@@ -22,11 +22,18 @@ if [ ! -f "$CHECKER" ]; then
     exit 0
 fi
 
-# Посреди rebase / cherry-pick / merge дерево в промежуточном состоянии,
-# и блокировать там нечего: обхода вроде --no-verify у продолжения операции нет.
+# Посреди rebase дерево в промежуточном состоянии, а обойти проверку нечем:
+# у "git rebase --continue" своего --no-verify нет. Поэтому пропускаем - но
+# ВСЛУХ: маркеры залипают (git am оставляет rebase-apply до --abort), и
+# молчаливый пропуск выключил бы хук насовсем, а человек считал бы себя
+# защищённым.
+# Конфликтные merge / cherry-pick / revert сюда НЕ входят намеренно: они
+# завершаются обычным git commit, где --no-verify доступен, а склеивание
+# конфликта - ровно тот момент, когда строки индекса и ломаются.
 GIT_DIR_PATH=$(git rev-parse --git-dir 2>/dev/null) || exit 0
-for marker in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+for marker in rebase-merge rebase-apply; do
     if [ -e "$GIT_DIR_PATH/$marker" ]; then
+        echo "pre-commit: идёт rebase - проверка памяти пропущена." >&2
         exit 0
     fi
 done
@@ -34,7 +41,10 @@ done
 # Проверять есть смысл, только когда память вообще участвует в коммите.
 # Иначе незакоммиченная правка памяти блокировала бы посторонние коммиты -
 # а память правится постоянно, это её нормальное состояние.
-if ! git diff --cached --name-only --diff-filter=ACMR -- "$MEMORY_DIR" | grep -q .; then
+# Фильтр по видам изменений здесь не ставим намеренно: удаление файла - самый
+# частый способ осиротить строку индекса, и отсеять его означало бы пропускать
+# ровно тот случай, ради которого проверка и нужна.
+if ! git diff --cached --name-only -- "$MEMORY_DIR" | grep -q .; then
     exit 0
 fi
 

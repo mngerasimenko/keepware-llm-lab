@@ -28,6 +28,24 @@ SCRIPT = os.path.join(SCRIPTS_DIR, "check_memory_index.py")
 HOOK = os.path.join(REPO_DIR, ".githooks", "pre-commit")
 
 
+def find_sh():
+    """sh из PATH, а если его там нет - из комплекта Git.
+
+    На Windows git.exe лежит в PATH, а sh.exe - нет, он рядом в usr/bin.
+    Без этого весь класс тестов хука молча пропускался бы ровно на той
+    системе, ради которой в хуке половина кода.
+    """
+    found = shutil.which("sh")
+    if found:
+        return found
+    git = shutil.which("git")
+    if not git:
+        return None
+    root = os.path.dirname(os.path.dirname(os.path.abspath(git)))
+    candidate = os.path.join(root, "usr", "bin", "sh.exe")
+    return candidate if os.path.isfile(candidate) else None
+
+
 class MemoryFixture(unittest.TestCase):
     """Собирает временную папку памяти из словаря «имя файла -> содержимое»."""
 
@@ -188,6 +206,40 @@ class IndexLinksToFiles(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
+        self.assertIn("L1", output)
+
+    def test_link_to_another_drive_is_a_finding_not_a_crash(self):
+        """Разные диски: относительный путь между ними не вычисляется вообще.
+
+        Раньше это роняло всю проверку в код 2, а хук трактует код 2 как
+        «не блокирую» - то есть одна кривая строка молча выключала проверку.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Чужой диск](D:/other/file.md) - другой том\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("L1", output)
+
+    def test_unc_path_is_a_finding_not_a_crash(self):
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Сетевая шара](//server/share/file.md) - UNC\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("L1", output)
+
+    def test_file_named_like_parent_dir_is_not_mistaken_for_escape(self):
+        self.write({
+            "MEMORY.md": "- [Странное имя](..dotdot.md) - файл, а не выход наверх\n",
+            "..dotdot.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
 
 
 class IndexParsing(MemoryFixture):
@@ -219,6 +271,61 @@ class IndexParsing(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
 
+    def test_row_before_unclosed_comment_survives(self):
+        """Комментарий открыт в хвосте строки - сама строка от этого не пропадает."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто <!-- TODO дописать крючок\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertIn("не закрыт", output.lower())
+
+    def test_row_after_comment_end_on_same_line_survives(self):
+        self.write({
+            "MEMORY.md": "<!--\nслужебная шапка\n--> - [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_comment_inside_fence_does_not_swallow_the_fence(self):
+        """Иначе закрывающие кавычки съедаются, и остаток индекса теряется."""
+        self.write({
+            "MEMORY.md": "```markdown\n"
+                         "<!-- пример строки -->\n"
+                         "- [Заголовок](primer.md) - крючок\n"
+                         "```\n"
+                         "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_unclosed_fence_is_reported_not_silent(self):
+        """Потерянная строка невидима - о ней надо сказать вслух."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "```markdown\n"
+                         "- [Заголовок](primer.md) - забыли закрыть блок\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertIn("не закрыт", output.lower())
+
+    def test_tilde_fence_is_recognised(self):
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "~~~markdown\n"
+                         "- [Заголовок](primer.md) - крючок\n"
+                         "~~~\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
     def test_star_and_plus_bullets_are_parsed(self):
         self.write({
             "MEMORY.md": "* [Профиль](user.md) - звёздочка\n+ [Сервер](server.md) - плюс\n",
@@ -228,14 +335,24 @@ class IndexParsing(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
 
-    def test_empty_index_says_so_explicitly(self):
+    def test_empty_index_without_facts_passes_with_warning(self):
+        """Свежая память - законное состояние, а не повод рубить первый коммит."""
         self.write({
-            "MEMORY.md": "# Память\n\nни одной строки\n",
+            "MEMORY.md": "# Память\n\nПока пусто - первые факты появятся здесь.\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertIn("пуст", output.lower())
+
+    def test_empty_index_with_existing_facts_hints_at_format(self):
+        """Файлы есть, а строк ноль - почти наверняка индекс написан не так."""
+        self.write({
+            "MEMORY.md": "| Заголовок | Файл |\n|---|---|\n| Профиль | user.md |\n",
             "user.md": "факт\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        self.assertIn("0 строк", output)
+        self.assertIn("формат", output.lower())
 
     def test_bom_and_crlf_index_is_read(self):
         self.write({"MEMORY.md": "- [Профиль](user.md) - кто\n"},
@@ -306,6 +423,22 @@ class FilesAppearInIndex(MemoryFixture):
         code, output = self.run_linter("--allow-orphan", "Templates/*.md")
         self.assertEqual(code, 1, output)
 
+    def test_sub_indexes_count_by_default_without_flags(self):
+        """Прибивает умолчание шаблона индекса.
+
+        Хук зовёт проверку без ключей. Верни умолчание к одному «MEMORY.md» -
+        и у всех, кто разбил индекс на части, начнут падать коммиты. Раньше
+        оба теста про под-индексы передавали --index явно, и эта регрессия
+        прошла бы мимо набора.
+        """
+        self.write({
+            "MEMORY.md": "- [Инфра](MEMORY_infra.md) - под-индекс\n",
+            "MEMORY_infra.md": "- [Сервер](server.md) - прод\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
     def test_sub_index_rows_also_count_as_mention(self):
         self.write({
             "MEMORY.md": "- [Под-индекс](MEMORY_infra.md) - инфраструктура\n",
@@ -326,6 +459,107 @@ class FilesAppearInIndex(MemoryFixture):
         code, output = self.run_linter("--index", "MEMORY*.md")
         self.assertEqual(code, 1, output)
         self.assertIn("MEMORY_infra.md", output)
+
+
+class MemoryFolderBoundary(MemoryFixture):
+    """Линтер отвечает только за папку памяти и не выходит за её пределы."""
+
+    def test_folder_without_root_index_is_usage_error(self):
+        """Указали корень репозитория вместо памяти - отказ, а не разбор чужого дерева."""
+        self.write({
+            "sub/MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "sub/user.md": "факт\n",
+            "README.md": "не память\n",
+            "node_modules/paket/README.md": "чужое\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 2, output)
+        self.assertIn("не папка памяти", output.lower())
+
+    def test_hidden_dirs_inside_memory_are_not_memory(self):
+        """У тех, кто держит заметки в Obsidian, это лежит прямо в папке памяти."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            ".obsidian/templates/zagotovka.md": "шаблон редактора\n",
+            ".trash/udalennoe.md": "лежит в корзине\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_sub_index_may_live_in_subfolder(self):
+        """Индекс при росте бьют по каталогам - это разрешено, лишь бы корневой был на месте."""
+        self.write({
+            "MEMORY.md": "- [Инфра](sub/MEMORY_infra.md) - под-индекс\n",
+            "sub/MEMORY_infra.md": "- [Сервер](server.md) - прод\n",
+            "sub/server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+
+class LinkedSubtrees(MemoryFixture):
+    """Связанные каталоги внутри памяти: junction на Windows, симлинк на POSIX."""
+
+    def link_dir(self, target, link):
+        """Пробует связать каталоги; пропускает тест, если система не даёт."""
+        try:
+            if os.name == "nt":
+                result = subprocess.run(["cmd", "/c", "mklink", "/J", link, target],
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                if result.returncode != 0:
+                    self.skipTest("junction создать не удалось")
+            else:
+                os.symlink(target, link, target_is_directory=True)
+        except OSError:
+            self.skipTest("связывание каталогов недоступно")
+
+    def test_linked_subtree_is_not_treated_as_memory(self):
+        """Иначе вердикт зависит от системы: junction обход проходит, симлинк - нет."""
+        outside = tempfile.mkdtemp(prefix="memcheck-outside-")
+        self.addCleanup(shutil.rmtree, outside, True)
+        with io.open(os.path.join(outside, "chuzhoe.md"), "w", encoding="utf-8") as fh:
+            fh.write("не наша память\n")
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        self.link_dir(outside, os.path.join(self.root, "shared"))
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_link_into_linked_subtree_still_resolves(self):
+        """Связанный каталог не память, но открыть файл в нём система может."""
+        outside = tempfile.mkdtemp(prefix="memcheck-outside-")
+        self.addCleanup(shutil.rmtree, outside, True)
+        with io.open(os.path.join(outside, "zametka.md"), "w", encoding="utf-8") as fh:
+            fh.write("факт\n")
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Через связь](shared/zametka.md) - лежит за junction\n",
+            "user.md": "факт\n",
+        })
+        self.link_dir(outside, os.path.join(self.root, "shared"))
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+
+class UnreadableEntries(MemoryFixture):
+    """Один нечитаемый файл не должен отменять весь прогон."""
+
+    def test_dangling_symlink_does_not_abort_the_run(self):
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        try:
+            os.symlink(os.path.join(self.root, "net-takogo.md"),
+                       os.path.join(self.root, "bitaya.md"))
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("символические ссылки недоступны")
+        code, output = self.run_linter()
+        self.assertIn(code, (0, 1), output)
+        self.assertNotIn("Проверку выполнить не удалось", output)
 
 
 class DuplicateTitles(MemoryFixture):
@@ -413,8 +647,9 @@ class PreCommitHook(unittest.TestCase):
     """Хук - это то, что трогает посторонний человек. Здесь ошибаться дороже всего."""
 
     def setUp(self):
-        if not (shutil.which("sh") and shutil.which("git")):
-            self.skipTest("нужны sh и git")
+        self.sh = find_sh()
+        if not (self.sh and shutil.which("git")):
+            self.skipTest("не нашёл sh - тесты хука НЕ выполнялись, это не значит, что он исправен")
         self.repo = tempfile.mkdtemp(prefix="memcheck-repo-")
         self.addCleanup(shutil.rmtree, self.repo, True)
         os.makedirs(os.path.join(self.repo, "scripts"))
@@ -440,7 +675,7 @@ class PreCommitHook(unittest.TestCase):
 
     def run_hook(self, env=None):
         return subprocess.run(
-            ["sh", os.path.join(self.repo, ".githooks", "pre-commit")],
+            [self.sh, os.path.join(self.repo, ".githooks", "pre-commit")],
             cwd=self.repo, env=env or os.environ.copy(),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
@@ -470,22 +705,73 @@ class PreCommitHook(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
 
     def test_ignores_fake_python3_stub(self):
-        """python3 на Windows часто заглушка Microsoft Store, а не Питон."""
+        """python3 на Windows часто заглушка Microsoft Store, а не Питон.
+
+        Память намеренно битая: код 0 вернула бы и ветка «подходящий Питон
+        не найден вовсе», поэтому проверяем, что настоящий реально отработал.
+        """
+        self.write_memory("- [Профиль](net.md) - битая\n")
         self.git("add", "-A")
         env = self.fake_python3("#!/bin/sh\necho Python\nexit 49\n")
         result = self.run_hook(env)
-        self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("L1", text)
 
-    def test_rejects_python2_candidate(self):
-        """Заглушка - не единственный самозванец: питон второй тоже не подходит."""
+    def test_rejects_python_below_required_version(self):
+        """Самозванец не только заглушка: подойдёт и Питон старее нашей планки.
+
+        Подделываем 3.6 - он ниже заявленных 3.7 и до сих пор живёт на старых
+        LTS-системах. Проба обязана спрашивать версию, а не факт запуска:
+        «это вообще Питон?» такой кандидат проходит, а проверку версии - нет.
+        """
         self.write_memory("- [Профиль](net.md) - битая\n")
         self.git("add", "-A")
-        # Проверку "это Питон вообще" такой самозванец проходит,
-        # проверку версии - нет. Значит хук обязан отбросить его и взять настоящий.
         env = self.fake_python3(
             '#!/bin/sh\ncase "$*" in *version_info*) exit 1 ;; *) exit 0 ;; esac\n'
         )
         result = self.run_hook(env)
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("L1", text)
+
+    def test_hook_is_committed_executable(self):
+        """Неисполняемый хук git пропускает молча - и это уже случалось."""
+        if not shutil.which("git"):
+            self.skipTest("нужен git")
+        listing = subprocess.check_output(
+            ["git", "ls-files", "-s", ".githooks/pre-commit"], cwd=REPO_DIR)
+        self.assertTrue(listing.startswith(b"100755"),
+                        listing.decode("utf-8", "replace"))
+
+    def test_blocks_when_memory_file_is_deleted(self):
+        """Удаление файла - самый частый способ осиротить строку индекса."""
+        self.git("add", "-A")
+        self.git("-c", "user.email=t@e.st", "-c", "user.name=test", "commit", "-qm", "init")
+        self.git("rm", "-q", "memory/user.md")
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("L1", text)
+
+    def test_skips_during_rebase_but_says_so_out_loud(self):
+        """Маркеры rebase залипают - молчаливый пропуск выключил бы хук насовсем."""
+        self.write_memory("- [Профиль](net.md) - битая\n")
+        self.git("add", "-A")
+        os.makedirs(os.path.join(self.repo, ".git", "rebase-apply"))
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, text)
+        self.assertIn("rebase", text.lower())
+
+    def test_does_not_skip_during_merge_conflict(self):
+        """Конфликтный merge завершается обычным commit - там --no-verify доступен."""
+        self.write_memory("- [Профиль](net.md) - битая\n")
+        self.git("add", "-A")
+        with io.open(os.path.join(self.repo, ".git", "MERGE_HEAD"), "w",
+                     encoding="utf-8") as fh:
+            fh.write("0" * 40 + "\n")
+        result = self.run_hook()
         text = result.stdout.decode("utf-8", "replace")
         self.assertEqual(result.returncode, 1, text)
         self.assertIn("L1", text)

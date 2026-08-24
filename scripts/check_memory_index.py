@@ -39,6 +39,7 @@ from urllib.parse import unquote, urlparse
 ROW = re.compile(r"^\s*[-*+]\s*\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\(([^)]*)\)")
 
 FENCE = re.compile(r"^\s*(```|~~~)")
+COMPLETE_COMMENT = re.compile(r"<!--.*?-->", re.S)
 
 # Метка "этот файл лежит вне индекса намеренно" - по образцу директивы :orphan:
 # в Sphinx, которому пришлось её завести ровно по этой причине.
@@ -94,31 +95,82 @@ def clean_target(raw):
 
 
 def parse_index(path):
-    """Строки индекса: (заголовок, адрес, номер строки).
+    """Разбирает индекс: возвращает (строки, что осталось незакрытым).
 
     Блоки кода и html-комментарии пропускаем: индекс, который документирует
-    собственный формат, иначе ругался бы на свой же пример.
+    собственный формат - а мы сами так и советуем, - иначе ругался бы на
+    собственный пример.
+
+    Тонкости, каждая из которых иначе молча съедает строки:
+    - блок кода проверяется РАНЬШЕ комментария, иначе `<!--` внутри примера
+      съест закрывающие кавычки блока и весь остаток индекса;
+    - законченные `<!-- ... -->` вырезаются из строки, а не отбрасывают её
+      целиком: строка может делить место с комментарием;
+    - при незакрытом комментарии обрабатывается часть строки ДО него.
+
+    Потерянная строка невидима: человек видит «файл не упомянут в индексе»
+    про файл, который в индексе есть. Поэтому о незакрытом блоке или
+    комментарии зовущий обязан сказать вслух - для этого второе значение.
     """
     rows = []
     in_fence = False
     in_comment = False
     for lineno, line in enumerate(read_text(path).splitlines(), 1):
-        if in_comment:
-            if "-->" in line:
-                in_comment = False
-            continue
-        if "<!--" in line and "-->" not in line:
-            in_comment = True
-            continue
-        if FENCE.match(line):
-            in_fence = not in_fence
-            continue
         if in_fence:
+            if FENCE.match(line):
+                in_fence = False
+            continue
+        if in_comment:
+            if "-->" not in line:
+                continue
+            line = line.split("-->", 1)[1]
+            in_comment = False
+        line = COMPLETE_COMMENT.sub("", line)
+        if "<!--" in line:
+            line = line[:line.index("<!--")]
+            in_comment = True
+        if FENCE.match(line):
+            in_fence = True
             continue
         match = ROW.match(line)
         if match:
             rows.append((match.group(1).strip(), match.group(2).strip(), lineno))
-    return rows
+    unclosed = "блок кода" if in_fence else ("html-комментарий" if in_comment else None)
+    return rows, unclosed
+
+
+def prune_non_memory_dirs(folder, dirs):
+    """Убирает из обхода то, что памятью не является.
+
+    **Скрытые каталоги** (на точку). У тех, кто держит заметки в markdown-
+    редакторе, прямо в папке памяти лежат `.obsidian` с шаблонами и `.trash`
+    с удалённым. Это служебное хозяйство инструмента, а не факты, и требовать
+    для него строк в индексе бессмысленно. Через хук пользователь исключить
+    их не может - хук зовёт проверку без ключей, - так что молчать нельзя,
+    правило названо в README.
+
+    **Связанные каталоги** (симлинки и виндовые junction'ы). Без этого вердикт
+    зависит от системы: os.walk заходит внутрь junction'а, но не заходит внутрь
+    симлинка, и одна и та же папка памяти давала бы разные ответы на Windows и
+    в CI на Linux. А junction, указывающий на предка, загонял обход в петлю до
+    упора в предел длины пути - и проверка молча не выполнялась вовсе.
+    Содержимое связанного каталога - чужая память, за неё мы не отвечаем;
+    но ссылку внутрь такого каталога L1 всё равно разрешит, если её открывает
+    система.
+    """
+    is_junction = getattr(os.path, "isjunction", None)
+    kept = []
+    for name in sorted(dirs):
+        if name.startswith("."):
+            continue
+        path = os.path.join(folder, name)
+        if os.path.islink(path):
+            continue
+        if is_junction is not None and is_junction(path):
+            continue
+        kept.append(name)
+    dirs[:] = kept
+    return dirs
 
 
 def build_file_map(root):
@@ -132,7 +184,8 @@ def build_file_map(root):
     """
     exact = {}
     folded = {}
-    for folder, _dirs, names in os.walk(root):
+    for folder, dirs, names in os.walk(root):
+        prune_non_memory_dirs(folder, dirs)
         for name in sorted(names):
             path = os.path.normpath(os.path.join(folder, name))
             rel = os.path.relpath(path, root).replace(os.sep, "/")
@@ -142,9 +195,17 @@ def build_file_map(root):
 
 
 def relative_to_root(root, path):
-    """Путь внутри папки памяти или None, если он из неё вышел."""
-    rel = os.path.relpath(path, root)
-    if rel.startswith(os.pardir) or os.path.isabs(rel):
+    """Путь внутри папки памяти или None, если он из неё вышел.
+
+    ValueError - это ссылка на другой диск или сетевую шару: между ними
+    относительный путь не существует в принципе. Такая строка не должна
+    ронять весь прогон, это обычная находка «вышли за папку памяти».
+    """
+    try:
+        rel = os.path.relpath(path, root)
+    except ValueError:
+        return None
+    if os.path.isabs(rel) or rel == os.pardir or rel.startswith(os.pardir + os.sep):
         return None
     return rel.replace(os.sep, "/")
 
@@ -163,8 +224,15 @@ def frontmatter_lines(text):
 
 
 def is_orphan_ok(path):
-    """Файл сам объявил, что лежит вне индекса намеренно."""
-    text = read_text(path)
+    """Файл сам объявил, что лежит вне индекса намеренно.
+
+    Нечитаемый файл (битый симлинк, отобранные права) - это не «намеренно»,
+    но и не повод отменять весь прогон: считаем его обычной находкой.
+    """
+    try:
+        text = read_text(path)
+    except OSError:
+        return False
     if any(FRONTMATTER_ORPHAN.match(line) for line in frontmatter_lines(text)):
         return True
     return any(COMMENT_ORPHAN.search(line) for line in text.splitlines()[:HEAD_LINES])
@@ -172,7 +240,8 @@ def is_orphan_ok(path):
 
 def find_indexes(root, pattern):
     found = []
-    for folder, _dirs, names in os.walk(root):
+    for folder, dirs, names in os.walk(root):
+        prune_non_memory_dirs(folder, dirs)
         for name in sorted(names):
             # fnmatchcase, а не fnmatch: последний на Windows сравнивает без учёта
             # регистра, и набор файлов разъезжается между машиной и CI.
@@ -192,14 +261,23 @@ def check(root, index_paths, allow_globs):
 
     exact, folded = build_file_map(root)
     index_rels = {relative_to_root(root, p) for p in index_paths}
-    root_index_rel = ROOT_INDEX_NAME if ROOT_INDEX_NAME in index_rels else None
-    if root_index_rel is None and len(index_rels) == 1:
-        root_index_rel = next(iter(index_rels))
+    # Корневой индекс - тот, что лежит в самой папке памяти: только он
+    # загружается сам. Под-индексы могут жить и в подкаталогах.
+    top_level = {rel for rel in index_rels if "/" not in rel}
+    root_index_rel = ROOT_INDEX_NAME if ROOT_INDEX_NAME in top_level else None
+    if root_index_rel is None and len(top_level) == 1:
+        root_index_rel = next(iter(top_level))
 
     # L1: каждая ссылка из индекса ведёт на существующий файл.
     for index_path in index_paths:
         where = relative_to_root(root, index_path) or index_path
-        for title, raw_target, lineno in parse_index(index_path):
+        index_rows, unclosed = parse_index(index_path)
+        if unclosed:
+            warnings.append(
+                "%s: %s не закрыт до конца файла - строки ниже в разбор не попали"
+                % (where, unclosed)
+            )
+        for title, raw_target, lineno in index_rows:
             row_count += 1
             target = clean_target(raw_target)
             if not target or target.startswith("#"):
@@ -221,6 +299,13 @@ def check(root, index_paths, allow_globs):
 
             hit = exact.get(rel)
             twin = folded.get(rel.casefold()) if hit is None else None
+            if hit is None and twin is None and os.path.isfile(absolute):
+                # Файла нет в обходе, но система его открывает - значит он
+                # за связанным каталогом. Агент такой файл прочитает, поэтому
+                # ссылка живая, даже если содержимое каталога мы не аудируем.
+                # Порядок важен: на Windows isfile подтвердит и ссылку с чужим
+                # регистром, поэтому сначала регистр, и только потом эта ветка.
+                hit = absolute
             actual = hit or twin
             if actual is not None:
                 actual_rel = relative_to_root(root, actual)
@@ -246,10 +331,23 @@ def check(root, index_paths, allow_globs):
             else:
                 errors.append("L1 %s:%d ссылка в никуда: %s" % (where, lineno, target))
 
+    # Ноль разобранных строк - это «я не понял индекс», а не «память разъехалась».
+    # Ошибкой это быть не должно: иначе первый же коммит новой, ещё пустой памяти
+    # оказывается заблокирован. Настоящие нарушения (сироты, битые ссылки)
+    # заблокируют его сами, если они есть.
     if index_paths and row_count == 0:
-        errors.append(
-            "Разобрано 0 строк индекса - ожидается формат `- [Заголовок](файл.md) - крючок`"
-        )
+        has_facts = any(rel.lower().endswith(".md") and rel not in index_rels
+                        for rel in exact)
+        if has_facts:
+            warnings.append(
+                "Индекс не дал ни одной строки формата `- [Заголовок](файл.md) - крючок`, "
+                "хотя файлы памяти есть - проверьте формат строк индекса"
+            )
+        else:
+            warnings.append(
+                "Индекс пуст: строк формата `- [Заголовок](файл.md) - крючок` в нём нет. "
+                "Для новой памяти это нормально"
+            )
 
     # L2: каждый файл памяти упомянут хотя бы в одном индексе.
     # Корневой индекс исключён: он загружается сам. Под-индекс - обычный файл,
@@ -305,6 +403,16 @@ def main(argv=None):
     if not index_paths:
         print("Индекс не найден: %s" % os.path.join(args.memory_dir, args.index),
               file=sys.stderr)
+        return EXIT_USAGE
+
+    # Проверка отвечает только за папку памяти. Если индекса нет в ней самой,
+    # а он нашёлся где-то в глубине, значит указали не ту папку - например корень
+    # репозитория. Разбирать чужое дерево и выдавать сотни «сирот» нельзя:
+    # ошибку надо назвать на входе.
+    if not any(os.path.dirname(p) == root for p in index_paths):
+        print("Это не папка памяти: индекс %s не лежит в %s "
+              "(нашёлся только во вложенных каталогах - похоже, указана не та папка)"
+              % (args.index, args.memory_dir), file=sys.stderr)
         return EXIT_USAGE
 
     try:
