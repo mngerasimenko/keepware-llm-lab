@@ -8,3 +8,7 @@ desktop.ini
 .vscode/
 *.swp
 *~
+
+# Python
+__pycache__/
+*.pyc
