@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from contextlib import redirect_stdout, redirect_stderr
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -459,6 +460,62 @@ class FilesAppearInIndex(MemoryFixture):
         code, output = self.run_linter("--index", "INDEX*.md")
         self.assertEqual(code, 0, output)
 
+    def test_sub_index_reachable_through_a_chain(self):
+        """Достижимость транзитивна: корень -> A -> B. Иначе это не обход, а один шаг."""
+        self.write({
+            "MEMORY.md": "- [А](MEMORY_a.md) - первый уровень\n",
+            "MEMORY_a.md": "- [Б](MEMORY_b.md) - второй уровень\n",
+            "MEMORY_b.md": "- [Сервер](server.md) - прод\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_detached_cycle_of_sub_indexes_is_error(self):
+        """Два под-индекса, ссылающиеся друг на друга, «упомянуты» - и недостижимы."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "MEMORY_b.md": "- [В](MEMORY_c.md) - сосед\n",
+            "MEMORY_c.md": "- [Б](MEMORY_b.md) - сосед\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+
+    def test_unreferenced_top_level_index_is_error_with_custom_pattern(self):
+        """Тот случай, где «корень выведен из шаблона» и «все верхние - корни» расходятся."""
+        self.write({
+            "INDEX.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "INDEX_infra.md": "- [Сервер](server.md) - прод\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter("--index", "INDEX*.md")
+        self.assertEqual(code, 1, output)
+        self.assertIn("INDEX_infra.md", output)
+
+    def test_pattern_with_several_wildcards_does_not_crown_the_wrong_root(self):
+        self.write({
+            "AGENT_MEMORY.md": "- [Профиль](user.md) - кто\n- [Инфра](MEMORY.md) - под-индекс\n",
+            "MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "user.md": "факт\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter("--index", "*MEMORY*.md")
+        self.assertEqual(code, 0, output)
+
+    def test_cross_listing_the_same_file_from_two_sub_indexes_is_not_a_duplicate(self):
+        """L2 разрешает упоминание в любом индексе - значит это законная схема."""
+        self.write({
+            "MEMORY.md": "- [Инфра](MEMORY_infra.md) - раз\n- [Прод](MEMORY_prod.md) - два\n",
+            "MEMORY_infra.md": "- [Сервер](server.md) - прод\n",
+            "MEMORY_prod.md": "- [Сервер](server.md) - тот же файл, другой раздел\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("L3", output)
+
     def test_sub_index_unreachable_from_root_is_error(self):
         """Упоминание где-нибудь - не то же самое, что достижимость от корня.
 
@@ -570,6 +627,76 @@ class LinkedSubtrees(MemoryFixture):
         self.link_dir(outside, os.path.join(self.root, "shared"))
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
+
+
+    def test_linked_subtree_is_pruned_without_isjunction(self):
+        """os.path.isjunction есть только с 3.12, а islink не видит junction с 3.8.
+
+        Значит на 3.8-3.11 под Windows защита не работала бы вовсе - в том
+        числе в ячейке CI windows-latest / 3.9.
+        """
+        outside = tempfile.mkdtemp(prefix="memcheck-outside-")
+        self.addCleanup(shutil.rmtree, outside, True)
+        with io.open(os.path.join(outside, "chuzhoe.md"), "w", encoding="utf-8") as fh:
+            fh.write("не наша память\n")
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        self.link_dir(outside, os.path.join(self.root, "shared"))
+        with unittest.mock.patch.object(os.path, "isjunction", None, create=True):
+            code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+
+class ExitCodeContract(MemoryFixture):
+    """Код 1 - только нарушения памяти. Всё прочее обязано быть кодом 2.
+
+    Хук трактует код 2 как «не блокирую», поэтому ошибка в обратную сторону
+    молча выключает защиту для всей папки, а не для одной строки.
+    """
+
+    def test_unparseable_target_is_a_finding_not_a_crash(self):
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Странное](//[oops) - протокол-относительная\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("L1", output)
+
+    def test_unreadable_index_does_not_abort_the_run(self):
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        real_read = linter.read_text
+        index_path = os.path.join(self.root, "MEMORY.md")
+
+        def failing_read(path):
+            if os.path.abspath(path) == os.path.abspath(index_path):
+                raise OSError(13, "нет доступа")
+            return real_read(path)
+
+        with unittest.mock.patch.object(linter, "read_text", failing_read):
+            code, output = self.run_linter()
+        self.assertNotIn("Проверку выполнить не удалось", output)
+        self.assertIn("не читается", output.lower())
+
+    def test_internal_failure_is_exit_two_not_one(self):
+        """Иначе хук скажет «память разъехалась» поверх трейсбека."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+
+        def boom(*_args, **_kwargs):
+            raise OSError(5, "ошибка ввода-вывода")
+
+        with unittest.mock.patch.object(linter, "prune_non_memory_dirs", boom):
+            code, output = self.run_linter()
+        self.assertEqual(code, 2, output)
 
 
 class UnreadableEntries(MemoryFixture):

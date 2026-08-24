@@ -28,6 +28,7 @@ import argparse
 import fnmatch
 import os
 import re
+import stat
 import sys
 from collections import defaultdict
 from urllib.parse import unquote, urlparse
@@ -74,7 +75,12 @@ def is_external(target):
     Однобуквенная - это диск в Windows ("C:/..."), а не протокол: urlparse
     считает его схемой, и без этой проверки абсолютный путь молча пропускался бы.
     """
-    scheme = urlparse(target).scheme
+    try:
+        scheme = urlparse(target).scheme
+    except ValueError:
+        # Неразбираемый адрес - не внешний: пусть L1 честно скажет, что
+        # ссылка никуда не ведёт, вместо того чтобы ронять весь прогон.
+        return False
     return len(scheme) > 1
 
 
@@ -125,17 +131,43 @@ def parse_index(path):
             line = line.split("-->", 1)[1]
             in_comment = False
         line = COMPLETE_COMMENT.sub("", line)
+        if FENCE.match(line):
+            # Раньше поиска незакрытого комментария: внутри блока кода
+            # `<!--` - обычный текст, и строка "```markdown <!-- пример"
+            # иначе включала бы разом оба состояния.
+            in_fence = True
+            continue
         if "<!--" in line:
             line = line[:line.index("<!--")]
             in_comment = True
-        if FENCE.match(line):
-            in_fence = True
-            continue
         match = ROW.match(line)
         if match:
             rows.append((match.group(1).strip(), match.group(2).strip(), lineno))
     unclosed = "блок кода" if in_fence else ("html-комментарий" if in_comment else None)
     return rows, unclosed
+
+
+def is_linked_dir(path):
+    """Симлинк или виндовый junction.
+
+    os.path.isjunction появился только в 3.12, а os.path.islink перестал
+    считать junction ссылкой ещё в 3.8. То есть на 3.8-3.11 под Windows
+    обе привычные проверки промахиваются, и обход уходит внутрь чужого
+    каталога. Поэтому третий путь - атрибут точки повторного разбора.
+    """
+    if os.path.islink(path):
+        return True
+    is_junction = getattr(os.path, "isjunction", None)
+    if is_junction is not None:
+        try:
+            return bool(is_junction(path))
+        except OSError:
+            return False
+    try:
+        attributes = os.lstat(path).st_file_attributes
+    except (OSError, AttributeError):
+        return False
+    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def prune_non_memory_dirs(folder, dirs):
@@ -157,15 +189,11 @@ def prune_non_memory_dirs(folder, dirs):
     но ссылку внутрь такого каталога L1 всё равно разрешит, если её открывает
     система.
     """
-    is_junction = getattr(os.path, "isjunction", None)
     kept = []
     for name in sorted(dirs):
         if name.startswith("."):
             continue
-        path = os.path.join(folder, name)
-        if os.path.islink(path):
-            continue
-        if is_junction is not None and is_junction(path):
+        if is_linked_dir(os.path.join(folder, name)):
             continue
         kept.append(name)
     dirs[:] = kept
@@ -257,6 +285,7 @@ def check(root, index_paths, allow_globs, index_pattern):
     titles = defaultdict(set)
     seen_rows = set()
     index_links = defaultdict(set)
+    empty_indexes = []
     row_count = 0
 
     exact, folded = build_file_map(root)
@@ -269,25 +298,30 @@ def check(root, index_paths, allow_globs, index_pattern):
     # Иначе ключ --index, который мы сами рекламируем, ломает проверку:
     # у человека с индексами INDEX*.md корневой оказывался бы «сиротой».
     top_level = {rel for rel in index_rels if "/" not in rel}
-    derived_root = index_pattern.replace("*", "")
-    if derived_root in top_level:
+    derived_root = index_pattern.replace("*", "") if index_pattern.count("*") == 1 else None
+    if derived_root is not None and derived_root in top_level:
         roots = {derived_root}
-    elif len(top_level) == 1:
-        roots = set(top_level)
     else:
-        # Не смогли выделить один корневой - считаем корневыми все верхние:
+        # Одного корневого не выделить - считаем корневыми все верхние:
         # какой из них загрузится, решает не проверка.
         roots = set(top_level)
 
     # L1: каждая ссылка из индекса ведёт на существующий файл.
     for index_path in index_paths:
         where = relative_to_root(root, index_path) or index_path
-        index_rows, unclosed = parse_index(index_path)
+        try:
+            index_rows, unclosed = parse_index(index_path)
+        except OSError as exc:
+            warnings.append("%s: файл не читается (%s) - строки из него не учтены"
+                            % (where, exc.strerror or exc))
+            continue
         if unclosed:
             warnings.append(
                 "%s: %s не закрыт до конца файла - строки ниже в разбор не попали"
                 % (where, unclosed)
             )
+        if not index_rows:
+            empty_indexes.append(where)
         for title, raw_target, lineno in index_rows:
             row_count += 1
             target = clean_target(raw_target)
@@ -324,7 +358,7 @@ def check(root, index_paths, allow_globs, index_pattern):
                 titles[title].add(actual_rel)
                 if actual_rel in index_rels and actual_rel != where:
                     index_links[where].add(actual_rel)
-                row_key = (title, actual_rel)
+                row_key = (where, title, actual_rel)
                 if row_key in seen_rows:
                     warnings.append("L3 %s:%d строка повторяется: «%s» → %s"
                                     % (where, lineno, title, actual_rel))
@@ -348,19 +382,24 @@ def check(root, index_paths, allow_globs, index_pattern):
     # Ошибкой это быть не должно: иначе первый же коммит новой, ещё пустой памяти
     # оказывается заблокирован. Настоящие нарушения (сироты, битые ссылки)
     # заблокируют его сами, если они есть.
-    if index_paths and row_count == 0:
+    #
+    # Считаем по каждому индексу отдельно: если корневой написан не в том
+    # формате, а под-индекс разобрался, общий счётчик был бы ненулевым - и
+    # человек получил бы стену «сирот» без единого намёка на причину.
+    if empty_indexes:
         has_facts = any(rel.lower().endswith(".md") and rel not in index_rels
                         for rel in exact)
-        if has_facts:
-            warnings.append(
-                "Индекс не дал ни одной строки формата `- [Заголовок](файл.md) - крючок`, "
-                "хотя файлы памяти есть - проверьте формат строк индекса"
-            )
-        else:
+        if not has_facts and len(empty_indexes) == len(index_paths):
             warnings.append(
                 "Индекс пуст: строк формата `- [Заголовок](файл.md) - крючок` в нём нет. "
                 "Для новой памяти это нормально"
             )
+        else:
+            for where in empty_indexes:
+                warnings.append(
+                    "%s: ни одной строки формата `- [Заголовок](файл.md) - крючок` "
+                    "- проверьте формат строк индекса" % where
+                )
 
     # L2: каждый файл памяти упомянут хотя бы в одном индексе.
     # Корневой индекс исключён: он загружается сам. Под-индекс - обычный файл,
@@ -429,23 +468,23 @@ def main(argv=None):
         print("Папка памяти не найдена: %s" % args.memory_dir, file=sys.stderr)
         return EXIT_USAGE
 
-    index_paths = find_indexes(root, args.index)
-    if not index_paths:
-        print("Индекс не найден: %s" % os.path.join(args.memory_dir, args.index),
-              file=sys.stderr)
-        return EXIT_USAGE
-
-    # Проверка отвечает только за папку памяти. Если индекса нет в ней самой,
-    # а он нашёлся где-то в глубине, значит указали не ту папку - например корень
-    # репозитория. Разбирать чужое дерево и выдавать сотни «сирот» нельзя:
-    # ошибку надо назвать на входе.
-    if not any(os.path.dirname(p) == root for p in index_paths):
-        print("Это не папка памяти: индекс %s не лежит в %s "
-              "(нашёлся только во вложенных каталогах - похоже, указана не та папка)"
-              % (args.index, args.memory_dir), file=sys.stderr)
-        return EXIT_USAGE
-
     try:
+        index_paths = find_indexes(root, args.index)
+        if not index_paths:
+            print("Индекс не найден: %s" % os.path.join(args.memory_dir, args.index),
+                  file=sys.stderr)
+            return EXIT_USAGE
+
+        # Проверка отвечает только за папку памяти. Если индекса нет в ней самой,
+        # а он нашёлся где-то в глубине, значит указали не ту папку - например
+        # корень репозитория. Разбирать чужое дерево и выдавать сотни «сирот»
+        # нельзя: ошибку надо назвать на входе.
+        if not any(os.path.dirname(p) == root for p in index_paths):
+            print("Это не папка памяти: индекс %s не лежит в %s "
+                  "(нашёлся только во вложенных каталогах - похоже, указана не та папка)"
+                  % (args.index, args.memory_dir), file=sys.stderr)
+            return EXIT_USAGE
+
         errors, warnings, row_count = check(root, index_paths, args.allow_orphan, args.index)
     except Exception as exc:  # проверка сломалась - это не нарушение памяти
         print("Проверку выполнить не удалось: %s: %s"
