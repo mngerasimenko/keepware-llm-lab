@@ -69,8 +69,15 @@ if [ -z "$PYTHON" ]; then
     exit 0
 fi
 
+# Дополнительные ключи проверки - через настройку репозитория, например:
+#   git config memorycheck.args "--allow-orphan templates/*.md"
+# Без этого ключи из README (тот же --allow-orphan) у пользователя хука
+# не работали бы вовсе: хук зовёт проверку сам и аргументов ниоткуда не брал.
+EXTRA_ARGS=$(git config --get memorycheck.args 2>/dev/null || true)
+
 set +e
-"$PYTHON" "$CHECKER" "$MEMORY_DIR" --quiet
+# Кавычек вокруг $EXTRA_ARGS нет намеренно: это несколько аргументов, а не один.
+"$PYTHON" "$CHECKER" "$MEMORY_DIR" --quiet $EXTRA_ARGS
 STATUS=$?
 set -e
 

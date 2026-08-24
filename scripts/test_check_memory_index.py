@@ -448,6 +448,34 @@ class FilesAppearInIndex(MemoryFixture):
         code, output = self.run_linter("--index", "MEMORY*.md")
         self.assertEqual(code, 0, output)
 
+    def test_root_index_is_derived_from_the_pattern_not_from_a_fixed_name(self):
+        """Ключ --index мы рекламируем - значит он должен работать не только с MEMORY."""
+        self.write({
+            "INDEX.md": "- [Профиль](user.md) - кто\n- [Инфра](INDEX_infra.md) - под-индекс\n",
+            "INDEX_infra.md": "- [Сервер](server.md) - прод\n",
+            "user.md": "факт\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter("--index", "INDEX*.md")
+        self.assertEqual(code, 0, output)
+
+    def test_sub_index_unreachable_from_root_is_error(self):
+        """Упоминание где-нибудь - не то же самое, что достижимость от корня.
+
+        Под-индекс, который ссылается сам на себя, формально «упомянут»,
+        а на деле к нему неоткуда прийти: сам он не загружается.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "MEMORY_infra.md": "- [Я сам](MEMORY_infra.md) - самоссылка\n"
+                               "- [Сервер](server.md) - прод\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("MEMORY_infra.md", output)
+
     def test_unreferenced_sub_index_is_error(self):
         """Под-индекс, на который никто не ссылается, невидим - и всё за ним тоже."""
         self.write({
@@ -589,7 +617,6 @@ class ExitCodes(MemoryFixture):
     """Код 1 - только нарушения. Всё остальное не должно им притворяться."""
 
     def test_missing_memory_dir_is_usage_error(self):
-        code, _output = linter.main, None
         out = io.StringIO()
         err = io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
@@ -782,6 +809,17 @@ class PreCommitHook(unittest.TestCase):
         with io.open(os.path.join(self.repo, "unrelated.txt"), "w", encoding="utf-8") as fh:
             fh.write("не про память\n")
         self.git("add", "unrelated.txt")
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
+
+    def test_extra_args_can_be_supplied_via_git_config(self):
+        """Иначе --allow-orphan из README у пользователя хука не работает вовсе."""
+        os.makedirs(os.path.join(self.repo, "memory", "templates"))
+        with io.open(os.path.join(self.repo, "memory", "templates", "zagotovka.md"),
+                     "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("заготовка\n")
+        self.git("config", "memorycheck.args", "--allow-orphan templates/*.md")
+        self.git("add", "-A")
         result = self.run_hook()
         self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
 

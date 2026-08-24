@@ -46,7 +46,6 @@ COMPLETE_COMMENT = re.compile(r"<!--.*?-->", re.S)
 FRONTMATTER_ORPHAN = re.compile(r"^\s*orphan\s*:\s*true\s*$", re.I)
 COMMENT_ORPHAN = re.compile(r"<!--\s*linter:\s*orphan-ok\s*-->", re.I)
 
-ROOT_INDEX_NAME = "MEMORY.md"
 HEAD_LINES = 20
 
 EXIT_OK = 0
@@ -250,23 +249,35 @@ def find_indexes(root, pattern):
     return found
 
 
-def check(root, index_paths, allow_globs):
+def check(root, index_paths, allow_globs, index_pattern):
     """Возвращает (ошибки, предупреждения, число разобранных строк)."""
     errors = []
     warnings = []
     referenced = set()
     titles = defaultdict(set)
     seen_rows = set()
+    index_links = defaultdict(set)
     row_count = 0
 
     exact, folded = build_file_map(root)
     index_rels = {relative_to_root(root, p) for p in index_paths}
     # Корневой индекс - тот, что лежит в самой папке памяти: только он
     # загружается сам. Под-индексы могут жить и в подкаталогах.
+    #
+    # Имя корневого выводим ИЗ ШАБЛОНА, а не из строки "MEMORY.md": шаблон
+    # "MEMORY*.md" без звёздочки даёт "MEMORY.md", "INDEX*.md" - "INDEX.md".
+    # Иначе ключ --index, который мы сами рекламируем, ломает проверку:
+    # у человека с индексами INDEX*.md корневой оказывался бы «сиротой».
     top_level = {rel for rel in index_rels if "/" not in rel}
-    root_index_rel = ROOT_INDEX_NAME if ROOT_INDEX_NAME in top_level else None
-    if root_index_rel is None and len(top_level) == 1:
-        root_index_rel = next(iter(top_level))
+    derived_root = index_pattern.replace("*", "")
+    if derived_root in top_level:
+        roots = {derived_root}
+    elif len(top_level) == 1:
+        roots = set(top_level)
+    else:
+        # Не смогли выделить один корневой - считаем корневыми все верхние:
+        # какой из них загрузится, решает не проверка.
+        roots = set(top_level)
 
     # L1: каждая ссылка из индекса ведёт на существующий файл.
     for index_path in index_paths:
@@ -311,6 +322,8 @@ def check(root, index_paths, allow_globs):
                 actual_rel = relative_to_root(root, actual)
                 referenced.add(actual_rel)
                 titles[title].add(actual_rel)
+                if actual_rel in index_rels and actual_rel != where:
+                    index_links[where].add(actual_rel)
                 row_key = (title, actual_rel)
                 if row_key in seen_rows:
                     warnings.append("L3 %s:%d строка повторяется: «%s» → %s"
@@ -352,14 +365,31 @@ def check(root, index_paths, allow_globs):
     # L2: каждый файл памяти упомянут хотя бы в одном индексе.
     # Корневой индекс исключён: он загружается сам. Под-индекс - обычный файл,
     # и если на него никто не ссылается, невидим и он, и всё, что за ним.
+    # Достижимость от корня, а не просто «где-то упомянут»: под-индекс,
+    # ссылающийся сам на себя, формально упомянут, но прийти к нему неоткуда.
+    reachable = set(roots)
+    queue = list(roots)
+    while queue:
+        current = queue.pop()
+        for target in index_links.get(current, ()):
+            if target not in reachable:
+                reachable.add(target)
+                queue.append(target)
+
     for rel in sorted(exact):
         if not rel.lower().endswith(".md"):
             continue
-        if rel == root_index_rel or rel in referenced:
-            continue
         if any(fnmatch.fnmatchcase(rel, pattern) for pattern in allow_globs):
             continue
-        if is_orphan_ok(exact[rel]):
+        if rel in index_rels:
+            if rel in reachable or is_orphan_ok(exact[rel]):
+                continue
+            errors.append(
+                "L2 %s - под-индекс, до которого неоткуда дойти: от корневого "
+                "индекса ссылок на него нет, а сам он не загружается" % rel
+            )
+            continue
+        if rel in referenced or is_orphan_ok(exact[rel]):
             continue
         errors.append("L2 %s не упомянут ни в одном индексе - агент его не увидит" % rel)
 
@@ -416,7 +446,7 @@ def main(argv=None):
         return EXIT_USAGE
 
     try:
-        errors, warnings, row_count = check(root, index_paths, args.allow_orphan)
+        errors, warnings, row_count = check(root, index_paths, args.allow_orphan, args.index)
     except Exception as exc:  # проверка сломалась - это не нарушение памяти
         print("Проверку выполнить не удалось: %s: %s"
               % (type(exc).__name__, exc), file=sys.stderr)
