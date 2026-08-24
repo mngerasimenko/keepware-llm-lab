@@ -27,9 +27,11 @@ fi
 # ВСЛУХ: маркеры залипают (git am оставляет rebase-apply до --abort), и
 # молчаливый пропуск выключил бы хук насовсем, а человек считал бы себя
 # защищённым.
-# Конфликтные merge / cherry-pick / revert сюда НЕ входят намеренно: они
-# завершаются обычным git commit, где --no-verify доступен, а склеивание
-# конфликта - ровно тот момент, когда строки индекса и ломаются.
+# Конфликтные merge / cherry-pick / revert сюда НЕ входят намеренно:
+# склеивание конфликта - ровно тот момент, когда строки индекса и ломаются.
+# Обойти проверку там можно, но по-разному: у merge --no-verify есть, а у
+# cherry-pick и revert его нет - им нужно "git commit --no-verify" и затем
+# "--quit". Хук подсказывает это в сообщении об ошибке.
 GIT_DIR_PATH=$(git rev-parse --git-dir 2>/dev/null) || exit 0
 for marker in rebase-merge rebase-apply; do
     if [ -e "$GIT_DIR_PATH/$marker" ]; then
@@ -75,9 +77,18 @@ fi
 # не работали бы вовсе: хук зовёт проверку сам и аргументов ниоткуда не брал.
 EXTRA_ARGS=$(git config --get memorycheck.args 2>/dev/null || true)
 
+# Разбить строку на аргументы надо, а вот раскрывать шаблоны по текущему
+# каталогу - категорически нет: хук работает из корня репозитория, и
+# "--allow-orphan templates/*.md" превратился бы в найденные ТАМ пути.
+# set -f выключает раскрытие, set -- разбивает по пробелам. Значение
+# настройки оболочкой не разбирается: кавычки внутри него не работают.
+set -f
+# shellcheck disable=SC2086
+set -- $EXTRA_ARGS
+set +f
+
 set +e
-# Кавычек вокруг $EXTRA_ARGS нет намеренно: это несколько аргументов, а не один.
-"$PYTHON" "$CHECKER" "$MEMORY_DIR" --quiet $EXTRA_ARGS
+"$PYTHON" "$CHECKER" "$MEMORY_DIR" --quiet "$@"
 STATUS=$?
 set -e
 
@@ -93,6 +104,13 @@ case "$STATUS" in
     *)
         echo "pre-commit: память и индекс разошлись - см. список выше." >&2
         echo "pre-commit: разовый обход - git commit --no-verify" >&2
+        # У cherry-pick и revert своего --no-verify нет (в отличие от merge),
+        # поэтому "--continue --no-verify" человек не наберёт при всём желании.
+        if [ -e "$GIT_DIR_PATH/CHERRY_PICK_HEAD" ] || [ -e "$GIT_DIR_PATH/REVERT_HEAD" ]; then
+            echo "pre-commit: идёт cherry-pick или revert - у их --continue" >&2
+            echo "pre-commit: своего --no-verify нет, обход такой:" >&2
+            echo "pre-commit:   git commit --no-verify && git cherry-pick --quit" >&2
+        fi
         exit "$STATUS"
         ;;
 esac

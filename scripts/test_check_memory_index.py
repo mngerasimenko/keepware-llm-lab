@@ -803,7 +803,12 @@ class PreCommitHook(unittest.TestCase):
     def setUp(self):
         self.sh = find_sh()
         if not (self.sh and shutil.which("git")):
-            self.skipTest("не нашёл sh - тесты хука НЕ выполнялись, это не значит, что он исправен")
+            message = "не нашёл sh - тесты хука НЕ выполнялись, это не значит, что он исправен"
+            # В CI пропуск - это зелёная галочка при невыполненной проверке,
+            # то есть ровно тот тихий отказ, который мы весь день и ловим.
+            if os.environ.get("MEMCHECK_REQUIRE_SH"):
+                self.fail(message)
+            self.skipTest(message)
         self.repo = tempfile.mkdtemp(prefix="memcheck-repo-")
         self.addCleanup(shutil.rmtree, self.repo, True)
         os.makedirs(os.path.join(self.repo, "scripts"))
@@ -949,6 +954,56 @@ class PreCommitHook(unittest.TestCase):
         self.git("add", "-A")
         result = self.run_hook()
         self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
+
+    def test_extra_args_are_not_glob_expanded_against_the_repo(self):
+        """Разбиение на аргументы нужно, раскрытие шаблонов - нет.
+
+        Хук работает из корня репозитория. Если там окажется свой templates/,
+        шаблон из настройки подменится на найденные пути: при двух файлах
+        проверка упадёт на неизвестный аргумент (и хук пропустит коммит
+        насовсем), при одном - исключение перестанет совпадать, и человека
+        заблокирует ровно тот файл, который он исключил.
+        """
+        os.makedirs(os.path.join(self.repo, "templates"))
+        for name in ("a.md", "b.md"):
+            with io.open(os.path.join(self.repo, "templates", name), "w",
+                         encoding="utf-8", newline="\n") as fh:
+                fh.write("постороннее\n")
+        os.makedirs(os.path.join(self.repo, "memory", "templates"))
+        with io.open(os.path.join(self.repo, "memory", "templates", "zagotovka.md"),
+                     "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("заготовка\n")
+        self.git("config", "memorycheck.args", "--allow-orphan templates/*.md")
+        self.git("add", "-A")
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertNotIn("unrecognized arguments", text)
+        self.assertEqual(result.returncode, 0, text)
+
+    def test_does_not_skip_during_cherry_pick(self):
+        self.write_memory("- [Профиль](net.md) - битая\n")
+        self.git("add", "-A")
+        with io.open(os.path.join(self.repo, ".git", "CHERRY_PICK_HEAD"), "w",
+                     encoding="utf-8") as fh:
+            fh.write("0" * 40 + "\n")
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("cherry-pick", text.lower())
+
+    def test_skips_during_interactive_rebase(self):
+        """rebase-merge - маркер интерактивного rebase, самого частого из всех."""
+        self.write_memory("- [Профиль](net.md) - битая\n")
+        self.git("add", "-A")
+        os.makedirs(os.path.join(self.repo, ".git", "rebase-merge"))
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
+
+    def test_committed_hook_has_lf_line_endings(self):
+        """CRLF в хуке ломает его на Linux и в CI - о режиме мы помним, о байтах нет."""
+        blob = subprocess.check_output(
+            ["git", "show", "HEAD:.githooks/pre-commit"], cwd=REPO_DIR)
+        self.assertNotIn(b"\r\n", blob)
 
     def test_does_not_block_when_checker_is_missing(self):
         os.remove(os.path.join(self.repo, "scripts", "check_memory_index.py"))

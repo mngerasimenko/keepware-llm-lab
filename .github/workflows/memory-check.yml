@@ -8,10 +8,24 @@ on:
   push:
   pull_request:
 
+# Читать репозиторий - всё, что нужно. Файл копируют к себе, поэтому права
+# сужаем явно, а не полагаемся на умолчание чужого репозитория.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    # Без этого тесты хука молча пропустятся там, где не нашёлся sh, и job
+    # станет зелёным при невыполненной проверке.
+    env:
+      MEMCHECK_REQUIRE_SH: "1"
     strategy:
       fail-fast: false
       matrix:
