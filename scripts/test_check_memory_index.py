@@ -373,6 +373,35 @@ class IndexParsing(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
 
+    def test_nested_list_rows_are_parsed(self):
+        """Отступ под пунктом списка - вложенный пункт, а не блок кода."""
+        self.write({
+            "MEMORY.md": "- Инфраструктура\n"
+                         "    - [Сервер](server.md) - прод\n"
+                         "    - [База](db.md) - postgres\n",
+            "server.md": "факт\n",
+            "db.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_nested_rows_indented_with_tabs_are_parsed(self):
+        self.write({
+            "MEMORY.md": "- Инфраструктура\n\t- [Сервер](server.md) - прод\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_broken_link_inside_a_nested_group_is_still_caught(self):
+        """Иначе вложенные группы просто выпадают из проверки."""
+        self.write({
+            "MEMORY.md": "- Инфраструктура\n    - [Сервер](net-takogo.md) - прод\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("L1", output)
+
     def test_row_indented_by_three_spaces_still_counts(self):
         """Три пробела - всё ещё список, а не код."""
         self.write({
@@ -408,7 +437,9 @@ class IndexParsing(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        self.assertIn("формат", output.lower())
+        # Именно заметка про разбор индекса, а не подсказка про сироту:
+        # слово «формат» теперь есть и там, и там.
+        self.assertIn("MEMORY.md: ни одной строки формата", output)
 
     def test_format_hint_names_the_index_that_failed(self):
         """При кривом корневом и рабочем под-индексе иначе не понять, где чинить."""
@@ -440,6 +471,18 @@ class FilesAppearInIndex(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 1)
         self.assertIn("zabytyi.md", output)
+
+    def test_orphan_hint_does_not_fire_on_a_substring_collision(self):
+        """«user.md» находится внутри «superuser.md» - подсказка бы соврала."""
+        self.write({
+            "MEMORY.md": "- [Супер](superuser.md) - другой файл\n",
+            "superuser.md": "факт\n",
+            "user.md": "меня в индексе нет вовсе\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("user.md", output)
+        self.assertNotIn("встречается", output)
 
     def test_orphan_marker_in_frontmatter_allows_file_outside_index(self):
         self.write({
@@ -766,6 +809,27 @@ class ExitCodeContract(MemoryFixture):
         # Ни одного обвинения в сиротстве: проверять их было не по чему.
         self.assertNotIn("не упомянут", output)
 
+    def test_real_violation_still_blocks_even_if_another_index_is_unreadable(self):
+        """L1 по прочитанным индексам остаётся честным - молчать о нём нельзя."""
+        self.write({
+            "MEMORY.md": "- [Профиль](net-takogo.md) - битая ссылка\n"
+                         "- [Ещё](MEMORY_extra.md) - под-индекс\n",
+            "MEMORY_extra.md": "- [Сервер](server.md) - прод\n",
+            "server.md": "факт\n",
+        })
+        real_read = linter.read_text
+        extra = os.path.join(self.root, "MEMORY_extra.md")
+
+        def failing_read(path):
+            if os.path.abspath(path) == os.path.abspath(extra):
+                raise OSError(13, "нет доступа")
+            return real_read(path)
+
+        with unittest.mock.patch.object(linter, "read_text", failing_read):
+            code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("L1", output)
+
     def test_internal_failure_is_exit_two_not_one(self):
         """Иначе хук скажет «память разъехалась» поверх трейсбека."""
         self.write({
@@ -864,6 +928,30 @@ class ExitCodes(MemoryFixture):
         code, output = self.run_linter("--quiet")
         self.assertEqual(code, 1, output)
         self.assertIn("не закрыт", output.lower())
+
+    def test_quiet_still_reports_that_part_of_the_index_was_not_read(self):
+        """Совет промолчать может, «я не дочитал индекс» - нет. Это тихий отказ."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "```markdown\n"
+                         "- [Заголовок](primer.md) - пример, блок не закрыт\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter("--quiet")
+        self.assertEqual(code, 0, output)
+        self.assertIn("не закрыт", output.lower())
+
+    def test_explanation_prints_before_the_accusations(self):
+        """Под списком из шести обвинений причину никто не читает."""
+        self.write({
+            "MEMORY.md": "```markdown\n- [Заголовок](primer.md) - блок не закрыт\n",
+            "zabytyi.md": "меня забыли\n",
+            "vtoroi.md": "и меня\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertLess(output.index("не закрыт"), output.index("L2"), output)
 
     def test_quiet_hides_success_line_but_not_errors(self):
         self.write({
@@ -988,10 +1076,13 @@ class PreCommitHook(unittest.TestCase):
     def test_rejects_python_below_required_version(self):
         """Самозванец не только заглушка: подойдёт и Питон старее нашей планки.
 
-        Подделываем 3.6 - он ниже заявленных 3.7 и до сих пор живёт на старых
-        LTS-системах. Проба обязана спрашивать версию, а не факт запуска:
-        «это вообще Питон?» такой кандидат проходит, а проверку версии - нет.
+        Подделываем Питон старее нашей планки - такие до сих пор живут на
+        старых LTS-системах. Проба обязана спрашивать версию, а не факт
+        запуска: «это вообще Питон?» такой кандидат проходит, а версию - нет.
         """
+        with io.open(HOOK, encoding="utf-8") as fh:
+            self.assertIn("(3, 9)", fh.read(),
+                          "планка версии в хуке разошлась с объявленной")
         self.write_memory("- [Профиль](net.md) - битая\n")
         self.git("add", "-A")
         env = self.fake_python3(

@@ -37,10 +37,12 @@ from urllib.parse import unquote, urlparse
 # Внутри заголовка допускаем один уровень скобок: "[VPScan [beta]](vps.md)".
 # Разделитель после ссылки намеренно не разбираем: он бывает дефисом,
 # длинным тире или отсутствует - для проверки это неважно.
-# Отступ - не больше трёх пробелов: четыре и больше в markdown означают блок
-# кода, а примеры формата мы сами советуем писать прямо в индексе. Что у
-# человека отрисовалось на гитхабе серым блоком, то и для нас код.
-ROW = re.compile(r"^ {0,3}[-*+]\s*\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\(([^)]*)\)")
+# Строка индекса. Отступ здесь не разбираем - им занимается parse_index,
+# потому что «четыре пробела» значат разное в зависимости от того, что
+# стоит выше: под пунктом списка это вложенный пункт, а после абзаца -
+# блок кода.
+ROW = re.compile(r"^[-*+]\s*\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\(([^)]*)\)")
+BULLET = re.compile(r"^[-*+]\s")
 
 FENCE = re.compile(r"^\s*(```|~~~)")
 COMPLETE_COMMENT = re.compile(r"<!--.*?-->", re.S)
@@ -123,6 +125,7 @@ def parse_index(path):
     rows = []
     in_fence = False
     in_comment = False
+    after_list_item = False
     for lineno, line in enumerate(read_text(path).splitlines(), 1):
         if in_fence:
             if FENCE.match(line):
@@ -139,11 +142,26 @@ def parse_index(path):
             # `<!--` - обычный текст, и строка "```markdown <!-- пример"
             # иначе включала бы разом оба состояния.
             in_fence = True
+            after_list_item = False
             continue
         if "<!--" in line:
             line = line[:line.index("<!--")]
             in_comment = True
-        match = ROW.match(line)
+
+        expanded = line.expandtabs(4)
+        body = expanded.lstrip(" ")
+        if not body.strip():
+            continue  # пустая строка не разрывает список
+        indent = len(expanded) - len(body)
+        # Отступ в четыре пробела - это блок кода ТОЛЬКО после обычного текста.
+        # Под пунктом списка те же четыре пробела означают вложенный пункт, и
+        # гитхаб рисует его списком; выкидывать такие строки значило бы объявить
+        # сиротами всё, что человек сгруппировал по темам.
+        if indent >= 4 and not after_list_item:
+            after_list_item = False
+            continue
+        after_list_item = bool(BULLET.match(body))
+        match = ROW.match(body)
         if match:
             rows.append((match.group(1).strip(), match.group(2).strip(), lineno))
     unclosed = "блок кода" if in_fence else ("html-комментарий" if in_comment else None)
@@ -280,25 +298,39 @@ def find_indexes(root, pattern):
     return found
 
 
-def mentioned_in_raw_text(index_paths, name):
-    """Имя файла встречается в индексе, но строка не разобралась.
+def mentioned_in_raw_text(index_paths, *names):
+    """Имя файла встречается в тексте индекса, но ссылкой не разобралось.
 
-    Тогда сообщение «не упомянут ни в одном индексе» - прямая неправда:
-    человек видит строку своими глазами. Причина обычно в оформлении:
-    жирный заголовок, нумерованный список, таблица.
+    Тогда сообщение «не упомянут ни в одном индексе» человека дезориентирует:
+    строку он видит своими глазами. Причина бывает разная - оформление
+    (жирный заголовок, нумерованный список, таблица), блок кода или
+    закомментированная строка, - поэтому и формулировка осторожная.
+
+    Границы слева обязательны: без них «user.md» находится внутри
+    «superuser.md», и подсказка утверждала бы небылицу.
     """
+    patterns = [re.compile(r"(?<![\w.\-/])" + re.escape(name)) for name in names if name]
     for path in index_paths:
         try:
-            if name in read_text(path):
-                return True
+            text = read_text(path)
         except OSError:
             continue
+        if any(pattern.search(text) for pattern in patterns):
+            return True
     return False
 
 
 def check(root, index_paths, allow_globs, index_pattern):
-    """Возвращает (ошибки, предупреждения, число разобранных строк)."""
+    """Возвращает (ошибки, структурные заметки, советы, строк, непроверяемо).
+
+    Заметка структурная, если часть проверки не выполнилась: незакрытый блок
+    кода, нечитаемый индекс, ноль разобранных строк. Такие печатаются всегда,
+    в том числе под --quiet: молчать о невыполненной проверке - тот самый
+    тихий отказ. Советы (одинаковые заголовки, пустая новая память) ничего
+    не блокируют и под --quiet молчат, чтобы хук не бурчал на каждом коммите.
+    """
     errors = []
+    notices = []
     warnings = []
     referenced = set()
     titles = defaultdict(set)
@@ -336,11 +368,11 @@ def check(root, index_paths, allow_globs, index_pattern):
         try:
             index_rows, unclosed = parse_index(index_path)
         except OSError as exc:
-            warnings.append("%s: файл не читается (%s)" % (where, exc.strerror or exc))
+            notices.append("%s: файл не читается (%s)" % (where, exc.strerror or exc))
             unreadable.append(where)
             continue
         if unclosed:
-            warnings.append(
+            notices.append(
                 "%s: %s не закрыт до конца файла - строки ниже в разбор не попали"
                 % (where, unclosed)
             )
@@ -420,7 +452,7 @@ def check(root, index_paths, allow_globs, index_pattern):
             )
         else:
             for where in empty_indexes:
-                warnings.append(
+                notices.append(
                     "%s: ни одной строки формата `- [Заголовок](файл.md) - крючок` "
                     "- проверьте формат строк индекса" % where
                 )
@@ -430,11 +462,12 @@ def check(root, index_paths, allow_globs, index_pattern):
     # из-за файла, занятого редактором или антивирусом. L1 по прочитанным
     # индексам остаётся честным, L2 не проверяем вовсе.
     if unreadable:
-        warnings.append(
-            "L2 не проверялся: не прочитано индексов - %d. Пока их не прочесть, "
-            "сказать, какие файлы забыты в индексе, невозможно" % len(unreadable)
+        notices.append(
+            "L2 и L3 не проверялись: не прочитано индексов - %d. Пока их не "
+            "прочесть, сказать, какие файлы забыты в индексе, невозможно"
+            % len(unreadable)
         )
-        return errors, warnings, row_count, True
+        return errors, notices, warnings, row_count, True
 
     # L2: каждый файл памяти упомянут хотя бы в одном индексе.
     # Корневой индекс исключён: он загружается сам. Под-индекс - обычный файл,
@@ -466,8 +499,9 @@ def check(root, index_paths, allow_globs, index_pattern):
         if rel in referenced or is_orphan_ok(exact[rel]):
             continue
         hint = ""
-        if mentioned_in_raw_text(index_paths, os.path.basename(rel)):
-            hint = " (строка про него в индексе есть, но не в формате `- [Заголовок](файл.md)`)"
+        if mentioned_in_raw_text(index_paths, rel, os.path.basename(rel)):
+            hint = (" (имя файла в тексте индекса встречается, но ссылкой не "
+                    "разобралось - проверьте формат строки, блок кода, комментарий)")
         errors.append("L2 %s не упомянут ни в одном индексе - агент его не увидит%s"
                       % (rel, hint))
 
@@ -478,7 +512,7 @@ def check(root, index_paths, allow_globs, index_pattern):
             warnings.append("L3 заголовок «%s» ведёт на разные файлы: %s"
                             % (title, ", ".join(sorted(paths))))
 
-    return errors, warnings, row_count, False
+    return errors, notices, warnings, row_count, False
 
 
 def build_parser():
@@ -527,7 +561,7 @@ def main(argv=None):
                   % (args.index, args.memory_dir), file=sys.stderr)
             return EXIT_USAGE
 
-        errors, warnings, row_count, unverifiable = check(
+        errors, notices, warnings, row_count, unverifiable = check(
             root, index_paths, args.allow_orphan, args.index)
     except Exception as exc:  # проверка сломалась - это не нарушение памяти
         print("Проверку выполнить не удалось: %s: %s"
@@ -542,6 +576,10 @@ def main(argv=None):
     # одинаковых заголовков повторялось бы на каждом коммите и приучало бы
     # пролистывать вывод, а там и к --no-verify. Вместе с ошибкой они нужны -
     # без причины остаются одни обвинения.
+    # Структурные заметки печатаются всегда: они говорят, что часть проверки
+    # не выполнилась, и молчать об этом нельзя даже под --quiet.
+    for line in notices:
+        print(line)
     if errors or unverifiable or not args.quiet:
         for line in warnings:
             print(line)
@@ -554,7 +592,8 @@ def main(argv=None):
         print("\nНарушений: %d (строк в индексе: %d)" % (len(errors), row_count))
         return EXIT_VIOLATION
     if not args.quiet:
-        note = ", предупреждений: %d" % len(warnings) if warnings else ""
+        total_notes = len(notices) + len(warnings)
+        note = ", предупреждений: %d" % total_notes if total_notes else ""
         print("Память согласована: строк в индексе %d, индексов %d%s"
               % (row_count, len(index_paths), note))
     return EXIT_OK
