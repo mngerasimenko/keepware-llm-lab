@@ -298,6 +298,26 @@ def find_indexes(root, pattern):
     return found
 
 
+def name_patterns(*names):
+    """Границы слева обязательны: без них «user.md» находится в «superuser.md»."""
+    return [re.compile(r"(?<![\w.\-/])" + re.escape(name)) for name in names if name]
+
+
+def first_file_mentioning(paths, patterns, cache):
+    """Первый файл из списка, где встречается имя. paths - пары (путь, имя)."""
+    for path, rel in paths:
+        text = cache.get(rel)
+        if text is None:
+            try:
+                text = read_text(path)
+            except OSError:
+                text = ""
+            cache[rel] = text
+        if any(pattern.search(text) for pattern in patterns):
+            return rel
+    return None
+
+
 def mentioned_in_raw_text(index_paths, *names):
     """Имя файла встречается в тексте индекса, но ссылкой не разобралось.
 
@@ -483,6 +503,7 @@ def check(root, index_paths, allow_globs, index_pattern):
                 reachable.add(target)
                 queue.append(target)
 
+    orphans = []
     for rel in sorted(exact):
         if not rel.lower().endswith(".md"):
             continue
@@ -498,10 +519,38 @@ def check(root, index_paths, allow_globs, index_pattern):
             continue
         if rel in referenced or is_orphan_ok(exact[rel]):
             continue
+        orphans.append(rel)
+
+    # Подсказки считаем отдельным проходом: тексты соседних файлов читаются
+    # один раз на всех сирот, а не заново на каждую.
+    cache = {}
+    others = [(exact[other], other) for other in sorted(exact)
+              if other.lower().endswith(".md") and other not in index_rels]
+    for rel in orphans:
+        patterns = name_patterns(rel, os.path.basename(rel))
         hint = ""
         if mentioned_in_raw_text(index_paths, rel, os.path.basename(rel)):
             hint = (" (имя файла в тексте индекса встречается, но ссылкой не "
                     "разобралось - проверьте формат строки, блок кода, комментарий)")
+        else:
+            # Частый случай: человек завёл свой файл-список и назвал его
+            # по-своему. Для нас это обычный файл памяти, его строки мы не
+            # разбираем - и говорить «агент не увидит» без объяснения значит
+            # соврать: агент дойдёт по ссылке из корневого индекса.
+            source = first_file_mentioning(
+                [pair for pair in others if pair[1] != rel], patterns, cache)
+            if source:
+                # Здесь «агент его не увидит» было бы неправдой: по ссылке из
+                # индекса он дойдёт. Проблема в другом - строки этого файла мы
+                # не разбираем, и битые ссылки внутри него не проверяются.
+                errors.append(
+                    "L2 %s не упомянут ни в одном индексе. На него ссылается %s, "
+                    "но тот индексом не считается: его строки не разбираются, и "
+                    "битые ссылки внутри него не ловятся. Индекс опознаётся по "
+                    "шаблону имени - переименуйте или задайте свой ключом --index"
+                    % (rel, source)
+                )
+                continue
         errors.append("L2 %s не упомянут ни в одном индексе - агент его не увидит%s"
                       % (rel, hint))
 

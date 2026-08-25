@@ -472,6 +472,20 @@ class FilesAppearInIndex(MemoryFixture):
         self.assertEqual(code, 1)
         self.assertIn("zabytyi.md", output)
 
+    def test_orphan_points_at_the_list_file_that_is_not_an_index(self):
+        """Файл-список назван по-своему: сказать это прямо, а не «агент не увидит»."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Инфра](spisok-infra.md) - список по инфраструктуре\n",
+            "user.md": "факт\n",
+            "spisok-infra.md": "- [Сервер](server.md) - прод\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("spisok-infra.md", output)
+        self.assertIn("--index", output)
+
     def test_orphan_hint_does_not_fire_on_a_substring_collision(self):
         """«user.md» находится внутри «superuser.md» - подсказка бы соврала."""
         self.write({
