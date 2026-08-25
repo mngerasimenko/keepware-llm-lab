@@ -16,7 +16,7 @@
 например lychee.
 
 Скрипт только читает файлы и ничего не изменяет. Зависимостей нет,
-нужен Python 3.7+.
+нужен Python 3.9+ (именно эти версии гоняются в CI).
 
 Примеры:
     python scripts/check_memory_index.py
@@ -37,7 +37,10 @@ from urllib.parse import unquote, urlparse
 # Внутри заголовка допускаем один уровень скобок: "[VPScan [beta]](vps.md)".
 # Разделитель после ссылки намеренно не разбираем: он бывает дефисом,
 # длинным тире или отсутствует - для проверки это неважно.
-ROW = re.compile(r"^\s*[-*+]\s*\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\(([^)]*)\)")
+# Отступ - не больше трёх пробелов: четыре и больше в markdown означают блок
+# кода, а примеры формата мы сами советуем писать прямо в индексе. Что у
+# человека отрисовалось на гитхабе серым блоком, то и для нас код.
+ROW = re.compile(r"^ {0,3}[-*+]\s*\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\(([^)]*)\)")
 
 FENCE = re.compile(r"^\s*(```|~~~)")
 COMPLETE_COMMENT = re.compile(r"<!--.*?-->", re.S)
@@ -499,12 +502,15 @@ def main(argv=None):
     force_utf8_output()
     args = build_parser().parse_args(argv)
 
-    root = os.path.abspath(args.memory_dir)
-    if not os.path.isdir(root):
-        print("Папка памяти не найдена: %s" % args.memory_dir, file=sys.stderr)
-        return EXIT_USAGE
-
     try:
+        # abspath внутри перехвата намеренно: на Linux он зовёт getcwd(), а тот
+        # кидает, если текущий каталог удалён - получился бы трейсбек и код 1,
+        # то есть "у вас разъехалась память" вместо "проверка не выполнилась".
+        root = os.path.abspath(args.memory_dir)
+        if not os.path.isdir(root):
+            print("Папка памяти не найдена: %s" % args.memory_dir, file=sys.stderr)
+            return EXIT_USAGE
+
         index_paths = find_indexes(root, args.index)
         if not index_paths:
             print("Индекс не найден: %s" % os.path.join(args.memory_dir, args.index),
@@ -530,7 +536,16 @@ def main(argv=None):
 
     # Предупреждения первыми: они объясняют, откуда взялись ошибки, и под
     # списком из шести обвинений объяснение никто не читает.
-    for line in warnings + errors:
+    #
+    # Под --quiet (так проверку зовёт хук) отдельно стоящие предупреждения
+    # молчат: они ничего не блокируют, а долгоживущее предупреждение вроде
+    # одинаковых заголовков повторялось бы на каждом коммите и приучало бы
+    # пролистывать вывод, а там и к --no-verify. Вместе с ошибкой они нужны -
+    # без причины остаются одни обвинения.
+    if errors or unverifiable or not args.quiet:
+        for line in warnings:
+            print(line)
+    for line in errors:
         print(line)
 
     if unverifiable and not errors:

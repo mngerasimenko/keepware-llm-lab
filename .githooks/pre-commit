@@ -52,11 +52,12 @@ fi
 
 # Наличие команды ещё не значит, что это нужный Питон: на Windows "python3"
 # часто оказывается заглушкой Microsoft Store, а "python" на старых системах -
-# второй версией. Поэтому спрашиваем у кандидата версию, а не факт запуска.
+# второй версией или Питоном старее нашей планки. Поэтому спрашиваем у
+# кандидата версию, а не факт запуска.
 PYTHON=""
 for candidate in python3 python py; do
     if command -v "$candidate" >/dev/null 2>&1 &&
-       "$candidate" -c "import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)" \
+       "$candidate" -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)" \
            >/dev/null 2>&1; then
         PYTHON="$candidate"
         break
@@ -64,9 +65,9 @@ for candidate in python3 python py; do
 done
 
 if [ -z "$PYTHON" ]; then
-    echo "pre-commit: Python 3.7+ не найден, проверка памяти пропущена." >&2
+    echo "pre-commit: Python 3.9+ не найден, проверка памяти пропущена." >&2
     echo "pre-commit: это не значит, что память в порядке - проверка не запускалась." >&2
-    echo "pre-commit: поставьте Python 3.7+ либо отключите хук:" >&2
+    echo "pre-commit: поставьте Python 3.9+ либо отключите хук:" >&2
     echo "pre-commit:   git config --unset core.hooksPath" >&2
     exit 0
 fi
@@ -107,7 +108,7 @@ case "$STATUS" in
         fi
         exit 0
         ;;
-    *)
+    1)
         echo "pre-commit: память и индекс разошлись - см. список выше." >&2
         echo "pre-commit: разовый обход - git commit --no-verify" >&2
         # У cherry-pick и revert своего --no-verify нет (в отличие от merge),
@@ -126,6 +127,13 @@ case "$STATUS" in
             echo "pre-commit: если откатывали диапазон, продолжите остальные:" >&2
             echo "pre-commit:   git revert --continue" >&2
         fi
+        exit "$STATUS"
+        ;;
+    *)
+        # 126/127 - не запустилось, 130 - прервали с клавиатуры. Называть это
+        # "память разъехалась" - врать: память в этих случаях не проверена.
+        echo "pre-commit: проверка завершилась необычно (код $STATUS)," >&2
+        echo "pre-commit: память НЕ проверена - разбирайтесь с окружением." >&2
         exit "$STATUS"
         ;;
 esac

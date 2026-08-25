@@ -29,6 +29,25 @@ SCRIPT = os.path.join(SCRIPTS_DIR, "check_memory_index.py")
 HOOK = os.path.join(REPO_DIR, ".githooks", "pre-commit")
 
 
+MISSING_SH_MESSAGE = "не нашёл sh - тесты хука НЕ выполнялись, это не значит, что хук исправен"
+
+
+class HookPrerequisite(unittest.TestCase):
+    """Один внятный провал вместо девятнадцати одинаковых.
+
+    В CI пропуск тестов хука - это зелёная галочка при невыполненной
+    проверке, то есть ровно тот тихий отказ, который эта проверка и ловит.
+    Поэтому там выставлена MEMCHECK_REQUIRE_SH, и пропуск становится провалом.
+    """
+
+    def test_sh_is_available(self):
+        if find_sh() and shutil.which("git"):
+            return
+        if os.environ.get("MEMCHECK_REQUIRE_SH"):
+            self.fail(MISSING_SH_MESSAGE)
+        self.skipTest(MISSING_SH_MESSAGE)
+
+
 def find_sh():
     """sh из PATH, а если его там нет - из комплекта Git.
 
@@ -337,6 +356,28 @@ class IndexParsing(MemoryFixture):
                          "- [Сервер](server.md) - прод\n",
             "user.md": "факт\n",
             "server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_indented_example_is_code_not_a_row(self):
+        """Четыре пробела в markdown - это блок кода, а мы советуем писать примеры."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "Формат строки:\n"
+                         "\n"
+                         "    - [Заголовок](primer.md) - крючок\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_row_indented_by_three_spaces_still_counts(self):
+        """Три пробела - всё ещё список, а не код."""
+        self.write({
+            "MEMORY.md": "   - [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
@@ -754,8 +795,11 @@ class UnreadableEntries(MemoryFixture):
         except (OSError, NotImplementedError, AttributeError):
             self.skipTest("символические ссылки недоступны")
         code, output = self.run_linter()
-        self.assertIn(code, (0, 1), output)
         self.assertNotIn("Проверку выполнить не удалось", output)
+        # Битая ссылка - обычный файл вне индекса: одна находка, а не отмена
+        # всего прогона из-за того, что её не удалось прочитать.
+        self.assertEqual(code, 1, output)
+        self.assertIn("bitaya.md", output)
 
 
 class DuplicateTitles(MemoryFixture):
@@ -795,6 +839,31 @@ class ExitCodes(MemoryFixture):
         self.write({"user.md": "факт\n"})
         code, output = self.run_linter()
         self.assertEqual(code, 2, output)
+
+    def test_quiet_hides_standalone_warnings(self):
+        """Хук зовёт проверку с --quiet. Бурчание на здоровой памяти приучает к --no-verify."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - раз\n- [Профиль](user2.md) - два\n",
+            "user.md": "факт\n",
+            "user2.md": "факт\n",
+        })
+        code, output = self.run_linter("--quiet")
+        self.assertEqual(code, 0)
+        self.assertEqual(output.strip(), "")
+
+    def test_quiet_still_shows_warnings_that_explain_errors(self):
+        """При блокировке причина нужна: иначе обвинения без объяснения."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "```markdown\n"
+                         "- [Заголовок](primer.md) - забыли закрыть блок\n",
+            "user.md": "факт\n",
+            "zabytyi.md": "меня забыли внести\n",
+        })
+        code, output = self.run_linter("--quiet")
+        self.assertEqual(code, 1, output)
+        self.assertIn("не закрыт", output.lower())
 
     def test_quiet_hides_success_line_but_not_errors(self):
         self.write({
@@ -844,12 +913,10 @@ class PreCommitHook(unittest.TestCase):
     def setUp(self):
         self.sh = find_sh()
         if not (self.sh and shutil.which("git")):
-            message = "не нашёл sh - тесты хука НЕ выполнялись, это не значит, что он исправен"
-            # В CI пропуск - это зелёная галочка при невыполненной проверке,
-            # то есть ровно тот тихий отказ, который мы весь день и ловим.
-            if os.environ.get("MEMCHECK_REQUIRE_SH"):
-                self.fail(message)
-            self.skipTest(message)
+            # Провал здесь размножился бы на весь класс - девятнадцать
+            # одинаковых строк вместо одной внятной. Требование проверяет
+            # отдельный тест ниже, а здесь просто пропускаем.
+            self.skipTest(MISSING_SH_MESSAGE)
         self.repo = tempfile.mkdtemp(prefix="memcheck-repo-")
         self.addCleanup(shutil.rmtree, self.repo, True)
         os.makedirs(os.path.join(self.repo, "scripts"))
