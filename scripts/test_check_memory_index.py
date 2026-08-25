@@ -990,6 +990,23 @@ class PreCommitHook(unittest.TestCase):
         text = result.stdout.decode("utf-8", "replace")
         self.assertEqual(result.returncode, 1, text)
         self.assertIn("cherry-pick", text.lower())
+        # --quit бросает очередь: оставшиеся коммиты диапазона пропадают молча.
+        # Подсказка, которая уничтожает работу, хуже отсутствия подсказки.
+        self.assertNotIn("--quit", text)
+        self.assertIn("--continue", text)
+
+    def test_does_not_skip_during_revert(self):
+        """У revert свой --continue - советовать ему cherry-pick нельзя."""
+        self.write_memory("- [Профиль](net.md) - битая\n")
+        self.git("add", "-A")
+        with io.open(os.path.join(self.repo, ".git", "REVERT_HEAD"), "w",
+                     encoding="utf-8") as fh:
+            fh.write("0" * 40 + "\n")
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("git revert --continue", text)
+        self.assertNotIn("cherry-pick", text)
 
     def test_skips_during_interactive_rebase(self):
         """rebase-merge - маркер интерактивного rebase, самого частого из всех."""
@@ -1001,8 +1018,12 @@ class PreCommitHook(unittest.TestCase):
 
     def test_committed_hook_has_lf_line_endings(self):
         """CRLF в хуке ломает его на Linux и в CI - о режиме мы помним, о байтах нет."""
-        blob = subprocess.check_output(
-            ["git", "show", "HEAD:.githooks/pre-commit"], cwd=REPO_DIR)
+        try:
+            blob = subprocess.check_output(
+                ["git", "show", "HEAD:.githooks/pre-commit"], cwd=REPO_DIR,
+                stderr=subprocess.DEVNULL)
+        except (subprocess.CalledProcessError, OSError):
+            self.skipTest("хук не найден в истории (свежий репозиторий или архив)")
         self.assertNotIn(b"\r\n", blob)
 
     def test_does_not_block_when_checker_is_missing(self):

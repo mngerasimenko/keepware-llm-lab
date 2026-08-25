@@ -29,9 +29,9 @@ fi
 # защищённым.
 # Конфликтные merge / cherry-pick / revert сюда НЕ входят намеренно:
 # склеивание конфликта - ровно тот момент, когда строки индекса и ломаются.
-# Обойти проверку там можно, но по-разному: у merge --no-verify есть, а у
-# cherry-pick и revert его нет - им нужно "git commit --no-verify" и затем
-# "--quit". Хук подсказывает это в сообщении об ошибке.
+# Обойти проверку там можно, но по-разному: у merge свой --no-verify есть,
+# а у cherry-pick и revert его нет - им нужен обычный "git commit --no-verify",
+# который завершает текущий шаг. Хук подсказывает это в сообщении об ошибке.
 GIT_DIR_PATH=$(git rev-parse --git-dir 2>/dev/null) || exit 0
 for marker in rebase-merge rebase-apply; do
     if [ -e "$GIT_DIR_PATH/$marker" ]; then
@@ -99,6 +99,12 @@ case "$STATUS" in
     2)
         # Проверка не смогла выполниться - это не нарушение памяти.
         echo "pre-commit: проверку выполнить не удалось (см. выше), коммит не блокирую." >&2
+        # Опечатка в ключах даёт тот же код 2, и тогда блокировка выключена
+        # насовсем, а связь с собственной настройкой человек не увидит.
+        if [ -n "$EXTRA_ARGS" ]; then
+            echo "pre-commit: заданы свои ключи - проверьте их:" >&2
+            echo "pre-commit:   git config --get memorycheck.args" >&2
+        fi
         exit 0
         ;;
     *)
@@ -106,10 +112,19 @@ case "$STATUS" in
         echo "pre-commit: разовый обход - git commit --no-verify" >&2
         # У cherry-pick и revert своего --no-verify нет (в отличие от merge),
         # поэтому "--continue --no-verify" человек не наберёт при всём желании.
-        if [ -e "$GIT_DIR_PATH/CHERRY_PICK_HEAD" ] || [ -e "$GIT_DIR_PATH/REVERT_HEAD" ]; then
-            echo "pre-commit: идёт cherry-pick или revert - у их --continue" >&2
-            echo "pre-commit: своего --no-verify нет, обход такой:" >&2
-            echo "pre-commit:   git commit --no-verify && git cherry-pick --quit" >&2
+        # Обычный commit завершает текущий шаг; остальные шаги диапазона
+        # продолжает --continue. НЕ --quit: он бросает очередь молча, и
+        # оставшиеся коммиты диапазона просто пропадают.
+        if [ -e "$GIT_DIR_PATH/CHERRY_PICK_HEAD" ]; then
+            echo "pre-commit: идёт cherry-pick, своего --no-verify у него нет:" >&2
+            echo "pre-commit:   git commit --no-verify" >&2
+            echo "pre-commit: если переносили диапазон, продолжите остальные:" >&2
+            echo "pre-commit:   git cherry-pick --continue" >&2
+        elif [ -e "$GIT_DIR_PATH/REVERT_HEAD" ]; then
+            echo "pre-commit: идёт revert, своего --no-verify у него нет:" >&2
+            echo "pre-commit:   git commit --no-verify" >&2
+            echo "pre-commit: если откатывали диапазон, продолжите остальные:" >&2
+            echo "pre-commit:   git revert --continue" >&2
         fi
         exit "$STATUS"
         ;;
