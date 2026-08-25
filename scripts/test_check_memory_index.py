@@ -327,6 +327,20 @@ class IndexParsing(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
 
+    def test_fence_opener_carrying_a_comment_does_not_swallow_the_tail(self):
+        """Тот единственный случай, ради которого блок проверяется раньше комментария."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "```markdown <!-- незакрытый\n"
+                         "- [Заголовок](primer.md) - крючок\n"
+                         "```\n"
+                         "- [Сервер](server.md) - прод\n",
+            "user.md": "факт\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
     def test_star_and_plus_bullets_are_parsed(self):
         self.write({
             "MEMORY.md": "* [Профиль](user.md) - звёздочка\n+ [Сервер](server.md) - плюс\n",
@@ -354,6 +368,16 @@ class IndexParsing(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
         self.assertIn("формат", output.lower())
+
+    def test_format_hint_names_the_index_that_failed(self):
+        """При кривом корневом и рабочем под-индексе иначе не понять, где чинить."""
+        self.write({
+            "MEMORY.md": "| Заголовок | Файл |\n|---|---|\n| Инфра | MEMORY_infra.md |\n",
+            "MEMORY_infra.md": "- [Сервер](server.md) - прод\n",
+            "server.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        self.assertIn("MEMORY.md:", output)
 
     def test_bom_and_crlf_index_is_read(self):
         self.write({"MEMORY.md": "- [Профиль](user.md) - кто\n"},
@@ -502,6 +526,18 @@ class FilesAppearInIndex(MemoryFixture):
             "server.md": "факт\n",
         })
         code, output = self.run_linter("--index", "*MEMORY*.md")
+        self.assertEqual(code, 0, output)
+
+    def test_leading_wildcard_does_not_crown_the_wrong_root(self):
+        """Звёздочка одна, но в начале - имя корневого из шаблона так не вывести."""
+        self.write({
+            "AGENT_MEMORY.md": "- [Профиль](user.md) - кто\n"
+                               "- [Инфра](MEMORY.md) - под-индекс\n",
+            "MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "user.md": "факт\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter("--index", "*MEMORY.md")
         self.assertEqual(code, 0, output)
 
     def test_cross_listing_the_same_file_from_two_sub_indexes_is_not_a_duplicate(self):
@@ -681,8 +717,13 @@ class ExitCodeContract(MemoryFixture):
 
         with unittest.mock.patch.object(linter, "read_text", failing_read):
             code, output = self.run_linter()
-        self.assertNotIn("Проверку выполнить не удалось", output)
         self.assertIn("не читается", output.lower())
+        # Индекс не прочитан - значит про сирот сказать НЕЧЕГО. Код 1 здесь
+        # означал бы "у вас разъехалась память" из-за занятого файла, и хук
+        # заблокировал бы коммит по чужой вине.
+        self.assertEqual(code, 2, output)
+        # Ни одного обвинения в сиротстве: проверять их было не по чему.
+        self.assertNotIn("не упомянут", output)
 
     def test_internal_failure_is_exit_two_not_one(self):
         """Иначе хук скажет «память разъехалась» поверх трейсбека."""

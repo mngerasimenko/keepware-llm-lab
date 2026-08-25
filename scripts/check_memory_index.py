@@ -277,6 +277,22 @@ def find_indexes(root, pattern):
     return found
 
 
+def mentioned_in_raw_text(index_paths, name):
+    """Имя файла встречается в индексе, но строка не разобралась.
+
+    Тогда сообщение «не упомянут ни в одном индексе» - прямая неправда:
+    человек видит строку своими глазами. Причина обычно в оформлении:
+    жирный заголовок, нумерованный список, таблица.
+    """
+    for path in index_paths:
+        try:
+            if name in read_text(path):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def check(root, index_paths, allow_globs, index_pattern):
     """Возвращает (ошибки, предупреждения, число разобранных строк)."""
     errors = []
@@ -286,6 +302,7 @@ def check(root, index_paths, allow_globs, index_pattern):
     seen_rows = set()
     index_links = defaultdict(set)
     empty_indexes = []
+    unreadable = []
     row_count = 0
 
     exact, folded = build_file_map(root)
@@ -298,7 +315,11 @@ def check(root, index_paths, allow_globs, index_pattern):
     # Иначе ключ --index, который мы сами рекламируем, ломает проверку:
     # у человека с индексами INDEX*.md корневой оказывался бы «сиротой».
     top_level = {rel for rel in index_rels if "/" not in rel}
-    derived_root = index_pattern.replace("*", "") if index_pattern.count("*") == 1 else None
+    # Звёздочка должна быть одна и НЕ в начале: из "*MEMORY.md" имя корневого
+    # так же не выводится, просто промах менее очевиден.
+    single_trailing_wildcard = (index_pattern.count("*") == 1
+                                and not index_pattern.startswith("*"))
+    derived_root = index_pattern.replace("*", "") if single_trailing_wildcard else None
     if derived_root is not None and derived_root in top_level:
         roots = {derived_root}
     else:
@@ -312,8 +333,8 @@ def check(root, index_paths, allow_globs, index_pattern):
         try:
             index_rows, unclosed = parse_index(index_path)
         except OSError as exc:
-            warnings.append("%s: файл не читается (%s) - строки из него не учтены"
-                            % (where, exc.strerror or exc))
+            warnings.append("%s: файл не читается (%s)" % (where, exc.strerror or exc))
+            unreadable.append(where)
             continue
         if unclosed:
             warnings.append(
@@ -401,6 +422,17 @@ def check(root, index_paths, allow_globs, index_pattern):
                     "- проверьте формат строк индекса" % where
                 )
 
+    # Индекс не прочитан - значит про упоминания сказать НЕЧЕГО, и объявлять
+    # файлы сиротами нельзя: это обвинило бы человека в разъехавшейся памяти
+    # из-за файла, занятого редактором или антивирусом. L1 по прочитанным
+    # индексам остаётся честным, L2 не проверяем вовсе.
+    if unreadable:
+        warnings.append(
+            "L2 не проверялся: не прочитано индексов - %d. Пока их не прочесть, "
+            "сказать, какие файлы забыты в индексе, невозможно" % len(unreadable)
+        )
+        return errors, warnings, row_count, True
+
     # L2: каждый файл памяти упомянут хотя бы в одном индексе.
     # Корневой индекс исключён: он загружается сам. Под-индекс - обычный файл,
     # и если на него никто не ссылается, невидим и он, и всё, что за ним.
@@ -430,7 +462,11 @@ def check(root, index_paths, allow_globs, index_pattern):
             continue
         if rel in referenced or is_orphan_ok(exact[rel]):
             continue
-        errors.append("L2 %s не упомянут ни в одном индексе - агент его не увидит" % rel)
+        hint = ""
+        if mentioned_in_raw_text(index_paths, os.path.basename(rel)):
+            hint = " (строка про него в индексе есть, но не в формате `- [Заголовок](файл.md)`)"
+        errors.append("L2 %s не упомянут ни в одном индексе - агент его не увидит%s"
+                      % (rel, hint))
 
     # L3: одинаковый заголовок у разных файлов - предупреждение, не ошибка.
     # Индекс намеренно не уникальный ключ, поэтому это сигнал, а не запрет.
@@ -439,7 +475,7 @@ def check(root, index_paths, allow_globs, index_pattern):
             warnings.append("L3 заголовок «%s» ведёт на разные файлы: %s"
                             % (title, ", ".join(sorted(paths))))
 
-    return errors, warnings, row_count
+    return errors, warnings, row_count, False
 
 
 def build_parser():
@@ -485,15 +521,20 @@ def main(argv=None):
                   % (args.index, args.memory_dir), file=sys.stderr)
             return EXIT_USAGE
 
-        errors, warnings, row_count = check(root, index_paths, args.allow_orphan, args.index)
+        errors, warnings, row_count, unverifiable = check(
+            root, index_paths, args.allow_orphan, args.index)
     except Exception as exc:  # проверка сломалась - это не нарушение памяти
         print("Проверку выполнить не удалось: %s: %s"
               % (type(exc).__name__, exc), file=sys.stderr)
         return EXIT_USAGE
 
-    for line in errors + warnings:
+    # Предупреждения первыми: они объясняют, откуда взялись ошибки, и под
+    # списком из шести обвинений объяснение никто не читает.
+    for line in warnings + errors:
         print(line)
 
+    if unverifiable and not errors:
+        return EXIT_USAGE
     if errors:
         print("\nНарушений: %d (строк в индексе: %d)" % (len(errors), row_count))
         return EXIT_VIOLATION
