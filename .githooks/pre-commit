@@ -103,7 +103,7 @@ case "$STATUS" in
         # Опечатка в ключах даёт тот же код 2, и тогда блокировка выключена
         # насовсем, а связь с собственной настройкой человек не увидит.
         if [ -n "$EXTRA_ARGS" ]; then
-            echo "pre-commit: заданы свои ключи - проверьте их:" >&2
+            echo "pre-commit: если дело в ключах - проверьте их:" >&2
             echo "pre-commit:   git config --get memorycheck.args" >&2
         fi
         exit 0
@@ -121,11 +121,13 @@ case "$STATUS" in
             echo "pre-commit:   git commit --no-verify" >&2
             echo "pre-commit: если переносили диапазон, продолжите остальные:" >&2
             echo "pre-commit:   git cherry-pick --continue" >&2
+            echo "pre-commit: если коммит был один - всё, --continue не нужен." >&2
         elif [ -e "$GIT_DIR_PATH/REVERT_HEAD" ]; then
             echo "pre-commit: идёт revert, своего --no-verify у него нет:" >&2
             echo "pre-commit:   git commit --no-verify" >&2
             echo "pre-commit: если откатывали диапазон, продолжите остальные:" >&2
             echo "pre-commit:   git revert --continue" >&2
+            echo "pre-commit: если коммит был один - всё, --continue не нужен." >&2
         fi
         exit "$STATUS"
         ;;
@@ -133,7 +135,10 @@ case "$STATUS" in
         # 126/127 - не запустилось, 130 - прервали с клавиатуры. Называть это
         # "память разъехалась" - врать: память в этих случаях не проверена.
         echo "pre-commit: проверка завершилась необычно (код $STATUS)," >&2
-        echo "pre-commit: память НЕ проверена - разбирайтесь с окружением." >&2
+        echo "pre-commit: память НЕ проверена - дело в окружении, не в памяти." >&2
+        # Раз блокируем - обязаны сказать, как выйти: иначе человек заперт.
+        echo "pre-commit: разовый обход - git commit --no-verify" >&2
+        echo "pre-commit: отключить хук - git config --unset core.hooksPath" >&2
         exit "$STATUS"
         ;;
 esac

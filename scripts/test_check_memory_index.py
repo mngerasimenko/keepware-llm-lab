@@ -1225,6 +1225,34 @@ class PreCommitHook(unittest.TestCase):
             self.skipTest("хук не найден в истории (свежий репозиторий или архив)")
         self.assertNotIn(b"\r\n", blob)
 
+    def stub_checker(self, body):
+        """Подменяет проверку заглушкой с нужным кодом возврата."""
+        with io.open(os.path.join(self.repo, "scripts", "check_memory_index.py"),
+                     "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(body)
+
+    def test_unusual_exit_code_is_not_called_a_memory_problem(self):
+        """126/127/130 - проверка не отработала. Говорить «память разъехалась» - врать."""
+        self.stub_checker("import sys\nsys.exit(130)\n")
+        self.git("add", "-A")
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 130, text)
+        self.assertIn("НЕ проверена", text)
+        self.assertNotIn("разошлись", text)
+        # Блокируем - значит обязаны сказать, как обойти.
+        self.assertIn("--no-verify", text)
+
+    def test_usage_error_points_at_the_user_own_config(self):
+        """Опечатка в ключах даёт код 2 и выключает блокировку - связь надо назвать."""
+        self.stub_checker("import sys\nsys.exit(2)\n")
+        self.git("config", "memorycheck.args", "--alow-orphan opechatka")
+        self.git("add", "-A")
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, text)
+        self.assertIn("memorycheck.args", text)
+
     def test_does_not_block_when_checker_is_missing(self):
         os.remove(os.path.join(self.repo, "scripts", "check_memory_index.py"))
         self.git("add", "-A")
