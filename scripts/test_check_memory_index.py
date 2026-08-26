@@ -886,16 +886,21 @@ class CiGuards(unittest.TestCase):
             return fh.read()
 
     def test_ci_guard_and_run_use_the_same_test_pattern(self):
-        """Гард считает по одному шаблону имён, а прогон идёт по другому.
+        """Гард и прогон обязаны считать по одному шаблону имён.
 
-        В гарде задан `test_*.py`, а `unittest discover` без ключа берёт
-        `test*.py` - без обязательного подчёркивания. Сегодня файл один и
-        разницы нет, но файл вида `testSomething.py` прогон подхватит, а гард
-        не досчитает - и порог станет мимо факта.
+        Прежняя редакция искала `-p 'test_*.py'` в тексте - а эта строка есть
+        только в шаге «Тесты». Шаблон гарда она не смотрела вовсе, и подмена
+        его на `test*.py` проходила незамеченной. Достаём оба литерала и
+        сравниваем их друг с другом, а не с ожиданием.
         """
         text = self.workflow()
-        self.assertIn("-p 'test_*.py'", text.replace('"', "'"),
-                      "прогон тестов не закреплён тем же шаблоном, что гард")
+        in_guard = re.search(r"discover\('scripts',\s*'([^']+)'\)", text)
+        in_run = re.search(r"discover -s scripts -p '([^']+)'", text)
+        self.assertIsNotNone(in_guard, "не найден шаблон в гарде")
+        self.assertIsNotNone(in_run, "прогон тестов не закреплён шаблоном")
+        self.assertEqual(in_guard.group(1), in_run.group(1),
+                         "гард считает по одному шаблону, прогон идёт по другому")
+
 
     def test_ci_threshold_matches_the_real_test_count(self):
         """Порог в гарде не должен разойтись с действительностью.
@@ -918,10 +923,15 @@ class CiGuards(unittest.TestCase):
     def test_ci_guard_survives_windows_console_encoding(self):
         """У inline-скрипта нет force_utf8_output - кодировку задаёт окружение.
 
-        Русский print в нём на windows-latest иначе падает с UnicodeEncodeError:
-        джоба покраснеет, но по невнятной причине.
+        Прежняя редакция искала имя переменной во всём файле и проходила,
+        когда та осталась только в комментарии. Требуем её в блоке env.
         """
-        self.assertIn("PYTHONIOENCODING", self.workflow())
+        text = self.workflow()
+        env_block = re.search(r"\n    env:\n((?:      .*\n|\n)+)", text)
+        self.assertIsNotNone(env_block, "в workflow не найден блок env")
+        self.assertIn("PYTHONIOENCODING", env_block.group(1),
+                      "переменная не выставлена ни для одного шага")
+
 
     def test_ci_checks_that_tests_were_actually_collected(self):
         """На Python 3.9 сломанный discover даёт зелёную галочку при нуле тестов.
@@ -1366,6 +1376,155 @@ class SecondRoundFindings(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
+
+
+class ThirdRoundFindings(MemoryFixture):
+    """Третий круг. Каждая правка проверяется в обе стороны.
+
+    Все находки круга - маятник: прежняя правка закрывала одну сторону и
+    открывала другую. Поэтому здесь на каждый фикс два теста: что он ловит и
+    что при этом остаётся законным.
+    """
+
+    def test_hidden_count_ignores_what_is_visible_anyway(self):
+        """Ссылка «см. общий индекс» из архивной ветки не прячет весь корень.
+
+        Транзитивный подсчёт проваливался внутрь достижимого поддерева и
+        засчитывал его целиком как скрытое: на реальной памяти число врало в
+        двести раз. Инструмент, завышающий масштаб, толкает к неверному
+        решению - ровно то, ради чего число и заводили.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Сервер](server.md) - прод\n"
+                         "- [База](db.md) - данные\n",
+            "user.md": "факт\n",
+            "server.md": "факт\n",
+            "db.md": "факт\n",
+            "arch/MEMORY.md": "- [Общий](../MEMORY.md) - см. также\n"
+                              "- [Своё](staroe.md) - архив\n",
+            "arch/staroe.md": "архивный факт\n",
+        })
+        _code, output = self.run_linter()
+        hidden = [line for line in output.splitlines() if "скрыто" in line]
+        self.assertEqual(len(hidden), 1, output)
+        self.assertIn("скрыто 1 файл", hidden[0])
+
+    def test_hidden_count_still_walks_the_chain(self):
+        """Обратная сторона: транзитивность нужна и должна сохраниться.
+
+        Под-индекс в глубине недостижимой цепочки прячет и себя, и свои
+        факты. Прямой подсчёт называл бы единицу.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "arch/MEMORY.md": "- [Глубже](nested/MEMORY.md) - под\n",
+            "arch/nested/MEMORY.md": "- [Раз](a.md) - факт\n- [Два](b.md) - факт\n",
+            "arch/nested/a.md": "факт\n",
+            "arch/nested/b.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        top = [line for line in output.splitlines()
+               if "arch/MEMORY.md" in line and "скрыто" in line]
+        self.assertEqual(len(top), 1, output)
+        self.assertIn("скрыто 3 файла", top[0])
+
+    def test_filename_followed_by_a_sentence_period_is_found(self):
+        """`... лежит в user.md.` - точка кончает предложение, а не имя файла.
+
+        Просмотр вперёд, добавленный ради `user.mdx`, запрещал точку после
+        имени - и упоминание в обычной прозе переставало находиться вовсе.
+        Связный текст с точками в конце предложений - стиль этого репозитория.
+        """
+        self.write({
+            "MEMORY.md": "- [Список](spisok.md) - перечень\n",
+            "spisok.md": "Полный текст правил лежит в user.md.\n",
+            "user.md": "забытый факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        about = [line for line in output.splitlines() if line.startswith("L2 user.md")]
+        self.assertEqual(len(about), 1, output)
+        self.assertIn("spisok.md", about[0])
+
+    def test_filename_with_a_longer_extension_is_still_a_different_file(self):
+        """Обратная сторона: `user.mdx` - другой файл, ложным совпадением быть не должен."""
+        self.write({
+            "MEMORY.md": "- [Список](spisok.md) - перечень\n",
+            "spisok.md": "Раньше был файл user.mdx, другой формат.\n",
+            "user.md": "забытый факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        about = [line for line in output.splitlines() if line.startswith("L2 user.md")]
+        self.assertEqual(len(about), 1, output)
+        self.assertNotIn("spisok.md", about[0])
+
+    def test_dash_label_is_a_reference_not_a_checkbox(self):
+        """`[-]` чекбоксом не является ни в одном спек-совместимом рендерере.
+
+        Исключая его вместе с `[ ]` и `[x]`, мы ломали законную ссылку-метку -
+        то есть создавали ровно тот вред, который правка про чеклисты
+        закрывала, просто на более редком входе.
+        """
+        self.write({
+            "MEMORY.md": "- [-] - метка, названная дефисом\n"
+                         "\n"
+                         "[-]: real.md\n",
+            "real.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_checkbox_marks_are_still_not_references(self):
+        """Обратная сторона: `[ ]` и `[x]` остаются чеклистом.
+
+        Здесь компромисс осознанный: GitHub тоже отдаёт приоритет чекбоксу.
+        """
+        self.write({
+            "MEMORY.md": "- [Один факт](real.md) - обычная строка\n"
+                         "\n"
+                         "[x]: nowhere.md\n"
+                         "\n"
+                         "- [x] почистить бэклог\n"
+                         "- [X] и заглавной тоже\n"
+                         "- [ ] следующая задача\n",
+            "real.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_same_basename_elsewhere_is_a_real_source(self):
+        """Упоминание в файле с тем же именем, но в другой папке - не самоупоминание.
+
+        Само-исключение сравнивало кандидата с basename просматриваемого
+        файла, поэтому упоминание «user.md» внутри `a/user.md` считалось
+        упоминанием самим себя - и подсказка про настоящий источник пропадала.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](a/user.md) - кто\n",
+            "a/user.md": "См. user.md в этом же разделе.\n",
+            "c/user.md": "забытый факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        about = [line for line in output.splitlines() if line.startswith("L2 c/user.md")]
+        self.assertEqual(len(about), 1, output)
+        self.assertIn("a/user.md", about[0])
+
+    def test_a_file_mentioning_only_itself_is_not_its_own_source(self):
+        """Обратная сторона: самоупоминание источником по-прежнему не считается."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "odinokiy.md": "Смотри также odinokiy.md для истории.\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        about = [line for line in output.splitlines() if line.startswith("L2 odinokiy.md")]
+        self.assertEqual(len(about), 1, output)
+        self.assertNotIn("ссылается", about[0])
 
 
 class MemoryFolderBoundary(MemoryFixture):
@@ -1886,14 +2045,22 @@ class DocumentationMatchesReality(unittest.TestCase):
     def test_lefthook_snippet_is_a_config_not_a_bare_line(self):
         """Голая строка `sh "..."` для lefthook - не конфиг, а скаляр.
 
-        Для husky строка верна: `.husky/pre-commit` - это shell-скрипт. В
-        `lefthook.yml` ей нужен вид команды внутри `pre-commit: commands:`,
-        иначе YAML разберёт её как значение и хук не подключится.
+        Для husky строка верна: `.husky/pre-commit` - обычный shell-скрипт. В
+        `lefthook.yml` ей нужен вид команды внутри `pre-commit: commands:`.
+
+        Прежняя редакция искала слово `commands:` где угодно в README и
+        проходила на сломанном сниппете. Проверяем структуру.
         """
         text = self.readme()
         if "lefthook" not in text:
             self.skipTest("README больше не упоминает lefthook")
-        self.assertIn("commands:", text)
+        block = re.search(r"```ya?ml\n(.*?)```", text, re.S)
+        self.assertIsNotNone(block, "в README нет yaml-блока для lefthook")
+        self.assertRegex(
+            block.group(1),
+            r"pre-commit:\s*\n\s+commands:\s*\n\s+\S+:\s*\n\s+run:\s*\S",
+            "сниппет lefthook не является конфигом: %s" % block.group(1))
+
 
     def test_readme_does_not_teach_the_destructive_unset(self):
         """Тот же разрушительный совет не должен переехать из хука в документацию."""
@@ -2173,6 +2340,18 @@ class PreCommitHook(unittest.TestCase):
         result = self.run_hook()
         self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
 
+    def printed_lines(self):
+        """Строки, которые хук реально печатает человеку.
+
+        Не весь файл: команда, оставшаяся только в комментарии, человеку не
+        показывается - а тест, ищущий подстроку по всему файлу, этого не
+        замечает. Второй круг уже поймал один такой тест-пустышку.
+        """
+        with io.open(HOOK, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        return [line for line in lines
+                if not line.lstrip().startswith("#") and "pre-commit:" in line]
+
     def test_hook_never_advises_unsetting_hooks_path(self):
         """Совет, который сносит чужие хуки молча, не должен звучать пользователю.
 
@@ -2200,25 +2379,39 @@ class PreCommitHook(unittest.TestCase):
     def test_hook_tells_how_to_find_what_owns_hooks_path(self):
         """Отключать вслепую нечего - сначала надо увидеть, чем хук подключён.
 
-        Второй дефект прежнего совета: при глобальном core.hooksPath команда
-        `--unset` правит локальный конфиг, где ключа нет, возвращает 5 и не
-        печатает ничего. Человек выполнил предложенное и остался заперт.
+        Прежняя редакция искала `--show-origin` во всём файле и проходила,
+        даже когда флаг остался только в комментарии, а из живой команды
+        исчез. Смотрим на строку, которую человек реально увидит.
         """
-        with io.open(HOOK, encoding="utf-8") as fh:
-            text = fh.read()
-        self.assertIn("--show-origin", text)
+        printed = self.printed_lines()
+        origin = [line for line in printed if "core.hooksPath" in line]
+        self.assertTrue(origin, "хук не показывает, чем он подключён")
+        self.assertTrue(
+            any("--show-origin" in line for line in origin),
+            "команда диагностики не показывает происхождение ключа: %s" % origin)
+
 
     def test_disable_advice_covers_the_empty_answer(self):
         """Диагностика обязана предусмотреть, что ключ не задан вовсе.
 
         lefthook не использует core.hooksPath - он кладёт хуки прямо в
-        .git/hooks. У человека, подключившего нас ровно так, как советует
-        README, `--show-origin --get core.hooksPath` не выведет НИЧЕГО. Совет,
-        рассчитанный на два исхода из трёх, оставляет его без следующего шага.
+        .git/hooks. У человека, подключившего нас так, как советует README,
+        `--show-origin --get core.hooksPath` не выведет НИЧЕГО.
+
+        Прежняя редакция искала слово «lefthook» во всём файле и проходила,
+        даже если содержательная ветка исчезала, а слово оставалось в общей
+        фразе. Требуем именно разбор случая «ничего не вывелось».
         """
-        with io.open(HOOK, encoding="utf-8") as fh:
-            text = fh.read()
-        self.assertIn("lefthook", text.lower())
+        printed = self.printed_lines()
+        empty_case = [line for line in printed
+                      if "не вывела" in line or "не вывело" in line
+                      or "ничего не" in line]
+        self.assertTrue(
+            empty_case,
+            "совет не разбирает случай, когда ключ не задан вовсе: %s" % printed)
+        self.assertTrue(
+            any("lefthook" in line.lower() for line in printed),
+            "не назван самый частый источник пустого ответа")
 
 
     def test_blocking_branch_offers_bypass_and_no_destructive_command(self):
