@@ -292,14 +292,20 @@ class IndexParsing(MemoryFixture):
         self.assertEqual(code, 0, output)
 
     def test_row_before_unclosed_comment_survives(self):
-        """Комментарий открыт в хвосте строки - сама строка от этого не пропадает."""
+        """Комментарий открыт в хвосте строки - сама строка от этого не пропадает.
+
+        Проверяем именно это: user.md разобран и сиротой не объявлен. Код при
+        этом 2 - часть файла ниже комментария в разбор не попала.
+        """
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто <!-- TODO дописать крючок\n",
             "user.md": "факт\n",
         })
         code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
+        self.assertEqual(code, 2, output)
         self.assertIn("не закрыт", output.lower())
+        self.assertNotIn("L2 user.md", output)
+
 
     def test_row_after_comment_end_on_same_line_survives(self):
         self.write({
@@ -882,6 +888,178 @@ class LinkedSubtrees(MemoryFixture):
         self.assertEqual(code, 0, output)
 
 
+class SilentFailures(MemoryFixture):
+    """Самый опасный класс: проверка говорит «всё в порядке» на разъехавшейся памяти.
+
+    Найдено шестым кругом ревью по линзе «молчит ли». Общий признак у всех
+    пяти: часть разбора не выполнилась, а вывод об этом не сказал ни слова -
+    и код возврата остался нулевым.
+    """
+
+    def test_nested_fence_does_not_end_the_outer_block(self):
+        """Забор из четырёх кавычек не закрывается забором из трёх.
+
+        Приём «индекс документирует свой формат» README сам и советует:
+        внешний блок берут длиннее, чтобы внутри показать обычный. Прежде
+        внутренний закрывал внешний, и строка-ПРИМЕР становилась настоящей
+        строкой индекса - файл, которого в индексе нет, объявлялся упомянутым.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "````markdown\n"
+                         "```\n"
+                         "- [Пример](primer.md) - так выглядит строка\n"
+                         "```\n"
+                         "````\n",
+            "user.md": "факт\n",
+            "primer.md": "этого файла в индексе нет\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("primer.md", output)
+
+    def test_tilde_inside_backtick_fence_does_not_end_it(self):
+        """Забор закрывается только своим символом - тильда кавычки не закрывает."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "```markdown\n"
+                         "~~~\n"
+                         "- [Пример](primer.md) - так выглядит строка\n"
+                         "~~~\n"
+                         "```\n",
+            "user.md": "факт\n",
+            "primer.md": "этого файла в индексе нет\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("primer.md", output)
+
+    def test_closing_fence_may_be_longer_than_the_opening_one(self):
+        """CommonMark разрешает закрывать более длинным забором - не сломать это."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "```markdown\n"
+                         "- [Пример](primer.md) - строка-пример\n"
+                         "`````\n"
+                         "- [Сервер](server.md) - прод\n",
+            "user.md": "факт\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_unreadable_subfolder_is_reported_and_unverifiable(self):
+        """Поддерево, которое не открылось, уносит с собой факты - молчать нельзя.
+
+        os.walk без onerror глотает отказ доступа: каталог с под-индексом и
+        фактами просто исчезает из обхода, и проверка отчитывается «согласована».
+        Сказать про такую память что-либо нельзя - это код 2, а не код 0.
+        """
+        real_walk = os.walk
+
+        def fake_walk(top, onerror=None, **kw):
+            for folder, dirs, names in real_walk(top, **kw):
+                if "zakrytoe" in dirs:
+                    dirs.remove("zakrytoe")
+                    if onerror is not None:
+                        err = OSError(13, "Permission denied")
+                        err.filename = os.path.join(folder, "zakrytoe")
+                        onerror(err)
+                yield folder, dirs, names
+
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "zakrytoe/tayna.md": "факт, которого проверка не увидит\n",
+        })
+        with unittest.mock.patch.object(linter.os, "walk", fake_walk):
+            code, output = self.run_linter()
+        self.assertIn("zakrytoe", output)
+        self.assertEqual(code, 2, output)
+
+    def test_orphan_marker_quoted_in_prose_does_not_free_the_file(self):
+        """Заметка ПРО метку не должна освобождать сама себя.
+
+        Метка ищется по сырым первым строкам, поэтому файл, где она приведена
+        как пример внутри блока кода, молча выпадал из L2 - ровно тот файл,
+        который рассказывает, как работает проверка.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "zametka.md": "Как исключить файл из индекса:\n"
+                          "\n"
+                          "```\n"
+                          "<!-- linter: orphan-ok -->\n"
+                          "```\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("zametka.md", output)
+
+    def test_real_orphan_marker_still_frees_the_file(self):
+        """Обратная сторона: настоящая метка вне блока кода работать не перестала."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "zagotovka.md": "<!-- linter: orphan-ok -->\n\nчерновик\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_unclosed_fence_makes_the_run_unverifiable(self):
+        """Незакрытый блок - это невыполненный разбор, а не чистая память.
+
+        Строки ниже незакрытого забора в разбор не попали. Сейчас про это
+        печаталась заметка, но код оставался нулевым - то есть CI зеленел на
+        индексе, который прочитан наполовину. У нечитаемого индекса такой же
+        случай уже даёт код 2; здесь было непоследовательно.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "```markdown\n"
+                         "- [Заголовок](primer.md) - забыли закрыть блок\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertIn("не закрыт", output.lower())
+        self.assertEqual(code, 2, output)
+
+    def test_linked_subtree_is_mentioned_not_silently_skipped(self):
+        """Связанный каталог пропускается намеренно - но об этом надо сказать.
+
+        Правило описано в README, однако человек, глядя на вывод, не может
+        отличить «проверено и чисто» от «сюда даже не заходили».
+        """
+        outside = tempfile.mkdtemp(prefix="memcheck-outside-")
+        self.addCleanup(shutil.rmtree, outside, True)
+        with io.open(os.path.join(outside, "chuzhoe.md"), "w", encoding="utf-8") as fh:
+            fh.write("не наша память\n")
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        try:
+            if os.name == "nt":
+                result = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", os.path.join(self.root, "shared"), outside],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                if result.returncode != 0:
+                    self.skipTest("junction создать не удалось")
+            else:
+                os.symlink(outside, os.path.join(self.root, "shared"),
+                           target_is_directory=True)
+        except OSError:
+            self.skipTest("связывание каталогов недоступно")
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertIn("shared", output)
+
+
 class ExitCodeContract(MemoryFixture):
     """Код 1 - только нарушения памяти. Всё прочее обязано быть кодом 2.
 
@@ -1043,7 +1221,12 @@ class ExitCodes(MemoryFixture):
         self.assertIn("не закрыт", output.lower())
 
     def test_quiet_still_reports_that_part_of_the_index_was_not_read(self):
-        """Совет промолчать может, «я не дочитал индекс» - нет. Это тихий отказ."""
+        """Совет промолчать может, «я не дочитал индекс» - нет. Это тихий отказ.
+
+        Код 2, а не 0: разбор выполнен наполовину, и утверждать, что память
+        согласована, нельзя. Хук на коде 2 коммит не блокирует - он говорит
+        «проверить не удалось», а не «у вас нарушения».
+        """
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n"
                          "\n"
@@ -1052,8 +1235,9 @@ class ExitCodes(MemoryFixture):
             "user.md": "факт\n",
         })
         code, output = self.run_linter("--quiet")
-        self.assertEqual(code, 0, output)
+        self.assertEqual(code, 2, output)
         self.assertIn("не закрыт", output.lower())
+
 
     def test_explanation_prints_before_the_accusations(self):
         """Под списком из шести обвинений причину никто не читает."""

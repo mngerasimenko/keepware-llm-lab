@@ -44,8 +44,31 @@ from urllib.parse import unquote, urlparse
 ROW = re.compile(r"^[-*+]\s*\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\(([^)]*)\)")
 BULLET = re.compile(r"^[-*+]\s")
 
-FENCE = re.compile(r"^\s*(```|~~~)")
+FENCE = re.compile(r"^\s*(`{3,}|~{3,})\s*(.*)$")
 COMPLETE_COMMENT = re.compile(r"<!--.*?-->", re.S)
+
+
+def fence_delimiter(line):
+    """Забор в начале строки: (символы забора, хвост) либо (None, None)."""
+    match = FENCE.match(line)
+    if not match:
+        return None, None
+    return match.group(1), match.group(2)
+
+
+def closes_fence(mark, opened):
+    """CommonMark: закрывающий забор - того же символа и не короче открывающего.
+
+    Без этого правила блок из четырёх кавычек закрывался блоком из трёх, а
+    тильда закрывала кавычки. Приём «внешний забор длиннее внутреннего» -
+    ровно то, чем документируют формат, и мы сами его и советуем: строка-
+    ПРИМЕР становилась настоящей строкой индекса, а файл, которого в индексе
+    нет, объявлялся упомянутым.
+
+    Хвост после закрывающего забора обязан быть пустым - иначе `~~~python`
+    внутри блока сошёл бы за закрытие.
+    """
+    return mark[0] == opened[0] and len(mark) >= len(opened)
 
 # Метка "этот файл лежит вне индекса намеренно" - по образцу директивы :orphan:
 # в Sphinx, которому пришлось её завести ровно по этой причине.
@@ -123,13 +146,14 @@ def parse_index(path):
     комментарии зовущий обязан сказать вслух - для этого второе значение.
     """
     rows = []
-    in_fence = False
+    opened_fence = ""
     in_comment = False
     after_list_item = False
     for lineno, line in enumerate(read_text(path).splitlines(), 1):
-        if in_fence:
-            if FENCE.match(line):
-                in_fence = False
+        if opened_fence:
+            mark, tail = fence_delimiter(line)
+            if mark and closes_fence(mark, opened_fence) and not tail.strip():
+                opened_fence = ""
             continue
         if in_comment:
             if "-->" not in line:
@@ -137,11 +161,12 @@ def parse_index(path):
             line = line.split("-->", 1)[1]
             in_comment = False
         line = COMPLETE_COMMENT.sub("", line)
-        if FENCE.match(line):
+        mark, _tail = fence_delimiter(line)
+        if mark:
             # Раньше поиска незакрытого комментария: внутри блока кода
             # `<!--` - обычный текст, и строка "```markdown <!-- пример"
             # иначе включала бы разом оба состояния.
-            in_fence = True
+            opened_fence = mark
             after_list_item = False
             continue
         if "<!--" in line:
@@ -164,7 +189,7 @@ def parse_index(path):
         match = ROW.match(body)
         if match:
             rows.append((match.group(1).strip(), match.group(2).strip(), lineno))
-    unclosed = "блок кода" if in_fence else ("html-комментарий" if in_comment else None)
+    unclosed = "блок кода" if opened_fence else ("html-комментарий" if in_comment else None)
     return rows, unclosed
 
 
@@ -191,7 +216,7 @@ def is_linked_dir(path):
     return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
-def prune_non_memory_dirs(folder, dirs):
+def prune_non_memory_dirs(folder, dirs, linked=None):
     """Убирает из обхода то, что памятью не является.
 
     **Скрытые каталоги** (на точку). У тех, кто держит заметки в markdown-
@@ -215,6 +240,8 @@ def prune_non_memory_dirs(folder, dirs):
         if name.startswith("."):
             continue
         if is_linked_dir(os.path.join(folder, name)):
+            if linked is not None:
+                linked.append(os.path.join(folder, name))
             continue
         kept.append(name)
     dirs[:] = kept
@@ -222,7 +249,7 @@ def prune_non_memory_dirs(folder, dirs):
 
 
 def build_file_map(root):
-    """Один обход папки: точные пути и их регистро-независимые двойники.
+    """Один обход папки: точные пути, регистро-независимые двойники и то, что не открылось.
 
     Раньше каждая строка индекса опрашивала файловую систему через os.listdir.
     На Windows это врало: система регистронезависима, поэтому расхождение в
@@ -232,14 +259,23 @@ def build_file_map(root):
     """
     exact = {}
     folded = {}
-    for folder, dirs, names in os.walk(root):
-        prune_non_memory_dirs(folder, dirs)
+    unreadable_dirs = []
+    linked_dirs = []
+
+    def remember(error):
+        # os.walk без onerror глотает отказ доступа молча: поддерево с
+        # под-индексом и фактами просто исчезает из обхода, а проверка
+        # отчитывается «согласована». Это тихий отказ, а не чистая память.
+        unreadable_dirs.append(getattr(error, "filename", None) or str(error))
+
+    for folder, dirs, names in os.walk(root, onerror=remember):
+        prune_non_memory_dirs(folder, dirs, linked_dirs)
         for name in sorted(names):
             path = os.path.normpath(os.path.join(folder, name))
             rel = os.path.relpath(path, root).replace(os.sep, "/")
             exact[rel] = path
             folded.setdefault(rel.casefold(), path)
-    return exact, folded
+    return exact, folded, unreadable_dirs, linked_dirs
 
 
 def relative_to_root(root, path):
@@ -283,7 +319,22 @@ def is_orphan_ok(path):
         return False
     if any(FRONTMATTER_ORPHAN.match(line) for line in frontmatter_lines(text)):
         return True
-    return any(COMMENT_ORPHAN.search(line) for line in text.splitlines()[:HEAD_LINES])
+    # Метку ищем ВНЕ блоков кода: иначе заметка, приводящая её как пример,
+    # молча исключает из проверки сама себя - а это ровно тот файл, который
+    # рассказывает, как проверка работает.
+    opened_fence = ""
+    for line in text.splitlines()[:HEAD_LINES]:
+        mark, tail = fence_delimiter(line)
+        if opened_fence:
+            if mark and closes_fence(mark, opened_fence) and not tail.strip():
+                opened_fence = ""
+            continue
+        if mark:
+            opened_fence = mark
+            continue
+        if COMMENT_ORPHAN.search(line):
+            return True
+    return False
 
 
 def find_indexes(root, index_name):
@@ -391,9 +442,25 @@ def check(root, index_paths, allow_globs, index_name):
     index_links = defaultdict(set)
     empty_indexes = []
     unreadable = []
+    incomplete = []
     row_count = 0
 
-    exact, folded = build_file_map(root)
+    exact, folded, unreadable_dirs, linked_dirs = build_file_map(root)
+
+    # Каталог, который не открылся, уносит с собой факты: сказать про такую
+    # память «согласована» нельзя, это невыполненная проверка (код 2).
+    for where in unreadable_dirs:
+        notices.append("%s: каталог не читается - его содержимое в проверку не "
+                       "попало, о забытых в индексе файлах судить нельзя"
+                       % (relative_to_root(root, where) or where))
+
+    # Связанные каталоги пропускаются намеренно (чужая память), но человек по
+    # выводу не отличит «проверено и чисто» от «сюда даже не заходили».
+    for where in linked_dirs:
+        notices.append("%s: связанный каталог (симлинк или junction) - пропущен, "
+                       "его содержимое не проверялось"
+                       % (relative_to_root(root, where) or where))
+
     index_rels = {relative_to_root(root, p) for p in index_paths}
     # Корневой индекс ОДИН: файл с заданным именем в самой папке памяти.
     # Под-индекс - файл с тем же именем в подпапке. Двух корневых не бывает
@@ -431,6 +498,10 @@ def check(root, index_paths, allow_globs, index_name):
                 "%s: %s не закрыт до конца файла - строки ниже в разбор не попали"
                 % (where, unclosed)
             )
+            # Часть индекса не прочитана - тот же случай, что нечитаемый индекс.
+            # Прежде печаталась заметка, а код оставался нулевым: CI зеленел на
+            # индексе, разобранном наполовину.
+            incomplete.append(where)
         if not index_rows:
             empty_indexes.append(where)
         for title, raw_target, lineno in index_rows:
@@ -596,7 +667,7 @@ def check(root, index_paths, allow_globs, index_name):
             warnings.append("L3 заголовок «%s» ведёт на разные файлы: %s"
                             % (title, ", ".join(sorted(paths))))
 
-    return errors, notices, warnings, row_count, False
+    return errors, notices, warnings, row_count, bool(incomplete or unreadable_dirs)
 
 
 def build_parser():
