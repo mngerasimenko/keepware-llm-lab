@@ -45,6 +45,12 @@ ROW = re.compile(r"^[-*+]\s*\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\(([^)]*)\)")
 # Ссылка-метка: "- [Профиль][prof]" и свёрнутая форма "- [prof][]". Законный
 # markdown, по которому агент дойдёт - а L2 объявлял такой файл забытым.
 ROW_REF = re.compile(r"^[-*+]\s*\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\[([^\]]*)\]")
+# Сокращённая форма: "- [prof] - крючок", метка и есть текст ссылки. Третья
+# законная форма CommonMark. Отрицательный просмотр вперёд обязателен: без него
+# паттерн перехватывал бы обычные строки "- [Заголовок](файл.md)".
+# Строкой индекса она считается ТОЛЬКО при наличии определения метки - иначе
+# чекбоксы "- [ ]" и любые скобки в прозе стали бы ошибками на пустом месте.
+ROW_SHORTCUT = re.compile(r"^[-*+]\s*\[([^\[\]]+)\](?!\s*[\(\[])")
 # Определение метки: "[prof]: user.md". Отступ до трёх пробелов - по CommonMark.
 DEFINITION = re.compile(r"^\s{0,3}\[([^\]]+)\]:\s*(\S+)")
 BULLET = re.compile(r"^[-*+]\s")
@@ -79,8 +85,6 @@ def closes_fence(mark, opened):
 # в Sphinx, которому пришлось её завести ровно по этой причине.
 FRONTMATTER_ORPHAN = re.compile(r"^\s*orphan\s*:\s*true\s*$", re.I)
 COMMENT_ORPHAN = re.compile(r"<!--\s*linter:\s*orphan-ok\s*-->", re.I)
-
-HEAD_LINES = 20
 
 EXIT_OK = 0
 EXIT_VIOLATION = 1
@@ -195,7 +199,11 @@ def parse_index(path):
         definition = DEFINITION.match(body)
         if definition:
             # Метки регистронезависимы по CommonMark.
-            definitions[definition.group(1).strip().casefold()] = definition.group(2).strip()
+            # setdefault, а не присваивание: по CommonMark при повторе метки
+            # побеждает ПЕРВОЕ определение. Перезапись давала тихий пропуск -
+            # агент и любой рендерер идут по первому, проверка шла по последнему.
+            definitions.setdefault(definition.group(1).strip().casefold(),
+                                   definition.group(2).strip())
             after_list_item = False
             continue
 
@@ -209,15 +217,21 @@ def parse_index(path):
             title = reference.group(1).strip()
             # Свёрнутая форма "[user][]" берёт метку из текста ссылки.
             label = reference.group(2).strip() or title
-            pending_refs.append((title, label, lineno))
+            pending_refs.append((title, label, lineno, True))
+            continue
+        shortcut = ROW_SHORTCUT.match(body)
+        if shortcut:
+            label = shortcut.group(1).strip()
+            # required=False: нет определения - значит это не ссылка, а текст.
+            pending_refs.append((label, label, lineno, False))
     # Определения ищутся по всему файлу, поэтому метки разрешаем в конце:
     # "[prof]: user.md" законно стоит и ниже строки, которая на неё ссылается.
-    for title, label, lineno in pending_refs:
+    for title, label, lineno, required in pending_refs:
         target = definitions.get(label.casefold())
-        if target is None:
-            rows.append((title, label, lineno, "ref-missing"))
-        else:
+        if target is not None:
             rows.append((title, target, lineno, "inline"))
+        elif required:
+            rows.append((title, label, lineno, "ref-missing"))
 
     unclosed = "блок кода" if opened_fence else ("html-комментарий" if in_comment else None)
     return rows, unclosed
@@ -308,6 +322,18 @@ def build_file_map(root):
     return exact, folded, unreadable_dirs, linked_dirs
 
 
+def files_count(number):
+    """«1 файл», «2 файла», «5 файлов» - инструмент выходит на люди."""
+    tail, hundred = number % 10, number % 100
+    if tail == 1 and hundred != 11:
+        word = "файл"
+    elif 2 <= tail <= 4 and not 12 <= hundred <= 14:
+        word = "файла"
+    else:
+        word = "файлов"
+    return "%d %s" % (number, word)
+
+
 def relative_to_root(root, path):
     """Путь внутри папки памяти или None, если он из неё вышел.
 
@@ -352,8 +378,13 @@ def is_orphan_ok(path):
     # Метку ищем ВНЕ блоков кода: иначе заметка, приводящая её как пример,
     # молча исключает из проверки сама себя - а это ровно тот файл, который
     # рассказывает, как проверка работает.
+    #
+    # По всему файлу, без лимита на первые строки: наша же конвенция памяти -
+    # шапка плюс обязательные разделы - съедает два десятка строк раньше, чем
+    # автор дойдёт до пометки, и честно помеченный файл блокировал коммит.
+    # От файла ПРО метку теперь защищает фильтр блоков кода, а не лимит строк.
     opened_fence = ""
-    for line in text.splitlines()[:HEAD_LINES]:
+    for line in text.splitlines():
         mark, tail = fence_delimiter(line)
         if opened_fence:
             if mark and closes_fence(mark, opened_fence) and not tail.strip():
@@ -412,14 +443,26 @@ def looks_like_a_stray_index(root, index_name, exact):
     return stray
 
 
-def name_patterns(*names):
-    """Границы слева обязательны: без них «user.md» находится в «superuser.md»."""
-    return [re.compile(r"(?<![\w.\-/])" + re.escape(name)) for name in names if name]
+# Имя файла памяти как цельный токен. Максимальная жадность и обязательное
+# окончание на .md дают границу сами: в «superuser.md» найдётся именно
+# «superuser.md», а не «user.md» внутри него.
+FILENAME_TOKEN = re.compile(r"[\w.\-/\\]+\.md", re.I)
 
 
-def first_file_mentioning(paths, patterns, cache):
-    """Первый файл из списка, где встречается имя. paths - пары (путь, имя)."""
-    for path, rel in paths:
+def map_mentions(others, wanted, cache):
+    """Где встречается каждое из искомых имён: один проход по каждому файлу.
+
+    Прежде для КАЖДОЙ сироты заново сканировались все остальные файлы -
+    O(сирот × файлов) поисков по регулярке. На памяти масштаба портфеля
+    (240 файлов) сорок сирот превращали проверку из 45 мс в две с половиной
+    секунды - и это ровно тот момент, когда хук зовут чаще всего: человек
+    чинит разъехавшуюся память и коммитит снова.
+
+    Теперь каждый файл читается и разбирается один раз, а совпадение ищется
+    поиском по множеству.
+    """
+    found = {}
+    for path, rel in others:
         text = cache.get(rel)
         if text is None:
             try:
@@ -427,12 +470,26 @@ def first_file_mentioning(paths, patterns, cache):
             except OSError:
                 text = ""
             cache[rel] = text
-        if any(pattern.search(text) for pattern in patterns):
-            return rel
-    return None
+        for token in set(FILENAME_TOKEN.findall(text)):
+            normalised = token.replace("\\", "/")
+            for candidate in (normalised, os.path.basename(normalised)):
+                if candidate in wanted:
+                    found.setdefault(candidate, rel)
+    return found
 
 
-def mentioned_in_raw_text(index_paths, *names):
+def read_all(paths):
+    """Тексты файлов одним словарём: нечитаемый - пустая строка, не отказ."""
+    texts = {}
+    for path in paths:
+        try:
+            texts[path] = read_text(path)
+        except OSError:
+            texts[path] = ""
+    return texts
+
+
+def mentioned_in_raw_text(index_texts, *names):
     """Имя файла встречается в тексте индекса, но ссылкой не разобралось.
 
     Тогда сообщение «не упомянут ни в одном индексе» человека дезориентирует:
@@ -444,14 +501,8 @@ def mentioned_in_raw_text(index_paths, *names):
     «superuser.md», и подсказка утверждала бы небылицу.
     """
     patterns = [re.compile(r"(?<![\w.\-/])" + re.escape(name)) for name in names if name]
-    for path in index_paths:
-        try:
-            text = read_text(path)
-        except OSError:
-            continue
-        if any(pattern.search(text) for pattern in patterns):
-            return True
-    return False
+    return any(pattern.search(text)
+               for text in index_texts.values() for pattern in patterns)
 
 
 def check(root, index_paths, allow_globs, index_name):
@@ -467,6 +518,11 @@ def check(root, index_paths, allow_globs, index_name):
     notices = []
     warnings = []
     referenced = set()
+    # Строки копим по индексу, а не сразу в общий котёл: засчитывать их
+    # упомянутыми можно только после того, как известно, достижим ли сам
+    # индекс. Иначе под-индекс, до которого неоткуда дойти, «отмывает» свои
+    # файлы - и пометка orphan на нём давала зелёный свет невидимой ветке.
+    per_index = defaultdict(list)
     titles = defaultdict(set)
     seen_rows = set()
     index_links = defaultdict(set)
@@ -583,8 +639,7 @@ def check(root, index_paths, allow_globs, index_name):
             actual = hit or twin
             if actual is not None:
                 actual_rel = relative_to_root(root, actual)
-                referenced.add(actual_rel)
-                titles[title].add(actual_rel)
+                per_index[where].append((title, actual_rel))
                 if actual_rel in index_rels and actual_rel != where:
                     index_links[where].add(actual_rel)
                 row_key = (where, title, actual_rel)
@@ -656,6 +711,15 @@ def check(root, index_paths, allow_globs, index_name):
                 reachable.add(target)
                 queue.append(target)
 
+    # Теперь, когда достижимость известна, засчитываем упомянутыми только те
+    # строки, что лежат в достижимых индексах.
+    for where, rows_of in per_index.items():
+        if where not in reachable:
+            continue
+        for title, actual_rel in rows_of:
+            referenced.add(actual_rel)
+            titles[title].add(actual_rel)
+
     orphans = []
     for rel in sorted(exact):
         if not rel.lower().endswith(".md"):
@@ -663,11 +727,27 @@ def check(root, index_paths, allow_globs, index_name):
         if any(fnmatch.fnmatchcase(rel, pattern) for pattern in allow_globs):
             continue
         if rel in index_rels:
-            if rel in reachable or is_orphan_ok(exact[rel]):
+            if rel in reachable:
+                continue
+            behind = len({actual_rel for _title, actual_rel in per_index.get(rel, ())})
+            # Без придаточного: «1 файл, которые станут» не согласуется, а
+            # число тут любое.
+            tail = ". За ним скрыто %s" % files_count(behind) if behind else ""
+            if is_orphan_ok(exact[rel]):
+                # Метка снимает вопрос с самого файла - но не делает достижимым
+                # то, что он перечисляет. Молчать об этом нельзя: человек ставит
+                # метку, чтобы заглушить предупреждение, и получает зелёный свет
+                # вместе с невидимой веткой памяти.
+                if behind:
+                    notices.append(
+                        "%s: под-индекс помечен как намеренно вне индекса, но до "
+                        "него неоткуда дойти%s - пометьте скрытое тоже или "
+                        "исключите каталог ключом --allow-orphan" % (rel, tail)
+                    )
                 continue
             errors.append(
                 "L2 %s - под-индекс, до которого неоткуда дойти: от корневого "
-                "индекса (%s) цепочки ссылок на него нет" % (rel, index_name)
+                "индекса (%s) цепочки ссылок на него нет%s" % (rel, index_name, tail)
             )
             continue
         if rel in referenced or is_orphan_ok(exact[rel]):
@@ -675,14 +755,37 @@ def check(root, index_paths, allow_globs, index_name):
         orphans.append(rel)
 
     # Подсказки считаем отдельным проходом: тексты соседних файлов читаются
-    # один раз на всех сирот, а не заново на каждую.
+    # один раз на всех сирот, а не заново на каждую. Индексы - тем же приёмом:
+    # прежде они перечитывались с диска на КАЖДОГО сироту.
     cache = {}
+    index_texts = read_all(index_paths)
     others = [(exact[other], other) for other in sorted(exact)
               if other.lower().endswith(".md") and other not in index_rels]
+    wanted = set()
     for rel in orphans:
-        patterns = name_patterns(rel, os.path.basename(rel))
+        wanted.add(rel)
+        wanted.add(os.path.basename(rel))
+    mentions = map_mentions(others, wanted, cache) if wanted else {}
+    # Если файл упомянут в индексе, до которого неоткуда дойти, причина именно
+    # в этом - и говорить «проверьте формат строки» значит отправить человека
+    # чинить не то.
+    stranded = {}
+    for where, rows_of in per_index.items():
+        if where in reachable:
+            continue
+        for _title, actual_rel in rows_of:
+            stranded.setdefault(actual_rel, where)
+
+    for rel in orphans:
         hint = ""
-        if mentioned_in_raw_text(index_paths, rel, os.path.basename(rel)):
+        if rel in stranded:
+            errors.append(
+                "L2 %s не упомянут ни в одном достижимом индексе: он перечислен "
+                "в %s, а до того от корневого индекса (%s) дойти неоткуда"
+                % (rel, stranded[rel], index_name)
+            )
+            continue
+        if mentioned_in_raw_text(index_texts, rel, os.path.basename(rel)):
             hint = (" (имя файла в тексте индекса встречается, но ссылкой не "
                     "разобралось - проверьте формат строки, блок кода, комментарий)")
         else:
@@ -690,8 +793,9 @@ def check(root, index_paths, allow_globs, index_name):
             # по-своему. Для нас это обычный файл памяти, его строки мы не
             # разбираем - и говорить «агент не увидит» без объяснения значит
             # соврать: агент дойдёт по ссылке из корневого индекса.
-            source = first_file_mentioning(
-                [pair for pair in others if pair[1] != rel], patterns, cache)
+            source = mentions.get(rel) or mentions.get(os.path.basename(rel))
+            if source == rel:
+                source = None  # файл упомянул сам себя - это не источник
             if source:
                 # Здесь «агент его не увидит» было бы неправдой: по ссылке из
                 # индекса он дойдёт. Проблема в другом - строки этого файла мы

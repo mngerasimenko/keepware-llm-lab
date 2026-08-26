@@ -895,6 +895,203 @@ class CiGuards(unittest.TestCase):
         self.assertIn("countTestCases", text)
 
 
+class PanelReviewFindings(MemoryFixture):
+    """Находки состязательного ревью. Два критических случая - тихий отказ.
+
+    Общая мысль обоих: проверка объявляет память согласованной, когда часть
+    её агенту недоступна. Ровно тот класс, ради которого инструмент написан.
+    """
+
+    def test_orphan_marker_on_sub_index_does_not_legalise_what_it_lists(self):
+        """Метка снимает вопрос с ОДНОГО файла, а не со всей ветки за ним.
+
+        Строки всех найденных индексов заливались в «упомянутые» до расчёта
+        достижимости. Пометив недостижимый под-индекс как намеренный, человек
+        получал зелёный свет вместе с невидимой веткой памяти: сам под-индекс
+        прощён, а файлы, которые он перечисляет, уже засчитаны упомянутыми.
+
+        К этому подталкивало само сообщение: «под-индекс, до которого неоткуда
+        дойти» читается как «пометь, что он такой намеренно».
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "---\norphan: true\n---\n\n- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт, которого агент не увидит\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("infra/server.md", output)
+
+    def test_allow_orphan_on_sub_index_does_not_legalise_what_it_lists(self):
+        """Тот же случай через ключ запуска, а не через метку в файле."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт, которого агент не увидит\n",
+        })
+        code, output = self.run_linter("--allow-orphan", "infra/MEMORY.md")
+        self.assertEqual(code, 1, output)
+        self.assertIn("infra/server.md", output)
+
+    def test_whole_disconnected_branch_can_be_excluded_deliberately(self):
+        """Обратная сторона: осознанно отключить ВЕТКУ целиком по-прежнему можно.
+
+        Иначе правка выше запирала бы человека с архивным под-индексом: снять
+        вопрос с самого файла он может, а с его содержимого - нет.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "archive/MEMORY.md": "- [Старое](staroe.md) - архив\n",
+            "archive/staroe.md": "архивный факт\n",
+        })
+        code, output = self.run_linter("--allow-orphan", "archive/*.md")
+        self.assertEqual(code, 0, output)
+
+    def test_unreachable_sub_index_names_how_much_is_lost(self):
+        """Сообщение должно называть масштаб, а не только сам под-индекс.
+
+        Человек, видя одну строку про один файл, чинит одну строку. Знание
+        «за ним ещё N файлов» меняет решение - и удерживает от того, чтобы
+        заглушить предупреждение меткой.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - раз\n- [База](db.md) - два\n",
+            "infra/server.md": "факт\n",
+            "infra/db.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        unreachable = [line for line in output.splitlines()
+                       if "infra/MEMORY.md" in line and "неоткуда дойти" in line]
+        self.assertEqual(len(unreachable), 1, output)
+        self.assertRegex(unreachable[0], r"\b2\b",
+                         "в строке про недостижимый под-индекс не назван масштаб потери")
+
+
+    def test_orphan_hint_names_the_unreachable_sub_index_as_the_cause(self):
+        """Подсказка обязана назвать НАСТОЯЩУЮ причину, а не «проверьте формат».
+
+        Файл упомянут - но в под-индексе, до которого неоткуда дойти. Прежняя
+        подсказка отправляла человека проверять формат строки и блоки кода, то
+        есть чинить не то. Сообщение, уводящее в сторону, - тот же класс вреда,
+        что и совет, ломающий чужую настройку.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "---\norphan: true\n---\n\n- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        hint = [line for line in output.splitlines() if "infra/server.md" in line
+                and line.startswith("L2")]
+        self.assertEqual(len(hint), 1, output)
+        self.assertIn("infra/MEMORY.md", hint[0])
+        self.assertNotIn("проверьте формат", hint[0])
+
+    def test_count_of_lost_files_is_declined_correctly(self):
+        """«1 файлов» в сообщении инструмента, который выходит в свет, - брак."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - один\n",
+            "infra/server.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        self.assertIn("скрыто 1 файл", output)
+        self.assertNotIn("1 файлов", output)
+
+    def test_duplicate_definition_resolves_to_the_first_one(self):
+        """CommonMark: при повторе метки побеждает ПЕРВОЕ определение.
+
+        Код брал последнее - и это тихий пропуск: ссылка, которую увидит
+        агент и любой markdown-рендерер, ведёт в никуда, а проверка молчит.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль][prof] - кто\n"
+                         "\n"
+                         "[prof]: net-takogo.md\n"
+                         "[prof]: user.md\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("net-takogo.md", output)
+
+    def test_orphan_marker_works_below_the_twentieth_line(self):
+        """Метка-комментарий не должна зависеть от того, на какой она строке.
+
+        Наша же конвенция памяти - шапка плюс обязательные разделы - легко
+        съедает двадцать строк раньше, чем автор дойдёт до пометки.
+        """
+        head = "---\n" + "".join("pole_%d: znachenie\n" % i for i in range(1, 19)) + "---\n"
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "draft.md": head + "\nТекст заметки.\n\n<!-- linter: orphan-ok -->\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_marker_inside_a_fence_still_does_not_free_the_file(self):
+        """Снятие лимита строк не должно вернуть дефект с меткой в блоке кода."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "zametka.md": "Заметка про линтер.\n" * 30 +
+                          "\n```\n<!-- linter: orphan-ok -->\n```\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("zametka.md", output)
+
+    def test_shortcut_reference_row_is_a_real_row(self):
+        """Третья законная форма CommonMark: `- [prof]` без вторых скобок.
+
+        Под --quiet, которым зовёт хук, битая цель такой строки не давала
+        вообще ничего: пустой вывод и код 0.
+        """
+        self.write({
+            "MEMORY.md": "- [prof] - кто пользователь\n"
+                         "\n"
+                         "[prof]: user.md\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_shortcut_reference_with_broken_target_is_caught(self):
+        """Раз разбираем - значит и ловим битое."""
+        self.write({
+            "MEMORY.md": "- [prof] - кто\n"
+                         "\n"
+                         "[prof]: net-takogo.md\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter("--quiet")
+        self.assertEqual(code, 1, output)
+        self.assertIn("net-takogo.md", output)
+
+    def test_bracketed_text_without_a_definition_is_not_a_row(self):
+        """Без определения `[что-то]` - обычный текст, а не ссылка.
+
+        Иначе чекбоксы `- [ ]` и любые квадратные скобки в прозе начали бы
+        считаться строками индекса и порождать ошибки на пустом месте.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [ ] не сделано\n"
+                         "- [заметка на полях] просто текст\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+
 class MemoryFolderBoundary(MemoryFixture):
     """Линтер отвечает только за папку памяти и не выходит за её пределы."""
 
@@ -1748,6 +1945,31 @@ class PreCommitHook(unittest.TestCase):
         result = self.run_hook()
         text = result.stdout.decode("utf-8", "replace")
         self.assertNotIn("--unset core.hooksPath", text)
+
+    def test_hook_does_not_block_when_stderr_is_closed(self):
+        """Закрытый stderr не должен превращать «пропускаю» в «блокирую молча».
+
+        set -e плюс echo, вернувший ненулевой код, обрывает скрипт ДО exit 0.
+        Человека запирает ровно та ветка, которая обязана его выпустить, и без
+        единой строки объяснения. Закрытый stderr - не экзотика: так ведут себя
+        графические клиенты git и headless-обёртки.
+
+        Дескриптор именно ЗАКРЫВАЕМ (exec 2>&-), а не отправляем в /dev/null:
+        в /dev/null запись удаётся, и дефект не воспроизводится.
+
+        Дефект пред-существующий - воспроизводится и на версии до этой ветки.
+        """
+        os.remove(os.path.join(self.repo, "scripts", "check_memory_index.py"))
+        self.git("add", "-A")
+        hook = os.path.join(self.repo, ".githooks", "pre-commit").replace("\\", "/")
+        result = subprocess.run(
+            [self.sh, "-c", 'exec 2>&-; "$0" "$1"', self.sh, hook],
+            cwd=self.repo, env=os.environ.copy(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(result.returncode, 0,
+                         "хук заблокировал коммит из-за неудачной печати подсказки")
+
 
     def test_failure_message_mentions_the_escape_hatch(self):
         self.write_memory("- [Профиль](net.md) - битая\n")

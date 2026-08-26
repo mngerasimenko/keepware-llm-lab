@@ -7,6 +7,14 @@
 
 set -e
 
+# Печать подсказки не имеет права уронить хук. Под set -e неудачная запись в
+# stderr (закрытый дескриптор - обычное дело для графических клиентов git и
+# headless-обёрток) обрывала скрипт ДО exit 0: человека запирала ровно та
+# ветка, которая обязана его выпустить, и без единой строки объяснения.
+say() {
+    printf '%s\n' "$*" >&2 || :
+}
+
 # Как отключить хук - зависит от того, чем он подключён, и вслепую советовать
 # тут нечего. Команда "git config --unset core.hooksPath" выглядит безобидно,
 # но у человека с husky в этом ключе лежит .husky/_, и она убирает не наш хук,
@@ -15,11 +23,11 @@ set -e
 # выполнивший предложенное, остаётся заперт. Поэтому показываем, где ключ задан,
 # и объясняем, что убирать.
 advise_how_to_disable() {
-    echo "pre-commit: чтобы отключить, сначала посмотрите, чем хук подключён:" >&2
-    echo "pre-commit:   git config --show-origin --get core.hooksPath" >&2
-    echo "pre-commit: если это .githooks - уберите ключ там, где он задан;" >&2
-    echo "pre-commit: если что-то другое (.husky/_ и подобное) - наш хук зовётся" >&2
-    echo "pre-commit: строкой из вашего менеджера хуков, убирать надо её." >&2
+    say "pre-commit: чтобы отключить, сначала посмотрите, чем хук подключён:"
+    say "pre-commit:   git config --show-origin --get core.hooksPath"
+    say "pre-commit: если это .githooks - уберите ключ там, где он задан;"
+    say "pre-commit: если что-то другое (.husky/_ и подобное) - наш хук зовётся"
+    say "pre-commit: строкой из вашего менеджера хуков, убирать надо её."
 }
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
@@ -31,8 +39,8 @@ MEMORY_DIR="memory"
 [ -d "$MEMORY_DIR" ] || exit 0
 
 if [ ! -f "$CHECKER" ]; then
-    echo "pre-commit: хук подключён, но $CHECKER не найден - проверка НЕ идёт." >&2
-    echo "pre-commit: скопируйте scripts/ рядом с memory/ либо отключите хук." >&2
+    say "pre-commit: хук подключён, но $CHECKER не найден - проверка НЕ идёт."
+    say "pre-commit: скопируйте scripts/ рядом с memory/ либо отключите хук."
     advise_how_to_disable
     exit 0
 fi
@@ -50,7 +58,7 @@ fi
 GIT_DIR_PATH=$(git rev-parse --git-dir 2>/dev/null) || exit 0
 for marker in rebase-merge rebase-apply; do
     if [ -e "$GIT_DIR_PATH/$marker" ]; then
-        echo "pre-commit: идёт rebase - проверка памяти пропущена." >&2
+        say "pre-commit: идёт rebase - проверка памяти пропущена."
         exit 0
     fi
 done
@@ -80,9 +88,9 @@ for candidate in python3 python py; do
 done
 
 if [ -z "$PYTHON" ]; then
-    echo "pre-commit: Python 3.9+ не найден, проверка памяти пропущена." >&2
-    echo "pre-commit: это не значит, что память в порядке - проверка не запускалась." >&2
-    echo "pre-commit: поставьте Python 3.9+ либо отключите хук." >&2
+    say "pre-commit: Python 3.9+ не найден, проверка памяти пропущена."
+    say "pre-commit: это не значит, что память в порядке - проверка не запускалась."
+    say "pre-commit: поставьте Python 3.9+ либо отключите хук."
     advise_how_to_disable
     exit 0
 fi
@@ -114,45 +122,45 @@ case "$STATUS" in
         ;;
     2)
         # Проверка не смогла выполниться - это не нарушение памяти.
-        echo "pre-commit: проверку выполнить не удалось (см. выше), коммит не блокирую." >&2
+        say "pre-commit: проверку выполнить не удалось (см. выше), коммит не блокирую."
         # Опечатка в ключах даёт тот же код 2, и тогда блокировка выключена
         # насовсем, а связь с собственной настройкой человек не увидит.
         if [ -n "$EXTRA_ARGS" ]; then
-            echo "pre-commit: если дело в ключах - проверьте их:" >&2
-            echo "pre-commit:   git config --get memorycheck.args" >&2
+            say "pre-commit: если дело в ключах - проверьте их:"
+            say "pre-commit:   git config --get memorycheck.args"
         fi
         exit 0
         ;;
     1)
-        echo "pre-commit: память и индекс разошлись - см. список выше." >&2
-        echo "pre-commit: разовый обход - git commit --no-verify" >&2
+        say "pre-commit: память и индекс разошлись - см. список выше."
+        say "pre-commit: разовый обход - git commit --no-verify"
         # У cherry-pick и revert своего --no-verify нет (в отличие от merge),
         # поэтому "--continue --no-verify" человек не наберёт при всём желании.
         # Обычный commit завершает текущий шаг; остальные шаги диапазона
         # продолжает --continue. НЕ --quit: он бросает очередь молча, и
         # оставшиеся коммиты диапазона просто пропадают.
         if [ -e "$GIT_DIR_PATH/CHERRY_PICK_HEAD" ]; then
-            echo "pre-commit: идёт cherry-pick, своего --no-verify у него нет:" >&2
-            echo "pre-commit:   git commit --no-verify" >&2
-            echo "pre-commit: если переносили диапазон, продолжите остальные:" >&2
-            echo "pre-commit:   git cherry-pick --continue" >&2
-            echo "pre-commit: если коммит был один - всё, --continue не нужен." >&2
+            say "pre-commit: идёт cherry-pick, своего --no-verify у него нет:"
+            say "pre-commit:   git commit --no-verify"
+            say "pre-commit: если переносили диапазон, продолжите остальные:"
+            say "pre-commit:   git cherry-pick --continue"
+            say "pre-commit: если коммит был один - всё, --continue не нужен."
         elif [ -e "$GIT_DIR_PATH/REVERT_HEAD" ]; then
-            echo "pre-commit: идёт revert, своего --no-verify у него нет:" >&2
-            echo "pre-commit:   git commit --no-verify" >&2
-            echo "pre-commit: если откатывали диапазон, продолжите остальные:" >&2
-            echo "pre-commit:   git revert --continue" >&2
-            echo "pre-commit: если коммит был один - всё, --continue не нужен." >&2
+            say "pre-commit: идёт revert, своего --no-verify у него нет:"
+            say "pre-commit:   git commit --no-verify"
+            say "pre-commit: если откатывали диапазон, продолжите остальные:"
+            say "pre-commit:   git revert --continue"
+            say "pre-commit: если коммит был один - всё, --continue не нужен."
         fi
         exit "$STATUS"
         ;;
     *)
         # 126/127 - не запустилось, 130 - прервали с клавиатуры. Называть это
         # "память разъехалась" - врать: память в этих случаях не проверена.
-        echo "pre-commit: проверка завершилась необычно (код $STATUS)," >&2
-        echo "pre-commit: память НЕ проверена - дело в окружении, не в памяти." >&2
+        say "pre-commit: проверка завершилась необычно (код $STATUS),"
+        say "pre-commit: память НЕ проверена - дело в окружении, не в памяти."
         # Раз блокируем - обязаны сказать, как выйти: иначе человек заперт.
-        echo "pre-commit: разовый обход - git commit --no-verify" >&2
+        say "pre-commit: разовый обход - git commit --no-verify"
         advise_how_to_disable
         exit "$STATUS"
         ;;
