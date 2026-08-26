@@ -112,7 +112,16 @@ git config core.hooksPath .githooks
 sh "$(git rev-parse --show-toplevel)/.githooks/pre-commit" || exit 1
 ```
 
-Впишите её в `.husky/pre-commit` или в `lefthook.yml` - смотря чем пользуетесь.
+Эта строка - для **husky**: `.husky/pre-commit` это обычный shell-скрипт, и строка ложится в него как есть.
+
+Для **lefthook** голая строка не годится - `lefthook.yml` разберёт её как значение, а не как команду. Там нужен свой вид:
+
+```yaml
+pre-commit:
+  commands:
+    memory-check:
+      run: sh "$(git rev-parse --show-toplevel)/.githooks/pre-commit"
+```
 
 Учтите: подключение хука - **локальная настройка клона**. `.git/config` не коммитится, поэтому каждый включает его у себя сам, и на свежем клоне это нужно повторить.
 

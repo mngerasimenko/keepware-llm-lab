@@ -7,6 +7,21 @@
 
 set -e
 
+# Как отключить хук - зависит от того, чем он подключён, и вслепую советовать
+# тут нечего. Команда "git config --unset core.hooksPath" выглядит безобидно,
+# но у человека с husky в этом ключе лежит .husky/_, и она убирает не наш хук,
+# а ВЕСЬ его набор - молча, без ошибки. А если ключ задан глобально, та же
+# команда правит локальный конфиг, возвращает 5, не печатает ничего, и человек,
+# выполнивший предложенное, остаётся заперт. Поэтому показываем, где ключ задан,
+# и объясняем, что убирать.
+advise_how_to_disable() {
+    echo "pre-commit: чтобы отключить, сначала посмотрите, чем хук подключён:" >&2
+    echo "pre-commit:   git config --show-origin --get core.hooksPath" >&2
+    echo "pre-commit: если это .githooks - уберите ключ там, где он задан;" >&2
+    echo "pre-commit: если что-то другое (.husky/_ и подобное) - наш хук зовётся" >&2
+    echo "pre-commit: строкой из вашего менеджера хуков, убирать надо её." >&2
+}
+
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 cd "$REPO_ROOT" || exit 0
 
@@ -17,8 +32,8 @@ MEMORY_DIR="memory"
 
 if [ ! -f "$CHECKER" ]; then
     echo "pre-commit: хук подключён, но $CHECKER не найден - проверка НЕ идёт." >&2
-    echo "pre-commit: скопируйте scripts/ рядом с memory/ либо отключите хук:" >&2
-    echo "pre-commit:   git config --unset core.hooksPath" >&2
+    echo "pre-commit: скопируйте scripts/ рядом с memory/ либо отключите хук." >&2
+    advise_how_to_disable
     exit 0
 fi
 
@@ -67,8 +82,8 @@ done
 if [ -z "$PYTHON" ]; then
     echo "pre-commit: Python 3.9+ не найден, проверка памяти пропущена." >&2
     echo "pre-commit: это не значит, что память в порядке - проверка не запускалась." >&2
-    echo "pre-commit: поставьте Python 3.9+ либо отключите хук:" >&2
-    echo "pre-commit:   git config --unset core.hooksPath" >&2
+    echo "pre-commit: поставьте Python 3.9+ либо отключите хук." >&2
+    advise_how_to_disable
     exit 0
 fi
 
@@ -138,7 +153,7 @@ case "$STATUS" in
         echo "pre-commit: память НЕ проверена - дело в окружении, не в памяти." >&2
         # Раз блокируем - обязаны сказать, как выйти: иначе человек заперт.
         echo "pre-commit: разовый обход - git commit --no-verify" >&2
-        echo "pre-commit: отключить хук - git config --unset core.hooksPath" >&2
+        advise_how_to_disable
         exit "$STATUS"
         ;;
 esac

@@ -1292,6 +1292,30 @@ class OutputEncoding(MemoryFixture):
         self.assertIn("ссылка", text.lower())
 
 
+class DocumentationMatchesReality(unittest.TestCase):
+    """README - часть инструмента: неверная строка оттуда попадает людям в конфиг."""
+
+    def readme(self):
+        with io.open(os.path.join(REPO_DIR, "README.md"), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_lefthook_snippet_is_a_config_not_a_bare_line(self):
+        """Голая строка `sh "..."` для lefthook - не конфиг, а скаляр.
+
+        Для husky строка верна: `.husky/pre-commit` - это shell-скрипт. В
+        `lefthook.yml` ей нужен вид команды внутри `pre-commit: commands:`,
+        иначе YAML разберёт её как значение и хук не подключится.
+        """
+        text = self.readme()
+        if "lefthook" not in text:
+            self.skipTest("README больше не упоминает lefthook")
+        self.assertIn("commands:", text)
+
+    def test_readme_does_not_teach_the_destructive_unset(self):
+        """Тот же разрушительный совет не должен переехать из хука в документацию."""
+        self.assertNotIn("--unset core.hooksPath", self.readme())
+
+
 class PreCommitHook(unittest.TestCase):
     """Хук - это то, что трогает посторонний человек. Здесь ошибаться дороже всего."""
 
@@ -1564,6 +1588,55 @@ class PreCommitHook(unittest.TestCase):
         self.git("add", "-A")
         result = self.run_hook()
         self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
+
+    def test_hook_never_advises_unsetting_hooks_path(self):
+        """Совет, который сносит чужие хуки молча, не должен звучать пользователю.
+
+        `git config --unset core.hooksPath` печатался в трёх ветках. У человека
+        с husky в этом ключе лежит `.husky/_`, и команда убирает не наш хук, а
+        ВЕСЬ его набор - ту самую интеграцию, которую README и предлагает.
+        Ошибки при этом нет: хуки просто перестают запускаться.
+
+        Смотрим на строки, которые хук ПЕЧАТАЕТ, а не на файл целиком: в
+        комментарии команда названа намеренно - иначе следующий читатель
+        «упростит» диагностику обратно в одну строку. Проверяем echo, потому
+        что до ветки «Питон не найден» из теста не добраться, а совет обязан
+        отсутствовать во всех трёх.
+        """
+        with io.open(HOOK, encoding="utf-8") as fh:
+            printed = [line for line in fh.read().splitlines()
+                       if line.lstrip().startswith("echo")]
+        offenders = [line for line in printed if "--unset core.hooksPath" in line]
+        self.assertEqual(offenders, [], "хук печатает разрушительный совет")
+
+
+    def test_hook_tells_how_to_find_what_owns_hooks_path(self):
+        """Отключать вслепую нечего - сначала надо увидеть, чем хук подключён.
+
+        Второй дефект того же совета: при глобальном core.hooksPath команда
+        `--unset` работает с локальным конфигом, где ключа нет, возвращает 5 и
+        не печатает ничего. Человек выполнил предложенное и остался заперт.
+        """
+        with io.open(HOOK, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("--show-origin", text)
+
+    def test_blocking_branch_offers_bypass_and_no_destructive_command(self):
+        """Ветка, которая блокирует коммит, обязана дать выход - но безопасный."""
+        self.stub_checker("import sys\nsys.exit(130)\n")
+        self.git("add", "-A")
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertIn("--no-verify", text)
+        self.assertNotIn("--unset core.hooksPath", text)
+
+    def test_missing_checker_branch_gives_no_destructive_command(self):
+        """Ветка «проверки нет на месте» тоже советовала снести чужие хуки."""
+        os.remove(os.path.join(self.repo, "scripts", "check_memory_index.py"))
+        self.git("add", "-A")
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertNotIn("--unset core.hooksPath", text)
 
     def test_failure_message_mentions_the_escape_hatch(self):
         self.write_memory("- [Профиль](net.md) - битая\n")
