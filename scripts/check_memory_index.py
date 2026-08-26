@@ -42,6 +42,11 @@ from urllib.parse import unquote, urlparse
 # стоит выше: под пунктом списка это вложенный пункт, а после абзаца -
 # блок кода.
 ROW = re.compile(r"^[-*+]\s*\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\(([^)]*)\)")
+# Ссылка-метка: "- [Профиль][prof]" и свёрнутая форма "- [prof][]". Законный
+# markdown, по которому агент дойдёт - а L2 объявлял такой файл забытым.
+ROW_REF = re.compile(r"^[-*+]\s*\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\[([^\]]*)\]")
+# Определение метки: "[prof]: user.md". Отступ до трёх пробелов - по CommonMark.
+DEFINITION = re.compile(r"^\s{0,3}\[([^\]]+)\]:\s*(\S+)")
 BULLET = re.compile(r"^[-*+]\s")
 
 FENCE = re.compile(r"^\s*(`{3,}|~{3,})\s*(.*)$")
@@ -146,6 +151,8 @@ def parse_index(path):
     комментарии зовущий обязан сказать вслух - для этого второе значение.
     """
     rows = []
+    pending_refs = []
+    definitions = {}
     opened_fence = ""
     in_comment = False
     after_list_item = False
@@ -185,10 +192,33 @@ def parse_index(path):
         if indent >= 4 and not after_list_item:
             after_list_item = False
             continue
+        definition = DEFINITION.match(body)
+        if definition:
+            # Метки регистронезависимы по CommonMark.
+            definitions[definition.group(1).strip().casefold()] = definition.group(2).strip()
+            after_list_item = False
+            continue
+
         after_list_item = bool(BULLET.match(body))
         match = ROW.match(body)
         if match:
-            rows.append((match.group(1).strip(), match.group(2).strip(), lineno))
+            rows.append((match.group(1).strip(), match.group(2).strip(), lineno, "inline"))
+            continue
+        reference = ROW_REF.match(body)
+        if reference:
+            title = reference.group(1).strip()
+            # Свёрнутая форма "[user][]" берёт метку из текста ссылки.
+            label = reference.group(2).strip() or title
+            pending_refs.append((title, label, lineno))
+    # Определения ищутся по всему файлу, поэтому метки разрешаем в конце:
+    # "[prof]: user.md" законно стоит и ниже строки, которая на неё ссылается.
+    for title, label, lineno in pending_refs:
+        target = definitions.get(label.casefold())
+        if target is None:
+            rows.append((title, label, lineno, "ref-missing"))
+        else:
+            rows.append((title, target, lineno, "inline"))
+
     unclosed = "блок кода" if opened_fence else ("html-комментарий" if in_comment else None)
     return rows, unclosed
 
@@ -445,6 +475,11 @@ def check(root, index_paths, allow_globs, index_name):
     incomplete = []
     row_count = 0
 
+    # Пути внутри проверки нормализованы через прямой слэш, а на Windows
+    # человек напишет шаблон через обратный - и ключ молчал бы вхолостую,
+    # выглядя рабочим.
+    allow_globs = [pattern.replace("\\", "/") for pattern in allow_globs]
+
     exact, folded, unreadable_dirs, linked_dirs = build_file_map(root)
 
     # Каталог, который не открылся, уносит с собой факты: сказать про такую
@@ -504,10 +539,22 @@ def check(root, index_paths, allow_globs, index_name):
             incomplete.append(where)
         if not index_rows:
             empty_indexes.append(where)
-        for title, raw_target, lineno in index_rows:
+        for title, raw_target, lineno, kind in index_rows:
             row_count += 1
+            if kind == "ref-missing":
+                errors.append(
+                    "L1 %s:%d ссылка-метка «%s» нигде не определена: строки "
+                    "«[%s]: файл.md» в индексе нет"
+                    % (where, lineno, raw_target, raw_target)
+                )
+                continue
             target = clean_target(raw_target)
-            if not target or target.startswith("#"):
+            if not target:
+                # Прежде такая строка отбрасывалась вместе с якорями: человек
+                # видит строку в индексе и считает файл упомянутым, а адреса нет.
+                errors.append("L1 %s:%d строка без адреса: «%s»" % (where, lineno, title))
+                continue
+            if target.startswith("#"):
                 continue  # якорь внутри того же документа - не ссылка на файл
             if is_external(target):
                 continue

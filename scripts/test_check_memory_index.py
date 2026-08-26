@@ -784,6 +784,117 @@ class StrictRootIndexModel(MemoryFixture):
         self.assertIn("имя", output.lower())
 
 
+class SmallerFindings(MemoryFixture):
+    """Мелкое из шестого круга: ложная сирота, молчаливый пропуск, ключ вхолостую."""
+
+    def test_reference_style_row_is_a_real_row(self):
+        """`- [Профиль][prof]` с определением ниже - законный markdown.
+
+        Агент по такой ссылке дойдёт, а L2 объявлял файл забытым: строка не
+        подходила под шаблон `](`. Ложная тревога на честно оформленном индексе.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль][prof] - кто пользователь\n"
+                         "\n"
+                         "[prof]: user.md\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_collapsed_reference_row_is_a_real_row(self):
+        """Свёрнутая форма `- [user][]` - тот же случай, метка берётся из текста."""
+        self.write({
+            "MEMORY.md": "- [user][] - кто пользователь\n"
+                         "\n"
+                         "[user]: user.md\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_reference_style_row_with_broken_target_is_caught(self):
+        """Обратная сторона: разбирать - значит и ловить битое, а не просто молчать."""
+        self.write({
+            "MEMORY.md": "- [Профиль][prof] - кто\n"
+                         "\n"
+                         "[prof]: net-takogo.md\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("net-takogo.md", output)
+
+    def test_reference_style_row_without_definition_is_caught(self):
+        """Метка без определения - строка никуда не ведёт, и это надо назвать."""
+        self.write({
+            "MEMORY.md": "- [Профиль][prof] - кто\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("prof", output)
+
+    def test_empty_destination_is_not_silently_skipped(self):
+        """`- [Заголовок]()` - строка есть, адреса нет: молчать об этом нельзя.
+
+        Прежде такая строка распознавалась и тут же отбрасывалась вместе с
+        якорями. Человек видит строку в индексе и считает файл упомянутым.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль]() - крючок есть, адреса нет\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("адрес", output.lower())
+
+    def test_anchor_only_destination_stays_allowed(self):
+        """Якорь внутри того же документа - законная строка, её не трогаем."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [К разделу](#razdel) - якорь внутри индекса\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_allow_orphan_accepts_backslash_paths(self):
+        """На Windows человек напишет путь через обратный слэш - и ключ молчал.
+
+        Пути внутри проверки нормализованы через прямой слэш, поэтому шаблон
+        `templates\\*.md` не совпадал ни с чем, а ключ выглядел рабочим.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "templates/zagotovka.md": "заготовка\n",
+        })
+        code, output = self.run_linter("--allow-orphan", "templates\\*.md")
+        self.assertEqual(code, 0, output)
+
+
+class CiGuards(unittest.TestCase):
+    """CI обязан падать, когда проверка не выполнилась, а не когда «нет тестов»."""
+
+    def workflow(self):
+        path = os.path.join(REPO_DIR, ".github", "workflows", "memory-check.yml")
+        if not os.path.isfile(path):
+            self.skipTest("workflow не найден")
+        with io.open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_ci_checks_that_tests_were_actually_collected(self):
+        """На Python 3.9 сломанный discover даёт зелёную галочку при нуле тестов.
+
+        Свой возврат 5 «ни одного теста не собрано» unittest получил только в
+        3.12, а в матрице есть 3.9. Тот же класс, что MEMCHECK_REQUIRE_SH: без
+        гарда галочка зелёная, а проверка не выполнялась.
+        """
+        text = self.workflow()
+        self.assertIn("countTestCases", text)
+
+
 class MemoryFolderBoundary(MemoryFixture):
     """Линтер отвечает только за папку памяти и не выходит за её пределы."""
 
