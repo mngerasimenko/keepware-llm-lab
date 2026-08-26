@@ -547,108 +547,66 @@ class FilesAppearInIndex(MemoryFixture):
         self.assertEqual(code, 1, output)
 
     def test_sub_indexes_count_by_default_without_flags(self):
-        """Прибивает умолчание шаблона индекса.
+        """Прибивает умолчание имени индекса.
 
-        Хук зовёт проверку без ключей. Верни умолчание к одному «MEMORY.md» -
-        и у всех, кто разбил индекс на части, начнут падать коммиты. Раньше
-        оба теста про под-индексы передавали --index явно, и эта регрессия
-        прошла бы мимо набора.
+        Хук зовёт проверку без ключей. Смени умолчание - и у всех, кто разбил
+        индекс по подпапкам, начнут падать коммиты.
         """
         self.write({
-            "MEMORY.md": "- [Инфра](MEMORY_infra.md) - под-индекс\n",
-            "MEMORY_infra.md": "- [Сервер](server.md) - прод\n",
-            "server.md": "факт\n",
+            "MEMORY.md": "- [Инфра](infra/MEMORY.md) - под-индекс\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
+
 
     def test_sub_index_rows_also_count_as_mention(self):
+        """Упоминание в под-индексе закрывает L2 так же, как в корневом."""
         self.write({
-            "MEMORY.md": "- [Под-индекс](MEMORY_infra.md) - инфраструктура\n",
-            "MEMORY_infra.md": "- [Сервер](server.md) - прод\n",
-            "server.md": "факт\n",
-        })
-        code, output = self.run_linter("--index", "MEMORY*.md")
-        self.assertEqual(code, 0, output)
-
-    def test_root_index_is_derived_from_the_pattern_not_from_a_fixed_name(self):
-        """Ключ --index мы рекламируем - значит он должен работать не только с MEMORY."""
-        self.write({
-            "INDEX.md": "- [Профиль](user.md) - кто\n- [Инфра](INDEX_infra.md) - под-индекс\n",
-            "INDEX_infra.md": "- [Сервер](server.md) - прод\n",
-            "user.md": "факт\n",
-            "server.md": "факт\n",
-        })
-        code, output = self.run_linter("--index", "INDEX*.md")
-        self.assertEqual(code, 0, output)
-
-    def test_sub_index_reachable_through_a_chain(self):
-        """Достижимость транзитивна: корень -> A -> B. Иначе это не обход, а один шаг."""
-        self.write({
-            "MEMORY.md": "- [А](MEMORY_a.md) - первый уровень\n",
-            "MEMORY_a.md": "- [Б](MEMORY_b.md) - второй уровень\n",
-            "MEMORY_b.md": "- [Сервер](server.md) - прод\n",
-            "server.md": "факт\n",
+            "MEMORY.md": "- [Под-индекс](infra/MEMORY.md) - инфраструктура\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
+
+
+    def test_sub_index_reachable_through_a_chain(self):
+        """Достижимость транзитивна: корень -> a -> a/b. Иначе это не обход, а один шаг."""
+        self.write({
+            "MEMORY.md": "- [А](a/MEMORY.md) - первый уровень\n",
+            "a/MEMORY.md": "- [Б](b/MEMORY.md) - второй уровень\n",
+            "a/b/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "a/b/server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
 
     def test_detached_cycle_of_sub_indexes_is_error(self):
         """Два под-индекса, ссылающиеся друг на друга, «упомянуты» - и недостижимы."""
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n",
             "user.md": "факт\n",
-            "MEMORY_b.md": "- [В](MEMORY_c.md) - сосед\n",
-            "MEMORY_c.md": "- [Б](MEMORY_b.md) - сосед\n",
+            "b/MEMORY.md": "- [В](../c/MEMORY.md) - сосед\n",
+            "c/MEMORY.md": "- [Б](../b/MEMORY.md) - сосед\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
 
-    def test_unreferenced_top_level_index_is_error_with_custom_pattern(self):
-        """Тот случай, где «корень выведен из шаблона» и «все верхние - корни» расходятся."""
-        self.write({
-            "INDEX.md": "- [Профиль](user.md) - кто\n",
-            "user.md": "факт\n",
-            "INDEX_infra.md": "- [Сервер](server.md) - прод\n",
-            "server.md": "факт\n",
-        })
-        code, output = self.run_linter("--index", "INDEX*.md")
-        self.assertEqual(code, 1, output)
-        self.assertIn("INDEX_infra.md", output)
-
-    def test_pattern_with_several_wildcards_does_not_crown_the_wrong_root(self):
-        self.write({
-            "AGENT_MEMORY.md": "- [Профиль](user.md) - кто\n- [Инфра](MEMORY.md) - под-индекс\n",
-            "MEMORY.md": "- [Сервер](server.md) - прод\n",
-            "user.md": "факт\n",
-            "server.md": "факт\n",
-        })
-        code, output = self.run_linter("--index", "*MEMORY*.md")
-        self.assertEqual(code, 0, output)
-
-    def test_leading_wildcard_does_not_crown_the_wrong_root(self):
-        """Звёздочка одна, но в начале - имя корневого из шаблона так не вывести."""
-        self.write({
-            "AGENT_MEMORY.md": "- [Профиль](user.md) - кто\n"
-                               "- [Инфра](MEMORY.md) - под-индекс\n",
-            "MEMORY.md": "- [Сервер](server.md) - прод\n",
-            "user.md": "факт\n",
-            "server.md": "факт\n",
-        })
-        code, output = self.run_linter("--index", "*MEMORY.md")
-        self.assertEqual(code, 0, output)
 
     def test_cross_listing_the_same_file_from_two_sub_indexes_is_not_a_duplicate(self):
         """L2 разрешает упоминание в любом индексе - значит это законная схема."""
         self.write({
-            "MEMORY.md": "- [Инфра](MEMORY_infra.md) - раз\n- [Прод](MEMORY_prod.md) - два\n",
-            "MEMORY_infra.md": "- [Сервер](server.md) - прод\n",
-            "MEMORY_prod.md": "- [Сервер](server.md) - тот же файл, другой раздел\n",
+            "MEMORY.md": "- [Инфра](infra/MEMORY.md) - раз\n- [Прод](prod/MEMORY.md) - два\n",
+            "infra/MEMORY.md": "- [Сервер](../server.md) - тот же файл\n",
+            "prod/MEMORY.md": "- [Сервер](../server.md) - тот же файл, другой раздел\n",
             "server.md": "факт\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
-        self.assertNotIn("L3", output)
+
 
     def test_sub_index_unreachable_from_root_is_error(self):
         """Упоминание где-нибудь - не то же самое, что достижимость от корня.
@@ -672,12 +630,152 @@ class FilesAppearInIndex(MemoryFixture):
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n",
             "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("infra/MEMORY.md", output)
+
+
+class StrictRootIndexModel(MemoryFixture):
+    """Строгая модель корневого индекса (решение owner'а 26.08).
+
+    Корневой индекс ОДИН, с конкретным именем, в корне папки памяти.
+    Под-индекс живёт в подпапке под тем же именем: memory/MEMORY.md -
+    корневой, memory/infra/MEMORY.md - под-индекс. Тогда двух корневых
+    не бывает по построению, и проверке не приходится гадать, какой из
+    лежащих рядом файлов загрузится.
+
+    Шестой круг ревью показал, что прежняя модель (корень выводится из
+    шаблона `MEMORY*.md`) била в обе стороны: ложной тревогой на честной
+    памяти и молчанием на разъехавшейся.
+    """
+
+    def test_second_index_like_file_in_root_is_a_plain_fact(self):
+        """Файл рядом с корневым - обычный факт, а не под-индекс.
+
+        Прежняя модель короновала MEMORY.md, а MEMORY-work.md объявляла
+        под-индексом, до которого неоткуда дойти, и давала код 1 на памяти,
+        с которой всё в порядке. В строгой модели такой файл - обычный:
+        упомянут в индексе, значит вопросов нет.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Рабочее](MEMORY-work.md) - заметки\n",
+            "MEMORY-work.md": "рабочие заметки\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("неоткуда дойти", output)
+
+    def test_missing_root_index_is_unverifiable_not_success(self):
+        """Молчание шестого круга: корневого нет, а проверка говорит «согласована».
+
+        MEMORY_a.md и MEMORY_b.md подходили под шаблон, оба становились
+        «корневыми», всё оказывалось достижимым - код 0. Агент при этом не
+        грузит ничего: файла с ожидаемым именем в корне просто нет.
+        """
+        self.write({
+            "MEMORY_a.md": "- [Профиль](user.md) - кто\n",
+            "MEMORY_b.md": "- [Сервер](server.md) - прод\n",
+            "user.md": "факт\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 2, output)
+        self.assertIn("MEMORY.md", output)
+
+    def test_sub_index_in_subfolder_is_reachable(self):
+        """Канон строгой модели: под-индекс - это подпапка/<то же имя>."""
+        self.write({
+            "MEMORY.md": "- [Инфра](infra/MEMORY.md) - под-индекс\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_sub_index_in_subfolder_without_a_link_is_error(self):
+        """Тот же под-индекс, но ссылки на него нет - до него и правда неоткуда дойти."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("infra/MEMORY.md", output)
+
+    def test_unreachable_sub_index_message_does_not_claim_what_loads(self):
+        """Проверке никто не сообщает, что грузит харнесс - значит и утверждать нечего.
+
+        Прежний текст говорил «а сам он не загружается». Это знание о чужой
+        системе, которого у проверки нет.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        self.assertNotIn("не загружается", output)
+
+    def test_index_like_name_in_root_gets_an_explanation(self):
+        """Стена сирот без причины - тот самый вред, ради которого правило и меняли.
+
+        Человек разбил индекс по-старому: MEMORY_infra.md в корне. В строгой
+        модели это не под-индекс, его строки не разбираются, и перечисленные
+        в нём файлы становятся сиротами. Без объяснения такой вывод читается
+        как поломка проверки.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
             "MEMORY_infra.md": "- [Сервер](server.md) - прод\n",
             "server.md": "факт\n",
         })
-        code, output = self.run_linter("--index", "MEMORY*.md")
+        code, output = self.run_linter()
         self.assertEqual(code, 1, output)
         self.assertIn("MEMORY_infra.md", output)
+        self.assertIn("подпапк", output)
+
+    def test_plain_fact_with_index_like_name_does_not_trigger_the_hint(self):
+        """Подсказка требует ДВУХ признаков: похожего имени и строк индекса внутри.
+
+        Иначе обычный факт вроде MEMORY_of_incident.md ловил бы заметку
+        каждый прогон - шум, приучающий пролистывать вывод.
+        """
+        self.write({
+            "MEMORY.md": "- [Разбор](MEMORY_of_incident.md) - что случилось\n",
+            "MEMORY_of_incident.md": "в тот вечер сервис ответил 500\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("подпапк", output)
+
+    def test_custom_index_name_works(self):
+        """Ключ остаётся, но принимает ИМЯ, а не шаблон."""
+        self.write({
+            "INDEX.md": "- [Профиль](user.md) - кто\n- [Инфра](infra/INDEX.md) - под-индекс\n",
+            "infra/INDEX.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter("--index", "INDEX.md")
+        self.assertEqual(code, 0, output)
+
+    def test_glob_in_index_name_is_refused_not_silently_matched(self):
+        """Старая форма ключа не должна тихо «почти работать»."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter("--index", "MEMORY*.md")
+        self.assertEqual(code, 2, output)
+        self.assertIn("имя", output.lower())
 
 
 class MemoryFolderBoundary(MemoryFixture):
@@ -693,7 +791,8 @@ class MemoryFolderBoundary(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 2, output)
-        self.assertIn("не папка памяти", output.lower())
+        self.assertIn("корневой индекс не найден", output.lower())
+
 
     def test_hidden_dirs_inside_memory_are_not_memory(self):
         """У тех, кто держит заметки в Obsidian, это лежит прямо в папке памяти."""
@@ -709,8 +808,8 @@ class MemoryFolderBoundary(MemoryFixture):
     def test_sub_index_may_live_in_subfolder(self):
         """Индекс при росте бьют по каталогам - это разрешено, лишь бы корневой был на месте."""
         self.write({
-            "MEMORY.md": "- [Инфра](sub/MEMORY_infra.md) - под-индекс\n",
-            "sub/MEMORY_infra.md": "- [Сервер](server.md) - прод\n",
+            "MEMORY.md": "- [Инфра](sub/MEMORY.md) - под-индекс\n",
+            "sub/MEMORY.md": "- [Сервер](server.md) - прод\n",
             "sub/server.md": "факт\n",
         })
         code, output = self.run_linter()

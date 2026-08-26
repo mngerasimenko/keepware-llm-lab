@@ -20,7 +20,7 @@
 
 Примеры:
     python scripts/check_memory_index.py
-    python scripts/check_memory_index.py memory --index "MEMORY*.md"
+    python scripts/check_memory_index.py memory --index INDEX.md
     python scripts/check_memory_index.py memory --allow-orphan "templates/*.md"
 """
 
@@ -286,16 +286,49 @@ def is_orphan_ok(path):
     return any(COMMENT_ORPHAN.search(line) for line in text.splitlines()[:HEAD_LINES])
 
 
-def find_indexes(root, pattern):
+def find_indexes(root, index_name):
+    """Все индексы: корневой и под-индексы в подпапках - под одним именем.
+
+    Имя сравнивается точно и с учётом регистра: на Windows сравнение без
+    учёта регистра прошло бы, а в CI на Linux набор файлов разъехался бы.
+    """
     found = []
     for folder, dirs, names in os.walk(root):
         prune_non_memory_dirs(folder, dirs)
         for name in sorted(names):
-            # fnmatchcase, а не fnmatch: последний на Windows сравнивает без учёта
-            # регистра, и набор файлов разъезжается между машиной и CI.
-            if fnmatch.fnmatchcase(name, pattern):
+            if name == index_name:
                 found.append(os.path.normpath(os.path.join(folder, name)))
     return found
+
+
+def looks_like_a_stray_index(root, index_name, exact):
+    """Файлы в КОРНЕ, названные под старую плоскую раскладку.
+
+    `MEMORY_infra.md` рядом с `MEMORY.md` - это прежняя схема, где под-индексы
+    жили в корне и опознавались шаблоном. В строгой модели такой файл индексом
+    не считается, его строки не разбираются, и всё перечисленное в нём
+    становится сиротами. Стена сирот без объяснения читается как поломка
+    проверки, поэтому причину надо назвать вслух.
+
+    Требуем оба признака: похожее имя И строки индексного формата внутри.
+    Одного имени мало - `MEMORY_of_incident.md` может быть обычным фактом.
+    """
+    base = os.path.splitext(index_name)[0]
+    stray = []
+    for rel, path in sorted(exact.items()):
+        if "/" in rel or rel == index_name:
+            continue
+        if not rel.lower().endswith(".md"):
+            continue
+        if not os.path.splitext(rel)[0].startswith(base):
+            continue
+        try:
+            rows, _unclosed = parse_index(path)
+        except OSError:
+            continue
+        if rows:
+            stray.append(rel)
+    return stray
 
 
 def name_patterns(*names):
@@ -340,7 +373,7 @@ def mentioned_in_raw_text(index_paths, *names):
     return False
 
 
-def check(root, index_paths, allow_globs, index_pattern):
+def check(root, index_paths, allow_globs, index_name):
     """Возвращает (ошибки, структурные заметки, советы, строк, непроверяемо).
 
     Заметка структурная, если часть проверки не выполнилась: незакрытый блок
@@ -362,25 +395,27 @@ def check(root, index_paths, allow_globs, index_pattern):
 
     exact, folded = build_file_map(root)
     index_rels = {relative_to_root(root, p) for p in index_paths}
-    # Корневой индекс - тот, что лежит в самой папке памяти: только он
-    # загружается сам. Под-индексы могут жить и в подкаталогах.
+    # Корневой индекс ОДИН: файл с заданным именем в самой папке памяти.
+    # Под-индекс - файл с тем же именем в подпапке. Двух корневых не бывает
+    # по построению, поэтому гадать, какой из лежащих рядом файлов загрузится,
+    # не приходится - а прежняя модель гадала и ошибалась в обе стороны:
+    # ложной тревогой на здоровой памяти и молчанием на разъехавшейся.
     #
-    # Имя корневого выводим ИЗ ШАБЛОНА, а не из строки "MEMORY.md": шаблон
-    # "MEMORY*.md" без звёздочки даёт "MEMORY.md", "INDEX*.md" - "INDEX.md".
-    # Иначе ключ --index, который мы сами рекламируем, ломает проверку:
-    # у человека с индексами INDEX*.md корневой оказывался бы «сиротой».
-    top_level = {rel for rel in index_rels if "/" not in rel}
-    # Звёздочка должна быть одна и НЕ в начале: из "*MEMORY.md" имя корневого
-    # так же не выводится, просто промах менее очевиден.
-    single_trailing_wildcard = (index_pattern.count("*") == 1
-                                and not index_pattern.startswith("*"))
-    derived_root = index_pattern.replace("*", "") if single_trailing_wildcard else None
-    if derived_root is not None and derived_root in top_level:
-        roots = {derived_root}
-    else:
-        # Одного корневого не выделить - считаем корневыми все верхние:
-        # какой из них загрузится, решает не проверка.
-        roots = set(top_level)
+    # Отсутствие корневого - не находка, а невыполнимая проверка: её ловит
+    # вызывающий (main) и возвращает код 2 ещё до разбора.
+    roots = {index_name} if index_name in index_rels else set()
+
+    # Файлы в корне, названные под старую плоскую раскладку: их строки не
+    # разбираются, и всё перечисленное в них станет сиротами. Причину надо
+    # назвать, иначе вывод читается как поломка проверки.
+    for stray in looks_like_a_stray_index(root, index_name, exact):
+        notices.append(
+            "%s: лежит в корне и похож на индекс, но индексом не считается - "
+            "корневой индекс один (%s), а под-индекс живёт в подпапке под тем "
+            "же именем (например infra/%s). Строки этого файла не разбираются, "
+            "и то, на что он ссылается, будет считаться сиротами"
+            % (stray, index_name, index_name)
+        )
 
     # L1: каждая ссылка из индекса ведёт на существующий файл.
     for index_path in index_paths:
@@ -514,7 +549,7 @@ def check(root, index_paths, allow_globs, index_pattern):
                 continue
             errors.append(
                 "L2 %s - под-индекс, до которого неоткуда дойти: от корневого "
-                "индекса ссылок на него нет, а сам он не загружается" % rel
+                "индекса (%s) цепочки ссылок на него нет" % (rel, index_name)
             )
             continue
         if rel in referenced or is_orphan_ok(exact[rel]):
@@ -546,9 +581,9 @@ def check(root, index_paths, allow_globs, index_pattern):
                 errors.append(
                     "L2 %s не упомянут ни в одном индексе. На него ссылается %s, "
                     "но тот индексом не считается: его строки не разбираются, и "
-                    "битые ссылки внутри него не ловятся. Индекс опознаётся по "
-                    "шаблону имени - переименуйте или задайте свой ключом --index"
-                    % (rel, source)
+                    "битые ссылки внутри него не ловятся. Индексом считается файл "
+                    "с именем %s - переименуйте его так или задайте своё имя "
+                    "ключом --index" % (rel, source, index_name)
                 )
                 continue
         errors.append("L2 %s не упомянут ни в одном индексе - агент его не увидит%s"
@@ -571,9 +606,10 @@ def build_parser():
     )
     parser.add_argument("memory_dir", nargs="?", default="memory",
                         help="папка памяти (по умолчанию: memory)")
-    parser.add_argument("--index", default="MEMORY*.md",
-                        help='шаблон имени индекса (по умолчанию: MEMORY*.md - '
-                             'ловит и корневой индекс, и под-индексы)')
+    parser.add_argument("--index", default="MEMORY.md", metavar="ИМЯ",
+                        help="имя файла индекса (по умолчанию: MEMORY.md). "
+                             "Корневой - файл с этим именем в самой папке памяти; "
+                             "под-индекс - файл с тем же именем в подпапке")
     parser.add_argument("--allow-orphan", action="append", default=[], metavar="GLOB",
                         help="файл(ы), которым позволено не быть в индексе; можно повторять")
     parser.add_argument("--quiet", action="store_true",
@@ -594,20 +630,32 @@ def main(argv=None):
             print("Папка памяти не найдена: %s" % args.memory_dir, file=sys.stderr)
             return EXIT_USAGE
 
-        index_paths = find_indexes(root, args.index)
-        if not index_paths:
-            print("Индекс не найден: %s" % os.path.join(args.memory_dir, args.index),
-                  file=sys.stderr)
+        # Имя, а не шаблон. Прежняя форма ключа принимала глоб, и из него
+        # выводилось имя корневого - вывод промахивался на "*MEMORY.md" и на
+        # шаблонах с двумя звёздочками, причём молча. Глоб теперь отвергаем
+        # вслух: тихо «почти работающий» ключ хуже отказа.
+        if any(ch in args.index for ch in "*?["):
+            print("Ключ --index принимает ИМЯ файла индекса, а не шаблон: %s. "
+                  "Например: --index MEMORY.md" % args.index, file=sys.stderr)
             return EXIT_USAGE
 
-        # Проверка отвечает только за папку памяти. Если индекса нет в ней самой,
-        # а он нашёлся где-то в глубине, значит указали не ту папку - например
-        # корень репозитория. Разбирать чужое дерево и выдавать сотни «сирот»
-        # нельзя: ошибку надо назвать на входе.
+        index_paths = find_indexes(root, args.index)
+
+        # Корневой обязан лежать в самой папке памяти. Без него проверять
+        # нечего: под-индексы сами по себе не загружаются, и «согласовано»
+        # тут означало бы, что агент читает пустоту. Это невыполнимая
+        # проверка (код 2), а не находка.
         if not any(os.path.dirname(p) == root for p in index_paths):
-            print("Это не папка памяти: индекс %s не лежит в %s "
-                  "(нашёлся только во вложенных каталогах - похоже, указана не та папка)"
-                  % (args.index, args.memory_dir), file=sys.stderr)
+            if index_paths:
+                where = ", ".join(sorted(relative_to_root(root, p) or p
+                                         for p in index_paths))
+                print("Корневой индекс не найден: %s нет в самой папке %s "
+                      "(с этим именем нашлось только глубже: %s). Либо указана "
+                      "не та папка, либо корневой индекс назван иначе"
+                      % (args.index, args.memory_dir, where), file=sys.stderr)
+            else:
+                print("Индекс не найден: %s"
+                      % os.path.join(args.memory_dir, args.index), file=sys.stderr)
             return EXIT_USAGE
 
         errors, notices, warnings, row_count, unverifiable = check(
