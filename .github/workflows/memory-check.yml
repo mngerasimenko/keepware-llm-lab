@@ -30,6 +30,9 @@ jobs:
     # станет зелёным при невыполненной проверке.
     env:
       MEMCHECK_REQUIRE_SH: "1"
+      # У inline-скрипта гарда нет force_utf8_output, а печатает он по-русски:
+      # на windows-latest иначе UnicodeEncodeError вместо внятного сообщения.
+      PYTHONIOENCODING: "utf-8"
     strategy:
       fail-fast: false
       matrix:
@@ -47,7 +50,7 @@ jobs:
       # 3.12, а в матрице есть 3.9: там сломанный discover дал бы зелёную
       # галочку при невыполненных тестах. Тот же класс, что MEMCHECK_REQUIRE_SH.
       - name: Тесты вообще собрались
-        run: python -c "import unittest, sys; n = unittest.defaultTestLoader.discover('scripts', 'test_*.py').countTestCases(); print('собрано тестов:', n); sys.exit(0 if n >= 50 else 1)"
+        run: python -c "import unittest, sys; n = unittest.defaultTestLoader.discover('scripts', 'test_*.py').countTestCases(); print('собрано тестов:', n); sys.exit(0 if n >= 100 else 1)"
 
       - name: Тесты
         run: python -m unittest discover -s scripts -v

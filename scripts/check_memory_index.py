@@ -51,9 +51,17 @@ ROW_REF = re.compile(r"^[-*+]\s*\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\[([^\]]*)\]")
 # Строкой индекса она считается ТОЛЬКО при наличии определения метки - иначе
 # чекбоксы "- [ ]" и любые скобки в прозе стали бы ошибками на пустом месте.
 ROW_SHORTCUT = re.compile(r"^[-*+]\s*\[([^\[\]]+)\](?!\s*[\(\[])")
-# Определение метки: "[prof]: user.md". Отступ до трёх пробелов - по CommonMark.
-DEFINITION = re.compile(r"^\s{0,3}\[([^\]]+)\]:\s*(\S+)")
+# Определение метки: "[prof]: user.md" либо "[prof]: <моя папка/user.md>".
+# Угловые скобки берём целиком: внутри них законен пробел, а \S+ обрывался на
+# первом же - получался адрес "<моя", ложная битая ссылка и ложная сирота.
+# Ведущие пробелы здесь не разбираем: строка приходит уже без них, отступ
+# разбирает parse_index (четыре пробела после абзаца - это блок кода).
+DEFINITION = re.compile(r"^\[([^\]]+)\]:\s*(<[^>]*>|\S+)")
 BULLET = re.compile(r"^[-*+]\s")
+# Строка, похожая на строку индекса - чтобы сказать, сколько их потерялось за
+# незакрытым забором. Опечатка в конце файла и проглоченная половина индекса
+# выглядят в выводе одинаково, если не назвать число.
+ROWLIKE = re.compile(r"^[-*+]\s*\[")
 
 FENCE = re.compile(r"^\s*(`{3,}|~{3,})\s*(.*)$")
 COMPLETE_COMMENT = re.compile(r"<!--.*?-->", re.S)
@@ -157,6 +165,7 @@ def parse_index(path):
     rows = []
     pending_refs = []
     definitions = {}
+    lost_rows = 0
     opened_fence = ""
     in_comment = False
     after_list_item = False
@@ -164,10 +173,17 @@ def parse_index(path):
         if opened_fence:
             mark, tail = fence_delimiter(line)
             if mark and closes_fence(mark, opened_fence) and not tail.strip():
+                # Забор закрылся - строки внутри были законными примерами,
+                # ничего не потеряно.
                 opened_fence = ""
+                lost_rows = 0
+            elif ROWLIKE.match(line.lstrip()):
+                lost_rows += 1
             continue
         if in_comment:
             if "-->" not in line:
+                if ROWLIKE.match(line.lstrip()):
+                    lost_rows += 1
                 continue
             line = line.split("-->", 1)[1]
             in_comment = False
@@ -234,7 +250,7 @@ def parse_index(path):
             rows.append((title, label, lineno, "ref-missing"))
 
     unclosed = "блок кода" if opened_fence else ("html-комментарий" if in_comment else None)
-    return rows, unclosed
+    return rows, unclosed, lost_rows
 
 
 def is_linked_dir(path):
@@ -398,19 +414,18 @@ def is_orphan_ok(path):
     return False
 
 
-def find_indexes(root, index_name):
+def find_indexes(exact, index_name):
     """Все индексы: корневой и под-индексы в подпапках - под одним именем.
+
+    Берём их из уже построенной карты файлов, а не вторым обходом дерева:
+    хук зовут на каждый коммит, и повторный os.walk вместе с проверкой каждой
+    подпапки на связанность был бесплатной тратой.
 
     Имя сравнивается точно и с учётом регистра: на Windows сравнение без
     учёта регистра прошло бы, а в CI на Linux набор файлов разъехался бы.
     """
-    found = []
-    for folder, dirs, names in os.walk(root):
-        prune_non_memory_dirs(folder, dirs)
-        for name in sorted(names):
-            if name == index_name:
-                found.append(os.path.normpath(os.path.join(folder, name)))
-    return found
+    return [exact[rel] for rel in sorted(exact)
+            if os.path.basename(rel) == index_name]
 
 
 def looks_like_a_stray_index(root, index_name, exact):
@@ -425,17 +440,19 @@ def looks_like_a_stray_index(root, index_name, exact):
     Требуем оба признака: похожее имя И строки индексного формата внутри.
     Одного имени мало - `MEMORY_of_incident.md` может быть обычным фактом.
     """
-    base = os.path.splitext(index_name)[0]
+    # Регистр не важен: "memory_infra.md" - тот же случай, что "MEMORY_infra.md",
+    # и человек получит ту же стену сирот.
+    base = os.path.splitext(index_name)[0].casefold()
     stray = []
     for rel, path in sorted(exact.items()):
         if "/" in rel or rel == index_name:
             continue
         if not rel.lower().endswith(".md"):
             continue
-        if not os.path.splitext(rel)[0].startswith(base):
+        if not os.path.splitext(rel)[0].casefold().startswith(base):
             continue
         try:
-            rows, _unclosed = parse_index(path)
+            rows, _unclosed, _lost = parse_index(path)
         except OSError:
             continue
         if rows:
@@ -505,7 +522,7 @@ def mentioned_in_raw_text(index_texts, *names):
                for text in index_texts.values() for pattern in patterns)
 
 
-def check(root, index_paths, allow_globs, index_name):
+def check(root, index_paths, allow_globs, index_name, file_map):
     """Возвращает (ошибки, структурные заметки, советы, строк, непроверяемо).
 
     Заметка структурная, если часть проверки не выполнилась: незакрытый блок
@@ -536,7 +553,7 @@ def check(root, index_paths, allow_globs, index_name):
     # выглядя рабочим.
     allow_globs = [pattern.replace("\\", "/") for pattern in allow_globs]
 
-    exact, folded, unreadable_dirs, linked_dirs = build_file_map(root)
+    exact, folded, unreadable_dirs, linked_dirs = file_map
 
     # Каталог, который не открылся, уносит с собой факты: сказать про такую
     # память «согласована» нельзя, это невыполненная проверка (код 2).
@@ -579,15 +596,19 @@ def check(root, index_paths, allow_globs, index_name):
     for index_path in index_paths:
         where = relative_to_root(root, index_path) or index_path
         try:
-            index_rows, unclosed = parse_index(index_path)
+            index_rows, unclosed, lost_rows = parse_index(index_path)
         except OSError as exc:
             notices.append("%s: файл не читается (%s)" % (where, exc.strerror or exc))
             unreadable.append(where)
             continue
         if unclosed:
+            # Число в конце: опечатка в последней строке и проглоченная
+            # половина индекса выглядят одинаково, пока не назван масштаб.
+            lost = (", из них похожих на строки индекса: %d" % lost_rows
+                    if lost_rows else "")
             notices.append(
-                "%s: %s не закрыт до конца файла - строки ниже в разбор не попали"
-                % (where, unclosed)
+                "%s: %s не закрыт до конца файла - строки ниже в разбор не попали%s"
+                % (where, unclosed, lost)
             )
             # Часть индекса не прочитана - тот же случай, что нечитаемый индекс.
             # Прежде печаталась заметка, а код оставался нулевым: CI зеленел на
@@ -861,7 +882,10 @@ def main(argv=None):
                   "Например: --index MEMORY.md" % args.index, file=sys.stderr)
             return EXIT_USAGE
 
-        index_paths = find_indexes(root, args.index)
+        # Один обход дерева на весь прогон: карта файлов строится первой, а
+        # индексы берутся из неё.
+        file_map = build_file_map(root)
+        index_paths = find_indexes(file_map[0], args.index)
 
         # Корневой обязан лежать в самой папке памяти. Без него проверять
         # нечего: под-индексы сами по себе не загружаются, и «согласовано»
@@ -881,7 +905,7 @@ def main(argv=None):
             return EXIT_USAGE
 
         errors, notices, warnings, row_count, unverifiable = check(
-            root, index_paths, args.allow_orphan, args.index)
+            root, index_paths, args.allow_orphan, args.index, file_map)
     except Exception as exc:  # проверка сломалась - это не нарушение памяти
         print("Проверку выполнить не удалось: %s: %s"
               % (type(exc).__name__, exc), file=sys.stderr)

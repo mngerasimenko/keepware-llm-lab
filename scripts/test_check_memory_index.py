@@ -11,6 +11,7 @@
 import hashlib
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -884,6 +885,32 @@ class CiGuards(unittest.TestCase):
         with io.open(path, encoding="utf-8") as fh:
             return fh.read()
 
+    def test_ci_threshold_matches_the_real_test_count(self):
+        """Порог в гарде не должен разойтись с действительностью.
+
+        Зашитое число ловит «discover собрал ноль», но при чистке тестов оно
+        молча превращается в ложную тревогу или, наоборот, перестаёт ловить
+        частичную деградацию. Пусть за этим следит тест, а не память автора.
+        """
+        text = self.workflow()
+        match = re.search(r"n >= (\d+)", text)
+        self.assertIsNotNone(match, "порог в гарде не найден")
+        threshold = int(match.group(1))
+        actual = unittest.defaultTestLoader.discover(SCRIPTS_DIR, "test_*.py").countTestCases()
+        self.assertLessEqual(threshold, actual,
+                             "порог %d выше реального числа тестов %d" % (threshold, actual))
+        self.assertGreaterEqual(threshold * 2, actual,
+                                "порог %d сильно отстал от %d - обновите его"
+                                % (threshold, actual))
+
+    def test_ci_guard_survives_windows_console_encoding(self):
+        """У inline-скрипта нет force_utf8_output - кодировку задаёт окружение.
+
+        Русский print в нём на windows-latest иначе падает с UnicodeEncodeError:
+        джоба покраснеет, но по невнятной причине.
+        """
+        self.assertIn("PYTHONIOENCODING", self.workflow())
+
     def test_ci_checks_that_tests_were_actually_collected(self):
         """На Python 3.9 сломанный discover даёт зелёную галочку при нуле тестов.
 
@@ -1090,6 +1117,90 @@ class PanelReviewFindings(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
+
+
+class MinorPanelFindings(MemoryFixture):
+    """Мелкое из панельного ревью. Каждое дёшево чинится и незачем тащить в свет."""
+
+    def test_definition_target_in_angle_brackets_with_a_space(self):
+        """`[prof]: <моя папка/user.md>` - законный CommonMark.
+
+        В строке-ссылке пробел в адресе уже обрабатывался (угловые скобки
+        снимает clean_target), а в определении метки регулярка обрывалась на
+        первом пробеле: получался адрес «<моя», ложная битая ссылка И ложная
+        сирота на реально существующий файл.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль][prof] - кто\n"
+                         "\n"
+                         "[prof]: <moya papka/user.md>\n",
+            "moya papka/user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_unclosed_fence_notice_says_how_many_rows_were_lost(self):
+        """«Строки ниже в разбор не попали» - а сколько их было?
+
+        Знание «потеряно 3 строки» отличает опечатку в конце файла от
+        проглоченной половины индекса. Без числа человек не знает, срочно это
+        или нет.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "```markdown\n"
+                         "- [Раз](a.md) - крючок\n"
+                         "- [Два](b.md) - крючок\n"
+                         "- [Три](c.md) - крючок\n",
+            "user.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        unclosed = [line for line in output.splitlines() if "не закрыт" in line]
+        self.assertEqual(len(unclosed), 1, output)
+        self.assertRegex(unclosed[0], r"\b3\b",
+                         "не названо, сколько строк индекса пропало")
+
+    def test_stray_index_hint_is_case_insensitive(self):
+        """`memory_infra.md` строчными - тот же случай, что `MEMORY_infra.md`.
+
+        Подсказка про плоскую раскладку сравнивала имя с учётом регистра и на
+        строчном варианте молчала - а человек получал ту же стену сирот.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "memory_infra.md": "- [Сервер](server.md) - прод\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("подпапк", output)
+
+    def test_folder_is_walked_only_once(self):
+        """Дерево обходится один раз, а не дважды на каждый коммит.
+
+        find_indexes и build_file_map ходили по папке независимо, повторяя и
+        обход, и проверку каждой подпапки на связанность. Хук зовут на каждый
+        коммит - второй обход был бесплатной тратой.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Инфра](infra/MEMORY.md) - под\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        real_walk = os.walk
+        calls = []
+
+        def counting_walk(top, *args, **kwargs):
+            calls.append(top)
+            return real_walk(top, *args, **kwargs)
+
+        with unittest.mock.patch.object(linter.os, "walk", counting_walk):
+            code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(calls), 1, "дерево обошли %d раз: %s" % (len(calls), calls))
 
 
 class MemoryFolderBoundary(MemoryFixture):
