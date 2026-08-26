@@ -885,6 +885,18 @@ class CiGuards(unittest.TestCase):
         with io.open(path, encoding="utf-8") as fh:
             return fh.read()
 
+    def test_ci_guard_and_run_use_the_same_test_pattern(self):
+        """Гард считает по одному шаблону имён, а прогон идёт по другому.
+
+        В гарде задан `test_*.py`, а `unittest discover` без ключа берёт
+        `test*.py` - без обязательного подчёркивания. Сегодня файл один и
+        разницы нет, но файл вида `testSomething.py` прогон подхватит, а гард
+        не досчитает - и порог станет мимо факта.
+        """
+        text = self.workflow()
+        self.assertIn("-p 'test_*.py'", text.replace('"', "'"),
+                      "прогон тестов не закреплён тем же шаблоном, что гард")
+
     def test_ci_threshold_matches_the_real_test_count(self):
         """Порог в гарде не должен разойтись с действительностью.
 
@@ -1201,6 +1213,159 @@ class MinorPanelFindings(MemoryFixture):
             code, output = self.run_linter()
         self.assertEqual(code, 0, output)
         self.assertEqual(len(calls), 1, "дерево обошли %d раз: %s" % (len(calls), calls))
+
+
+class SecondRoundFindings(MemoryFixture):
+    """Второй круг ревью: регрессии, внесённые правками первого круга."""
+
+    def test_task_list_checkbox_is_not_a_shortcut_reference(self):
+        """`- [x] сделано` - чеклист, а не ссылка, даже если метка `[x]` определена.
+
+        Сокращённая форма ссылки-метки, добавленная первым кругом, матчила
+        любую строку `- [текст]`. Стоило в том же файле оказаться определению
+        `[x]: файл.md` - и обычный список задач начинал резолвиться как строки
+        индекса, блокируя честный коммит. Чеклисты и определения меток
+        сосуществуют в реальных файлах постоянно.
+        """
+        self.write({
+            "MEMORY.md": "- [Один факт](real.md) - обычная строка\n"
+                         "\n"
+                         "[x]: nowhere.md\n"
+                         "\n"
+                         "- [x] почистить бэклог\n"
+                         "- [ ] следующая задача\n",
+            "real.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_shortcut_reference_still_works_next_to_checkboxes(self):
+        """Обратная сторона: настоящая сокращённая ссылка не должна пострадать."""
+        self.write({
+            "MEMORY.md": "- [prof] - кто пользователь\n"
+                         "- [ ] это чеклист\n"
+                         "\n"
+                         "[prof]: user.md\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_mention_hint_respects_the_path_boundary(self):
+        """`vendor/user.md` в чужом тексте - не упоминание нашего `user.md`.
+
+        Замена перебора на токенизацию потеряла границу слева, которую прежний
+        код проверял явно: имя сравнивалось ещё и по basename, а тот обрубает
+        любой ведущий путь. Подсказка начинала указывать на посторонний файл -
+        и отправляла чинить не то.
+        """
+        self.write({
+            "MEMORY.md": "- [Индекс](other.md) - обычный файл памяти\n",
+            "other.md": "Пример структуры лежит в vendor/user.md в их репозитории.\n",
+            "user.md": "реальный факт, забыт в индексе\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("ссылается other.md", output)
+
+    def test_self_mention_does_not_hide_the_real_source(self):
+        """Файл, упомянувший сам себя, не должен занимать место настоящего источника.
+
+        Прежний перебор исключал сам файл до поиска. Новый механизм
+        регистрировал первое совпадение по алфавиту - и если файл упоминал сам
+        себя, полезная подсказка про настоящий источник терялась.
+
+        Проверяем именно строку ПРО сироту: файл-список тоже сирота и даёт
+        собственную ошибку, на которую легко поймать себя ложным совпадением.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "aaa_orphan.md": "Смотри также aaa_orphan.md для истории.\n",
+            "zzz_spisok.md": "- пункт со ссылкой на aaa_orphan.md\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        about = [line for line in output.splitlines()
+                 if line.startswith("L2 aaa_orphan.md")]
+        self.assertEqual(len(about), 1, output)
+        self.assertIn("zzz_spisok.md", about[0])
+
+
+    def test_lost_rows_counter_resets_when_a_comment_closes(self):
+        """Строки закрытого комментария не должны приплюсовываться к настоящей потере.
+
+        Сброс счётчика стоял только у забора. Строки из благополучно закрытого
+        комментария утекали вперёд и раздували число - в том самом сообщении,
+        которое завели ради честного масштаба потери.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "<!--\n"
+                         "- [A](a.md) - в закрытом комментарии\n"
+                         "- [B](b.md) - тоже\n"
+                         "-->\n"
+                         "\n"
+                         "```markdown\n"
+                         "- [C](c.md) - единственная настоящая потеря\n",
+            "user.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        lost = [line for line in output.splitlines() if "не закрыт" in line]
+        self.assertEqual(len(lost), 1, output)
+        self.assertRegex(lost[0], r"индекса: 1\b",
+                         "число потерянных строк раздуто закрытым комментарием")
+
+    def test_mention_hint_does_not_confuse_md_with_mdx(self):
+        """`user.mdx` - другой файл, а не наш `user.md` с хвостом."""
+        self.write({
+            "MEMORY.md": "- [Профиль](profil.md) - кто\n"
+                         "\n"
+                         "Раньше был файл user.mdx, другой формат.\n",
+            "profil.md": "факт\n",
+            "user.md": "забытый факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("в тексте индекса встречается", output)
+
+    def test_two_level_orphan_chain_does_not_launder_deep_facts(self):
+        """Двойная метка не отмывает ветку: факты в глубине всё равно недостижимы."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "---\norphan: true\n---\n\n- [Глубже](nested/MEMORY.md) - под\n",
+            "infra/nested/MEMORY.md": "---\norphan: true\n---\n\n- [Факт](a.md) - раз\n",
+            "infra/nested/a.md": "спрятанный факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("infra/nested/a.md", output)
+
+    def test_file_listed_in_both_reachable_and_unreachable_index(self):
+        """Упоминания в достижимом индексе достаточно - недостижимый не мешает."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Общий](obshiy.md) - факт\n",
+            "user.md": "факт\n",
+            "obshiy.md": "факт\n",
+            "infra/MEMORY.md": "- [Тот же](../obshiy.md) - и тут\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("L2 obshiy.md", output)
+
+    def test_mutual_link_between_sub_indexes_where_one_is_reachable(self):
+        """Взаимная ссылка не создаёт остров, если один из двух достижим."""
+        self.write({
+            "MEMORY.md": "- [Первый](a/MEMORY.md) - под\n",
+            "a/MEMORY.md": "- [Второй](../b/MEMORY.md) - сосед\n- [Факт](x.md) - раз\n",
+            "a/x.md": "факт\n",
+            "b/MEMORY.md": "- [Первый](../a/MEMORY.md) - сосед\n- [Факт](y.md) - два\n",
+            "b/y.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
 
 
 class MemoryFolderBoundary(MemoryFixture):
@@ -2014,31 +2179,47 @@ class PreCommitHook(unittest.TestCase):
         `git config --unset core.hooksPath` печатался в трёх ветках. У человека
         с husky в этом ключе лежит `.husky/_`, и команда убирает не наш хук, а
         ВЕСЬ его набор - ту самую интеграцию, которую README и предлагает.
-        Ошибки при этом нет: хуки просто перестают запускаться.
 
-        Смотрим на строки, которые хук ПЕЧАТАЕТ, а не на файл целиком: в
-        комментарии команда названа намеренно - иначе следующий читатель
-        «упростит» диагностику обратно в одну строку. Проверяем echo, потому
-        что до ветки «Питон не найден» из теста не добраться, а совет обязан
-        отсутствовать во всех трёх.
+        Первая редакция теста искала строки, начинающиеся с `echo`. Потом вся
+        печать переехала на say() - и тест стал проходить всегда, при любом
+        содержимом хука: строк на `echo` в нём просто не осталось. Поэтому
+        теперь смотрим на все НЕ комментарии (механизм печати может смениться
+        снова) и отдельно убеждаемся, что предмет проверки вообще на месте.
         """
         with io.open(HOOK, encoding="utf-8") as fh:
-            printed = [line for line in fh.read().splitlines()
-                       if line.lstrip().startswith("echo")]
-        offenders = [line for line in printed if "--unset core.hooksPath" in line]
+            lines = fh.read().splitlines()
+        meaningful = [line for line in lines if not line.lstrip().startswith("#")]
+        self.assertTrue(
+            any("pre-commit:" in line for line in meaningful),
+            "в хуке не нашлось ни одной строки, печатаемой пользователю - "
+            "проверка потеряла предмет и больше ничего не гарантирует")
+        offenders = [line for line in meaningful if "--unset core.hooksPath" in line]
         self.assertEqual(offenders, [], "хук печатает разрушительный совет")
 
 
     def test_hook_tells_how_to_find_what_owns_hooks_path(self):
         """Отключать вслепую нечего - сначала надо увидеть, чем хук подключён.
 
-        Второй дефект того же совета: при глобальном core.hooksPath команда
-        `--unset` работает с локальным конфигом, где ключа нет, возвращает 5 и
-        не печатает ничего. Человек выполнил предложенное и остался заперт.
+        Второй дефект прежнего совета: при глобальном core.hooksPath команда
+        `--unset` правит локальный конфиг, где ключа нет, возвращает 5 и не
+        печатает ничего. Человек выполнил предложенное и остался заперт.
         """
         with io.open(HOOK, encoding="utf-8") as fh:
             text = fh.read()
         self.assertIn("--show-origin", text)
+
+    def test_disable_advice_covers_the_empty_answer(self):
+        """Диагностика обязана предусмотреть, что ключ не задан вовсе.
+
+        lefthook не использует core.hooksPath - он кладёт хуки прямо в
+        .git/hooks. У человека, подключившего нас ровно так, как советует
+        README, `--show-origin --get core.hooksPath` не выведет НИЧЕГО. Совет,
+        рассчитанный на два исхода из трёх, оставляет его без следующего шага.
+        """
+        with io.open(HOOK, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("lefthook", text.lower())
+
 
     def test_blocking_branch_offers_bypass_and_no_destructive_command(self):
         """Ветка, которая блокирует коммит, обязана дать выход - но безопасный."""

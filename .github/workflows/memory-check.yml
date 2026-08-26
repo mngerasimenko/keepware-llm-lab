@@ -52,8 +52,10 @@ jobs:
       - name: Тесты вообще собрались
         run: python -c "import unittest, sys; n = unittest.defaultTestLoader.discover('scripts', 'test_*.py').countTestCases(); print('собрано тестов:', n); sys.exit(0 if n >= 100 else 1)"
 
+      # Шаблон тот же, что в гарде выше: у discover без ключа он «test*.py»,
+      # без обязательного подчёркивания, и наборы могли бы разъехаться.
       - name: Тесты
-        run: python -m unittest discover -s scripts -v
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
 
       - name: Проверка собственной памяти репозитория
         run: python scripts/check_memory_index.py memory

@@ -51,6 +51,11 @@ ROW_REF = re.compile(r"^[-*+]\s*\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\[([^\]]*)\]")
 # Строкой индекса она считается ТОЛЬКО при наличии определения метки - иначе
 # чекбоксы "- [ ]" и любые скобки в прозе стали бы ошибками на пустом месте.
 ROW_SHORTCUT = re.compile(r"^[-*+]\s*\[([^\[\]]+)\](?!\s*[\(\[])")
+# Содержимое скобок, которое markdown трактует как чеклист, а не как ссылку.
+# Стоило в файле оказаться определению метки "[x]: файл.md" - и обычный список
+# задач начинал резолвиться строками индекса, блокируя честный коммит.
+# Чеклисты и определения меток сосуществуют в реальных файлах постоянно.
+TASK_MARKS = {"", "x", "-"}
 # Определение метки: "[prof]: user.md" либо "[prof]: <моя папка/user.md>".
 # Угловые скобки берём целиком: внутри них законен пробел, а \S+ обрывался на
 # первом же - получался адрес "<моя", ложная битая ссылка и ложная сирота.
@@ -187,6 +192,10 @@ def parse_index(path):
                 continue
             line = line.split("-->", 1)[1]
             in_comment = False
+            # Комментарий закрылся штатно - строки внутри него отброшены
+            # намеренно, а не потеряны. Без сброса они утекали вперёд и
+            # раздували число в сообщении о настоящей потере.
+            lost_rows = 0
         line = COMPLETE_COMMENT.sub("", line)
         mark, _tail = fence_delimiter(line)
         if mark:
@@ -236,7 +245,7 @@ def parse_index(path):
             pending_refs.append((title, label, lineno, True))
             continue
         shortcut = ROW_SHORTCUT.match(body)
-        if shortcut:
+        if shortcut and shortcut.group(1).strip().lower() not in TASK_MARKS:
             label = shortcut.group(1).strip()
             # required=False: нет определения - значит это не ссылка, а текст.
             pending_refs.append((label, label, lineno, False))
@@ -336,6 +345,26 @@ def build_file_map(root):
             exact[rel] = path
             folded.setdefault(rel.casefold(), path)
     return exact, folded, unreadable_dirs, linked_dirs
+
+
+def hidden_behind(start, per_index, index_rels):
+    """Всё, до чего нельзя дойти иначе, как через этот недостижимый индекс.
+
+    Считать только прямые строки было неверно: под-индекс, перечисленный в
+    недостижимом под-индексе, прячет за собой ещё и свои файлы, а сообщение
+    называло единицу. Спускаемся по цепочке.
+    """
+    seen = set()
+    queue = [start]
+    while queue:
+        current = queue.pop()
+        for _title, actual_rel in per_index.get(current, ()):
+            if actual_rel in seen or actual_rel == start:
+                continue
+            seen.add(actual_rel)
+            if actual_rel in index_rels:
+                queue.append(actual_rel)
+    return seen
 
 
 def files_count(number):
@@ -460,10 +489,11 @@ def looks_like_a_stray_index(root, index_name, exact):
     return stray
 
 
-# Имя файла памяти как цельный токен. Максимальная жадность и обязательное
-# окончание на .md дают границу сами: в «superuser.md» найдётся именно
-# «superuser.md», а не «user.md» внутри него.
-FILENAME_TOKEN = re.compile(r"[\w.\-/\\]+\.md", re.I)
+# Имя файла памяти как цельный токен. Жадность даёт границу слева: в
+# «superuser.md» найдётся именно «superuser.md». Просмотр вперёд - границу
+# справа: без него «user.mdx» откатывался до «user.md» и выдавал совпадение
+# с другим файлом.
+FILENAME_TOKEN = re.compile(r"[\w.\-/\\]+\.md(?![\w.\-])", re.I)
 
 
 def map_mentions(others, wanted, cache):
@@ -488,10 +518,19 @@ def map_mentions(others, wanted, cache):
                 text = ""
             cache[rel] = text
         for token in set(FILENAME_TOKEN.findall(text)):
-            normalised = token.replace("\\", "/")
-            for candidate in (normalised, os.path.basename(normalised)):
-                if candidate in wanted:
-                    found.setdefault(candidate, rel)
+            candidate = token.replace("\\", "/")
+            # Сравниваем токен целиком и НЕ отрезаем ведущий путь: «vendor/
+            # user.md» в чужом тексте - не упоминание нашего «user.md».
+            # Прежний перебор проверял ту же границу явным просмотром назад,
+            # а basename её терял и отправлял чинить посторонний файл.
+            # Голое имя без пути совпадёт с basename-формой, она уже в wanted.
+            if candidate not in wanted:
+                continue
+            # Файл, упомянувший сам себя, источником не считается: иначе он
+            # занимает слот, и настоящая ссылка из соседнего файла теряется.
+            if candidate in (rel, os.path.basename(rel)):
+                continue
+            found.setdefault(candidate, rel)
     return found
 
 
@@ -517,7 +556,8 @@ def mentioned_in_raw_text(index_texts, *names):
     Границы слева обязательны: без них «user.md» находится внутри
     «superuser.md», и подсказка утверждала бы небылицу.
     """
-    patterns = [re.compile(r"(?<![\w.\-/])" + re.escape(name)) for name in names if name]
+    patterns = [re.compile(r"(?<![\w.\-/])" + re.escape(name) + r"(?![\w.\-])")
+                for name in names if name]
     return any(pattern.search(text)
                for text in index_texts.values() for pattern in patterns)
 
@@ -750,7 +790,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
         if rel in index_rels:
             if rel in reachable:
                 continue
-            behind = len({actual_rel for _title, actual_rel in per_index.get(rel, ())})
+            behind = len(hidden_behind(rel, per_index, index_rels))
             # Без придаточного: «1 файл, которые станут» не согласуется, а
             # число тут любое.
             tail = ". За ним скрыто %s" % files_count(behind) if behind else ""

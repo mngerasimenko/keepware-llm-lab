@@ -28,6 +28,10 @@ advise_how_to_disable() {
     say "pre-commit: если это .githooks - уберите ключ там, где он задан;"
     say "pre-commit: если что-то другое (.husky/_ и подобное) - наш хук зовётся"
     say "pre-commit: строкой из вашего менеджера хуков, убирать надо её."
+    say "pre-commit: если команда не вывела ничего - ключ не задан вовсе:"
+    say "pre-commit: так работает lefthook и обычный .git/hooks/pre-commit."
+    say "pre-commit: тогда уберите вызов там, где вписали (lefthook.yml или"
+    say "pre-commit: сам файл хука)."
 }
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
