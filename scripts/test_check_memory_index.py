@@ -1327,6 +1327,33 @@ class SecondRoundFindings(MemoryFixture):
         self.assertRegex(lost[0], r"индекса: 1\b",
                          "число потерянных строк раздуто закрытым комментарием")
 
+    def test_lost_rows_counter_resets_when_a_fence_closes(self):
+        """Строки закрытого забора не должны приплюсовываться к настоящей потере.
+
+        Парный к тесту про комментарий - и найден не рассуждением, а
+        мутационным аудитом: сброс счётчика при закрытии ЗАБОРА оказался
+        единственной веткой из тридцати одной, которую не ловил ни один тест
+        из набора. Тест про комментарий существовал, про забор - нет, хотя
+        сбросов в коде два.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "```markdown\n"
+                         "- [A](a.md) - в закрытом заборе\n"
+                         "- [B](b.md) - тоже\n"
+                         "```\n"
+                         "\n"
+                         "<!--\n"
+                         "- [C](c.md) - единственная настоящая потеря\n",
+            "user.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        lost = [line for line in output.splitlines() if "не закрыт" in line]
+        self.assertEqual(len(lost), 1, output)
+        self.assertRegex(lost[0], r"индекса: 1\b",
+                         "число потерянных строк раздуто закрытым забором")
+
     def test_mention_hint_does_not_confuse_md_with_mdx(self):
         """`user.mdx` - другой файл, а не наш `user.md` с хвостом."""
         self.write({
@@ -1525,6 +1552,32 @@ class ThirdRoundFindings(MemoryFixture):
         about = [line for line in output.splitlines() if line.startswith("L2 odinokiy.md")]
         self.assertEqual(len(about), 1, output)
         self.assertNotIn("ссылается", about[0])
+
+    def test_file_in_a_subfolder_citing_its_own_bare_name_is_not_its_own_source(self):
+        """Тот же случай на НЕвырожденном входе - в подпапке путь и имя различаются.
+
+        Предыдущая редакция парного теста клала файл в корень, где `rel` и
+        basename совпадают: там обе реализации отсева ведут себя одинаково, и
+        тест физически не мог отличить нужную проверку от мёртвой. Я на этом
+        основании удалил рабочий guard - и получил сообщение «на него
+        ссылается он сам» с советом переименовать сироту в индекс.
+
+        Правило, которое отсюда следует: парный тест обязан стоять на входе,
+        который РАЗЛИЧАЕТ старую и новую реализацию. Иначе и он, и мутация
+        дают ложную уверенность.
+        """
+        self.write({
+            "MEMORY.md": "- [Якорь](anchor.md) - кто\n",
+            "anchor.md": "факт\n",
+            "sub/odinokiy.md": "Этот файл раньше назывался просто odinokiy.md.\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        about = [line for line in output.splitlines()
+                 if line.startswith("L2 sub/odinokiy.md")]
+        self.assertEqual(len(about), 1, output)
+        self.assertNotIn("ссылается", about[0])
+        self.assertNotIn("переименуйте", about[0])
 
 
 class MemoryFolderBoundary(MemoryFixture):
