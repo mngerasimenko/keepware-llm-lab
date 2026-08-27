@@ -30,7 +30,8 @@ import os
 import re
 import stat
 import sys
-from collections import defaultdict
+import unicodedata
+from collections import Counter, defaultdict
 from urllib.parse import unquote, urlparse
 
 # Строка индекса: "- [Заголовок](файл.md) - крючок".
@@ -105,6 +106,8 @@ def closes_fence(mark, opened):
 # Метка "этот файл лежит вне индекса намеренно" - по образцу директивы :orphan:
 # в Sphinx, которому пришлось её завести ровно по этой причине.
 FRONTMATTER_ORPHAN = re.compile(r"^\s*orphan\s*:\s*true\s*$", re.I)
+# Признак, отличающий незакрытую YAML-шапку от горизонтальной линейки.
+YAML_PAIR = re.compile(r"^\s*[\w.\-]+\s*:\s*\S")
 COMMENT_ORPHAN = re.compile(r"<!--\s*linter:\s*orphan-ok\s*-->", re.I)
 
 EXIT_OK = 0
@@ -119,6 +122,23 @@ def force_utf8_output():
             stream.reconfigure(encoding="utf-8")
         except Exception:
             pass  # поток без reconfigure или уже отсоединённый - не повод падать
+
+
+def nfc(text):
+    """Одна форма записи имени.
+
+    Одно и то же имя файла существует в нескольких формах Юникода: «é» одной
+    кодовой точкой и «e» плюс комбинирующий акут выглядят одинаково везде -
+    в редакторе, в проводнике, в выводе. Сравнение по кодовым точкам считает
+    их разными, и человек получает сразу две ошибки на исправной памяти:
+    «ссылка в никуда» и «файл не упомянут». Подсказка про регистр тут не
+    помогает - это не регистр.
+
+    macOS создаёт имена в разложенной форме, Windows и Linux хранят как дали;
+    файл, приехавший из архива или облака, может отличаться формой от того,
+    что человек набрал в индексе.
+    """
+    return unicodedata.normalize("NFC", text)
 
 
 def read_text(path):
@@ -349,7 +369,7 @@ def build_file_map(root):
         prune_non_memory_dirs(folder, dirs, linked_dirs)
         for name in sorted(names):
             path = os.path.normpath(os.path.join(folder, name))
-            rel = os.path.relpath(path, root).replace(os.sep, "/")
+            rel = nfc(os.path.relpath(path, root).replace(os.sep, "/"))
             exact[rel] = path
             folded.setdefault(rel.casefold(), path)
     return exact, folded, unreadable_dirs, linked_dirs
@@ -407,7 +427,7 @@ def relative_to_root(root, path):
         return None
     if os.path.isabs(rel) or rel == os.pardir or rel.startswith(os.pardir + os.sep):
         return None
-    return rel.replace(os.sep, "/")
+    return nfc(rel.replace(os.sep, "/"))
 
 
 def frontmatter_lines(text):
@@ -427,7 +447,12 @@ def frontmatter_lines(text):
         if line.strip() == "---":
             return head, False
         head.append(line)
-    return [], True
+    # Шапка не закрыта - но `---` первой строкой это ещё и обычная
+    # горизонтальная линейка, законный markdown. Объявлять «шапка открыта»
+    # по одному совпадению первой строки значит выдумывать факт: требуем
+    # хотя бы одну строку вида `ключ: значение`.
+    looks_like_yaml = any(YAML_PAIR.match(line) for line in head)
+    return [], looks_like_yaml
 
 
 def has_unclosed_frontmatter(path):
@@ -864,6 +889,13 @@ def check(root, index_paths, allow_globs, index_name, file_map):
     # прежде они перечитывались с диска на КАЖДОГО сироту.
     cache = {}
     index_texts = read_all(index_paths)
+    # Сколько файлов носит каждое короткое имя - считаем ОДИН раз. Прежде эта
+    # сумма бралась перебором всех файлов внутри цикла по сиротам, то есть
+    # O(сирот x файлов): на памяти в тысячу файлов прогон занимал 15 секунд, и
+    # это pre-commit хук. Ровно тот перебор, который уже убирали из поиска
+    # упоминаний, - вернулся в соседнюю ветку.
+    namesake_counts = Counter(os.path.basename(other) for other in exact
+                              if other.lower().endswith(".md"))
     others = [(exact[other], other) for other in sorted(exact)
               if other.lower().endswith(".md") and other not in index_rels]
     wanted = set()
@@ -882,6 +914,15 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             stranded.setdefault(actual_rel, where)
 
     for rel in orphans:
+        # Считаем ДО ветвления: ветка про источник заканчивается досрочным
+        # выходом, и подсказка, стоявшая после неё, не показывалась почти
+        # никогда - у забытого файла упоминание обычно есть. Два сигнала
+        # ортогональны: один объясняет, откуда взялась догадка про источник,
+        # другой - почему не сработала метка orphan.
+        head_note = ""
+        if has_unclosed_frontmatter(exact[rel]):
+            head_note = (" (шапка `---` открыта, но не закрыта - метка "
+                         "`orphan: true` внутри неё не читается)")
         hint = ""
         if rel in stranded:
             errors.append(
@@ -926,16 +967,14 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                 # Формулировка честная ровно настолько, насколько мы уверены:
                 # утвердительно - только по полному пути; по голому имени при
                 # нескольких однофамильцах - предположение, а не факт.
-                namesakes = sum(1 for other in exact
-                                if other.lower().endswith(".md")
-                                and os.path.basename(other) == os.path.basename(rel))
+                namesakes = namesake_counts[os.path.basename(rel)]
                 if by_name is not None and namesakes > 1:
                     errors.append(
                         "L2 %s не упомянут ни в одном индексе. Возможно, имеется в "
                         "виду в %s - совпало голое имя файла, а файлов с таким "
                         "именем несколько (%d). Индексом считается файл с именем "
                         "%s - переименуйте нужный так или задайте своё имя ключом "
-                        "--index" % (rel, source, namesakes, index_name)
+                        "--index%s" % (rel, source, namesakes, index_name, head_note)
                     )
                 else:
                     errors.append(
@@ -943,14 +982,11 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                         "но тот индексом не считается: его строки не разбираются, и "
                         "битые ссылки внутри него не ловятся. Индексом считается файл "
                         "с именем %s - переименуйте его так или задайте своё имя "
-                        "ключом --index" % (rel, source, index_name)
+                        "ключом --index%s" % (rel, source, index_name, head_note)
                     )
                 continue
-        if not hint and has_unclosed_frontmatter(exact[rel]):
-            hint = (" (шапка `---` открыта, но не закрыта - метка `orphan: true` "
-                    "внутри неё не читается)")
-        errors.append("L2 %s не упомянут ни в одном индексе - агент его не увидит%s"
-                      % (rel, hint))
+        errors.append("L2 %s не упомянут ни в одном индексе - агент его не увидит%s%s"
+                      % (rel, hint, head_note))
 
     # L3: одинаковый заголовок у разных файлов - предупреждение, не ошибка.
     # Индекс намеренно не уникальный ключ, поэтому это сигнал, а не запрет.

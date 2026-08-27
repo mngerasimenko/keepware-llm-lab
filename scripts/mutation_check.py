@@ -40,6 +40,7 @@
 
 import io
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -117,8 +118,17 @@ MUTATIONS = [
     ("ссылка на каталог диагностируется как ссылка в никуда", LINTER,
      "            elif os.path.isdir(absolute):", "            elif False:"),
     ("незакрытая шапка не объясняет, почему метка не сработала", LINTER,
-     "        if not hint and has_unclosed_frontmatter(exact[rel]):",
-     "        if False and has_unclosed_frontmatter(exact[rel]):"),
+     "        if has_unclosed_frontmatter(exact[rel]):",
+     "        if False:"),
+    ("горизонтальная линейка выдаётся за незакрытую шапку", LINTER,
+     "    looks_like_yaml = any(YAML_PAIR.match(line) for line in head)\n"
+     "    return [], looks_like_yaml",
+     "    return [], True"),
+    ("разные формы записи имени считаются разными файлами", LINTER,
+     '    return unicodedata.normalize("NFC", text)', "    return text"),
+    ("однофамильцы считаются неверно", LINTER,
+     "                namesakes = namesake_counts[os.path.basename(rel)]",
+     "                namesakes = 1"),
     ("догадка по голому имени выдаётся за факт", LINTER,
      "                if by_name is not None and namesakes > 1:",
      "                if False:"),
@@ -177,6 +187,16 @@ def write_atomically(path, text):
     folder = os.path.dirname(os.path.abspath(path))
     handle, temporary = tempfile.mkstemp(dir=folder, suffix=".tmp")
     try:
+        # Права переносим с оригинала. mkstemp создаёт файл с правами 0600, а
+        # замена оставляет права ИСТОЧНИКА - значит на POSIX первый же прогон
+        # снял бы с .githooks/pre-commit бит исполняемости. Неисполняемый хук
+        # git пропускает МОЛЧА: инструмент, ищущий тихие отказы, произвёл бы
+        # тихий отказ в защите, которая охраняет память. На Windows этого не
+        # видно вовсе - там замена сохраняет права цели.
+        try:
+            os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
+        except OSError:
+            pass  # оригинала ещё нет - оставляем права по умолчанию
         with io.open(handle, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
             stream.flush()

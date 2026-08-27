@@ -16,6 +16,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
+import time
 import threading
 import unittest
 import unittest.mock
@@ -1720,6 +1722,135 @@ class HiddenBehindTerminates(unittest.TestCase):
         worker.join(timeout=10)
         self.assertFalse(worker.is_alive(), "обход не завершился - цикл не разорван")
         self.assertEqual(finished[0], {"b/MEMORY.md", "c/MEMORY.md"})
+
+
+class SixthRoundFindings(MemoryFixture):
+    """Шестой круг. Три критических из четырёх - следствие правок пятого."""
+
+    def test_unclosed_frontmatter_is_explained_even_when_a_source_is_found(self):
+        """Две правки одного коммита: первая сделала вторую недостижимой.
+
+        Ветка про однофамильцев заканчивается досрочным выходом, а подсказка
+        про незакрытую шапку стояла после неё. У файла, который кто-то забыл
+        проиндексировать, упоминание обычно ЕСТЬ - значит подсказка не
+        показывалась почти никогда, а совет уводил не туда: «переименуйте
+        файл в индекс» вместо «допишите три символа».
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "shablon.md": "---\nname: shablon\norphan: true\n\nтело без закрытия\n",
+            "spisok.md": "Смотри детали в shablon.md.\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        about = [line for line in output.splitlines() if line.startswith("L2 shablon.md")]
+        self.assertEqual(len(about), 1, output)
+        self.assertIn("не закрыта", about[0])
+
+    def test_horizontal_rule_is_not_called_an_unclosed_frontmatter(self):
+        """`---` первой строкой - законная горизонтальная линейка, а не шапка.
+
+        Обратная сторона подсказки: она заявляла факт «шапка открыта» там,
+        где есть лишь совпадение по первой строке. Требуем признак YAML -
+        хотя бы одну строку вида `ключ: значение`.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "zametka.md": "---\n\nЗаметка начинается с линейки.\n\nВторая мысль.\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        about = [line for line in output.splitlines() if line.startswith("L2 zametka.md")]
+        self.assertEqual(len(about), 1, output)
+        self.assertNotIn("не закрыта", about[0])
+
+    def test_closing_fence_with_a_tail_does_not_close_the_block(self):
+        """Правило про пустой хвост обещано в докстроке и не проверялось нигде.
+
+        Закрывающий забор с хвостом (```python вместо ```) не закрывает блок.
+        Иначе пример внутри блока начинает разбираться как настоящий индекс -
+        ложная тревога ровно на приёме «документируем свой формат», который
+        README и советует.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "````markdown\n"
+                         "```python\n"
+                         "- [Пример](primer.md) - это пример, не строка индекса\n"
+                         "```\n"
+                         "````\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_unicode_name_in_a_different_normal_form_still_resolves(self):
+        """Одно и то же имя в NFC и NFD - один файл для человека и для ФС.
+
+        Ссылка набрана в одной форме, файл на диске создан в другой: внешне
+        строки идентичны, и человек получает сразу две ошибки на исправной
+        памяти - «ссылка в никуда» и «файл не упомянут». Подсказка про
+        регистр тут не срабатывает: это не регистр, а другая
+        последовательность кодовых точек.
+        """
+        composed = unicodedata.normalize("NFC", "café.md")
+        decomposed = unicodedata.normalize("NFD", "café.md")
+        self.assertNotEqual(composed, decomposed, "формы совпали - тест бессмыслен")
+        self.write({
+            "MEMORY.md": "- [Кафе](%s) - крючок\n" % composed,
+            decomposed: "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_distinct_unicode_names_are_still_distinct(self):
+        """Обратная сторона: нормализация не должна склеивать разные имена."""
+        self.write({
+            "MEMORY.md": "- [Кафе](cafe.md) - крючок\n",
+            "cafe.md": "факт\n",
+            "café.md": "другой файл, в индексе его нет\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("café.md", output)
+
+
+class HotPathStaysLinear(MemoryFixture):
+    """Защита от возврата квадратичности - мутациями её не поймать.
+
+    Мутационная проверка отвечает на вопрос «изменилось ли поведение», а
+    квадратичная и линейная версии ведут себя одинаково: разница только во
+    времени. Именно поэтому возврат перебора всех файлов на каждую сироту
+    прошёл незамеченным - и дал 15 секунд на памяти в тысячу файлов, то есть
+    на каждом коммите.
+
+    Потолок взят с большим запасом: на линейной версии этот вход считается
+    десятые доли секунды, на квадратичной - десятки секунд.
+    """
+
+    def test_many_orphans_do_not_make_the_run_quadratic(self):
+        files = {}
+        rows = []
+        for number in range(300):
+            name = "fakt_%03d.md" % number
+            files[name] = "факт %d\n" % number
+            rows.append("- [Факт %d](%s) - крючок\n" % (number, name))
+        for number in range(200):
+            files["sirota_%03d.md" % number] = "см. fakt_001.md рядом\n"
+        files["MEMORY.md"] = "".join(rows)
+        self.write(files)
+
+        started = time.perf_counter()
+        code, output = self.run_linter("--quiet")
+        spent = time.perf_counter() - started
+
+        self.assertEqual(code, 1, output)
+        self.assertLess(spent, 5.0,
+                        "500 файлов с 200 сиротами заняли %.1f с - похоже на "
+                        "возврат перебора всех файлов на каждую сироту" % spent)
 
 
 class MemoryFolderBoundary(MemoryFixture):
