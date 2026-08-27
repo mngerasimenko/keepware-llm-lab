@@ -2120,6 +2120,42 @@ class DocumentationMatchesReality(unittest.TestCase):
         self.assertNotIn("--unset core.hooksPath", self.readme())
 
 
+class MutationCheckIsAlive(unittest.TestCase):
+    """Мутационная проверка сама не должна стать тихим отказом.
+
+    Её мутации привязаны к точным фрагментам кода. Стоит коду измениться -
+    фрагмент перестаёт находиться, мутация тихо не ставится, и инструмент,
+    созданный ловить непроверенные ветки, начинает рапортовать успех ни о
+    чём. Это ровно тот класс дефекта, который он ищет.
+
+    Здесь проверяется только то, что все якоря на месте: полный прогон
+    занимает минуты (набор гоняется на каждую мутацию), а протухший якорь
+    надо ловить на каждом коммите.
+    """
+
+    def test_every_mutation_anchor_is_still_found(self):
+        sys.path.insert(0, SCRIPTS_DIR)
+        import mutation_check
+
+        previous = os.getcwd()
+        os.chdir(REPO_DIR)
+        try:
+            stale = mutation_check.missing_anchors()
+        finally:
+            os.chdir(previous)
+        self.assertEqual(
+            stale, [],
+            "мутации отстали от кода - поправьте их в scripts/mutation_check.py")
+
+    def test_mutation_list_is_not_empty(self):
+        """Пустой список мутаций отрапортовал бы «все пойманы» ни о чём."""
+        sys.path.insert(0, SCRIPTS_DIR)
+        import mutation_check
+
+        self.assertGreater(len(mutation_check.MUTATIONS), 20,
+                           "набор мутаций подозрительно мал")
+
+
 class PreCommitHook(unittest.TestCase):
     """Хук - это то, что трогает посторонний человек. Здесь ошибаться дороже всего."""
 
