@@ -21,9 +21,15 @@
 Коды возврата: 0 - все мутации пойманы; 1 - какая-то выжила либо якорь
 мутации больше не находится в коде (см. ниже).
 
-Файлы правятся на месте и возвращаются в исходное состояние в блоке
-finally - но это работа с рабочим деревом, поэтому запускать имеет смысл
-на чистом дереве, чтобы `git diff` после прогона был пустым.
+**Инструмент правит файлы в рабочем дереве** и возвращает их обратно.
+Запись атомарная (временный файл рядом плюс подмена через os.replace), так
+что прерывание не оставит файл пустым - но запускать всё равно стоит на
+чистом дереве, чтобы `git status` после прогона был пустым и чужие правки
+не смешались с мутациями.
+
+Перед мутациями набор прогоняется на нетронутом коде. Если он красный и
+без мутаций, инструмент отказывается работать: иначе «поймана» печаталось
+бы на каждой мутации по причине, к ней отношения не имеющей.
 
 **Про якоря.** Мутация ищет точный фрагмент кода. Когда код меняется,
 фрагмент перестаёт находиться - и молчаливый пропуск такой мутации
@@ -36,6 +42,7 @@ import io
 import os
 import subprocess
 import sys
+import tempfile
 
 LINTER = os.path.join("scripts", "check_memory_index.py")
 HOOK = os.path.join(".githooks", "pre-commit")
@@ -56,8 +63,8 @@ MUTATIONS = [
      '                opened_fence = ""\n                lost_rows = 0',
      '                opened_fence = ""'),
     ("счётчик потерянных строк не сбрасывается комментарием", LINTER,
-     "            in_comment = False\n            # Комментарий закрылся штатно",
-     "            in_comment = False\n            lost_rows = lost_rows\n            # Комментарий закрылся штатно"),
+     "            # раздували число в сообщении о настоящей потере.\n            lost_rows = 0",
+     "            # раздували число в сообщении о настоящей потере."),
     ("адрес метки не понимает угловые скобки", LINTER,
      r'DEFINITION = re.compile(r"^\[([^\]]+)\]:\s*(<[^>]*>|\S+)")',
      r'DEFINITION = re.compile(r"^\[([^\]]+)\]:\s*(\S+)")'),
@@ -81,6 +88,11 @@ MUTATIONS = [
      "        if where not in reachable:\n            continue", "        pass"),
     ("метка orphan на под-индексе отмывает ветку за ним", LINTER,
      "            if is_orphan_ok(exact[rel]):", "            if True:"),
+    ("обход скрытого перестал помнить посещённые узлы", LINTER,
+     "            if (actual_rel in seen or actual_rel == start\n"
+     "                    or actual_rel in reachable or actual_rel in referenced):",
+     "            if (actual_rel == start\n"
+     "                    or actual_rel in reachable or actual_rel in referenced):"),
     ("подсчёт скрытого считает и то, что видно другим путём", LINTER,
      "or actual_rel in reachable or actual_rel in referenced):", "):"),
     ("шаблоны --allow-orphan не нормализуются", LINTER,
@@ -101,6 +113,15 @@ MUTATIONS = [
      "            if source == rel:\n                source = None", "            pass"),
     ("самоотсев в карте упоминаний убран", LINTER,
      "            if candidate == rel:\n                continue", "            pass"),
+
+    ("ссылка на каталог диагностируется как ссылка в никуда", LINTER,
+     "            elif os.path.isdir(absolute):", "            elif False:"),
+    ("незакрытая шапка не объясняет, почему метка не сработала", LINTER,
+     "        if not hint and has_unclosed_frontmatter(exact[rel]):",
+     "        if False and has_unclosed_frontmatter(exact[rel]):"),
+    ("догадка по голому имени выдаётся за факт", LINTER,
+     "                if by_name is not None and namesakes > 1:",
+     "                if False:"),
 
     # --- обход файловой системы ---
     ("скрытые каталоги обходятся как память", LINTER,
@@ -140,6 +161,35 @@ MUTATIONS = [
 ]
 
 
+def write_atomically(path, text):
+    """Замена содержимого без окна, в котором файл пуст.
+
+    `open(path, "w")` усекает файл до нуля ЕЩЁ ДО записи. Между усечением и
+    `write()` есть точка, где CPython проверяет отложенные сигналы: Ctrl+C,
+    закрытие терминала, ошибка диска или лок антивируса в этот момент
+    оставляют файл пустым. Инструмент, который правит чужой рабочий файл и
+    может его обнулить, опаснее любой ошибки, которую он ищет.
+
+    Пишем во временный файл рядом (та же файловая система - иначе замена не
+    атомарна) и подменяем через os.replace: он либо отработал целиком, либо
+    не тронул оригинал. Работает и на POSIX, и на Windows.
+    """
+    folder = os.path.dirname(os.path.abspath(path))
+    handle, temporary = tempfile.mkstemp(dir=folder, suffix=".tmp")
+    try:
+        with io.open(handle, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
 def missing_anchors():
     """Мутации, чей фрагмент больше не находится ровно один раз."""
     stale = []
@@ -156,10 +206,23 @@ def missing_anchors():
 
 
 def suite_fails():
-    """True, если набор тестов покраснел. Останавливаемся на первом падении."""
+    """True, если набор тестов покраснел. Останавливаемся на первом падении.
+
+    Гоняем ТОЛЬКО `test_check_memory_index.py`, и это не удобство, а условие
+    осмысленности. Самотесты инструмента (`test_mutation_check_self.py`)
+    проверяют, что якоря мутаций находятся в коде - а активная мутация свой
+    же якорь и заменяет. Лежи они в измеряемом наборе, он краснел бы на
+    КАЖДОЙ мутации, и отчёт «все пойманы» печатался бы независимо от того,
+    заметил ли мутацию хоть один содержательный тест. Инструмент,
+    спрашивающий «врут ли тесты», врал бы сам - на всех прогонах.
+
+    Фильтровать по имени класса нельзя: у `unittest` ключ `-k` не понимает
+    отрицания (это синтаксис pytest), и `-k "not X"` молча отбирает ноль
+    тестов. Поэтому разделение файлами, а не фильтром.
+    """
     result = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", "scripts",
-         "-p", "test_*.py", "-f"],
+         "-p", "test_check_memory_index.py", "-f"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         env=dict(os.environ, PYTHONIOENCODING="utf-8"))
     return result.returncode != 0
@@ -186,15 +249,26 @@ def main():
             print("   %s: %s" % (name, why), file=sys.stderr)
         return 1
 
+    # Без этого прогона всё дальнейшее бессмысленно: если набор красный по
+    # своей причине - недостающий sh, чужая правка в дереве, сломанный тест, -
+    # то краснеть он будет и на каждой мутации, и отчёт «все пойманы» окажется
+    # рапортом о причине, к мутациям отношения не имеющей.
+    print("Проверяю, что набор зелёный без мутаций...")
+    if suite_fails():
+        print("Тесты не проходят и БЕЗ мутаций - сначала почините дерево.",
+              file=sys.stderr)
+        print("Пока набор красный, любая мутация засчитается «пойманной» по "
+              "чужой причине.", file=sys.stderr)
+        return 1
+
     survived = []
     for number, (name, path, old, new) in enumerate(MUTATIONS, 1):
         original = io.open(path, encoding="utf-8").read()
-        io.open(path, "w", encoding="utf-8", newline="\n").write(
-            original.replace(old, new))
         try:
+            write_atomically(path, original.replace(old, new))
             caught = suite_fails()
         finally:
-            io.open(path, "w", encoding="utf-8", newline="\n").write(original)
+            write_atomically(path, original)
         print("[%2d/%d] %-8s %s" % (number, len(MUTATIONS),
                                     "поймана" if caught else "ВЫЖИЛА", name))
         if not caught:

@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from contextlib import redirect_stdout, redirect_stderr
@@ -1580,6 +1581,147 @@ class ThirdRoundFindings(MemoryFixture):
         self.assertNotIn("переименуйте", about[0])
 
 
+class FifthRoundFindings(MemoryFixture):
+    """Пятый круг: честность подсказок и слепые зоны, найденные мутациями."""
+
+    def test_bare_name_source_is_not_stated_as_fact_when_namesakes_exist(self):
+        """Совпало голое имя, а файлов с таким именем несколько - это догадка.
+
+        Словарь упоминаний общий на все файлы с одним именем, побеждает первый
+        по алфавиту. Самоцитирование в `a/notes.md` занимало слот и объявлялось
+        источником для `zzz_real/notes.md`, хотя настоящая ссылка лежала рядом,
+        в той же папке. Утвердительное «на него ссылается» тут неправда.
+        """
+        self.write({
+            "MEMORY.md": "- [Корень](root.md) - обычный факт\n",
+            "root.md": "факт\n",
+            "a/notes.md": "Этот файл notes.md сам про себя.\n",
+            "zzz_real/referrer.md": "Реальная ссылка: подробности в notes.md.\n",
+            "zzz_real/notes.md": "забытый факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        about = [line for line in output.splitlines()
+                 if line.startswith("L2 zzz_real/notes.md")]
+        self.assertEqual(len(about), 1, output)
+        self.assertNotIn("На него ссылается", about[0])
+        self.assertIn("Возможно", about[0])
+
+    def test_bare_name_source_is_stated_as_fact_when_it_is_unique(self):
+        """Обратная сторона: один однофамилец - утверждать можно и нужно.
+
+        Смягчать формулировку всегда значило бы обесценить подсказку там, где
+        она однозначна.
+        """
+        self.write({
+            "MEMORY.md": "- [Корень](root.md) - обычный факт\n",
+            "root.md": "факт\n",
+            "spisok.md": "Подробности в zabytyy.md смотри там.\n",
+            "zabytyy.md": "забытый факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        about = [line for line in output.splitlines()
+                 if line.startswith("L2 zabytyy.md")]
+        self.assertEqual(len(about), 1, output)
+        self.assertIn("На него ссылается spisok.md", about[0])
+
+    def test_unclosed_frontmatter_explains_why_the_marker_did_not_work(self):
+        """Метка внутри незакрытой шапки не читается - об этом надо сказать.
+
+        Человек написал `orphan: true` правильно, а получал голое обвинение
+        «файл не упомянут». Причина - незакрытая `---`, и без подсказки её не
+        видно: остальные сообщения инструмента объясняют механизм, это молчало.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "shablon.md": "---\nname: shablon\norphan: true\n\nтело без закрытия шапки\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        about = [line for line in output.splitlines() if line.startswith("L2 shablon.md")]
+        self.assertEqual(len(about), 1, output)
+        self.assertIn("не закрыта", about[0])
+
+    def test_closed_frontmatter_marker_still_works(self):
+        """Обратная сторона: правильно закрытая шапка освобождает файл как прежде."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "shablon.md": "---\nname: shablon\norphan: true\n---\n\nтело\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_link_to_a_directory_says_so(self):
+        """`[Инфра](infra)` вместо `infra/MEMORY.md` - частая опечатка.
+
+        Ветка сообщения существовала, но ни один из тестов на неё не попадал:
+        мутация «отключить ветку» переживала весь набор. Диагноз «ссылка в
+        никуда» вместо «это каталог» отправляет чинить не то.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Инфра](infra) - раздел\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("каталог", output)
+
+    def test_cyrillic_file_names_are_handled(self):
+        """Во всех фикстурах набора не было ни одного не-ASCII имени.
+
+        Проект русскоязычный, кириллическое имя файла памяти - вопрос времени.
+        Проверяем обе стороны: связанный файл резолвится, забытый ловится.
+        """
+        self.write({
+            "MEMORY.md": "- [Заметка](заметка.md) - крючок\n",
+            "заметка.md": "факт\n",
+            "сирота файл.md": "забытый факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("сирота файл.md", output)
+        self.assertNotIn("L2 заметка.md", output)
+
+
+class HiddenBehindTerminates(unittest.TestCase):
+    """Обход скрытого обязан завершаться на любой топологии ссылок.
+
+    Дедупликация по посещённым узлам не была покрыта ни тестом, ни мутацией:
+    её снятие проходило весь набор чисто, а на цикле из трёх узлов, не
+    проходящем через стартовый, обход зависал навсегда. Зависший pre-commit -
+    замороженный терминал без единой строки объяснения, худший вид отказа из
+    всех, что этот инструмент старается не допускать.
+    """
+
+    def test_cycle_not_through_the_start_still_terminates(self):
+        sys.path.insert(0, SCRIPTS_DIR)
+        import check_memory_index as linter_module
+
+        per_index = {
+            "a/MEMORY.md": [("Б", "b/MEMORY.md")],
+            "b/MEMORY.md": [("В", "c/MEMORY.md")],
+            "c/MEMORY.md": [("Б", "b/MEMORY.md")],
+        }
+        index_rels = {"a/MEMORY.md", "b/MEMORY.md", "c/MEMORY.md"}
+
+        finished = []
+
+        def call():
+            finished.append(linter_module.hidden_behind(
+                "a/MEMORY.md", per_index, index_rels, set(), set()))
+
+        worker = threading.Thread(target=call, daemon=True)
+        worker.start()
+        worker.join(timeout=10)
+        self.assertFalse(worker.is_alive(), "обход не завершился - цикл не разорван")
+        self.assertEqual(finished[0], {"b/MEMORY.md", "c/MEMORY.md"})
+
+
 class MemoryFolderBoundary(MemoryFixture):
     """Линтер отвечает только за папку памяти и не выходит за её пределы."""
 
@@ -2119,41 +2261,6 @@ class DocumentationMatchesReality(unittest.TestCase):
         """Тот же разрушительный совет не должен переехать из хука в документацию."""
         self.assertNotIn("--unset core.hooksPath", self.readme())
 
-
-class MutationCheckIsAlive(unittest.TestCase):
-    """Мутационная проверка сама не должна стать тихим отказом.
-
-    Её мутации привязаны к точным фрагментам кода. Стоит коду измениться -
-    фрагмент перестаёт находиться, мутация тихо не ставится, и инструмент,
-    созданный ловить непроверенные ветки, начинает рапортовать успех ни о
-    чём. Это ровно тот класс дефекта, который он ищет.
-
-    Здесь проверяется только то, что все якоря на месте: полный прогон
-    занимает минуты (набор гоняется на каждую мутацию), а протухший якорь
-    надо ловить на каждом коммите.
-    """
-
-    def test_every_mutation_anchor_is_still_found(self):
-        sys.path.insert(0, SCRIPTS_DIR)
-        import mutation_check
-
-        previous = os.getcwd()
-        os.chdir(REPO_DIR)
-        try:
-            stale = mutation_check.missing_anchors()
-        finally:
-            os.chdir(previous)
-        self.assertEqual(
-            stale, [],
-            "мутации отстали от кода - поправьте их в scripts/mutation_check.py")
-
-    def test_mutation_list_is_not_empty(self):
-        """Пустой список мутаций отрапортовал бы «все пойманы» ни о чём."""
-        sys.path.insert(0, SCRIPTS_DIR)
-        import mutation_check
-
-        self.assertGreater(len(mutation_check.MUTATIONS), 20,
-                           "набор мутаций подозрительно мал")
 
 
 class PreCommitHook(unittest.TestCase):

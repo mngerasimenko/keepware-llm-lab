@@ -411,16 +411,32 @@ def relative_to_root(root, path):
 
 
 def frontmatter_lines(text):
-    """Строки шапки --- ... --- (если её нет, пусто)."""
+    """Строки шапки --- ... --- (если её нет, пусто).
+
+    Незакрытая шапка возвращает пустой список: разобрать её нельзя, потому
+    что где кончается шапка и начинается текст - неизвестно. Про это надо
+    сказать вслух, иначе человек, честно написавший `orphan: true` внутри,
+    получает голое «файл не упомянут» и не понимает, почему метка не
+    сработала. Второе значение отвечает на этот вопрос.
+    """
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
-        return []
+        return [], False
     head = []
     for line in lines[1:]:
         if line.strip() == "---":
-            return head
+            return head, False
         head.append(line)
-    return []
+    return [], True
+
+
+def has_unclosed_frontmatter(path):
+    """Шапка открыта и не закрыта - метка внутри неё не читается."""
+    try:
+        text = read_text(path)
+    except OSError:
+        return False
+    return frontmatter_lines(text)[1]
 
 
 def is_orphan_ok(path):
@@ -433,7 +449,8 @@ def is_orphan_ok(path):
         text = read_text(path)
     except OSError:
         return False
-    if any(FRONTMATTER_ORPHAN.match(line) for line in frontmatter_lines(text)):
+    head, unclosed_head = frontmatter_lines(text)
+    if any(FRONTMATTER_ORPHAN.match(line) for line in head):
         return True
     # Метку ищем ВНЕ блоков кода: иначе заметка, приводящая её как пример,
     # молча исключает из проверки сама себя - а это ровно тот файл, который
@@ -881,7 +898,16 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             # по-своему. Для нас это обычный файл памяти, его строки мы не
             # разбираем - и говорить «агент не увидит» без объяснения значит
             # соврать: агент дойдёт по ссылке из корневого индекса.
-            source = mentions.get(rel) or mentions.get(os.path.basename(rel))
+            # Совпадение по полному пути однозначно. Совпадение по голому
+            # имени - нет: словарь упоминаний общий на все файлы с этим
+            # именем, и побеждает первый по алфавиту. Если таких файлов
+            # несколько, «на него ссылается X» может указать на посторонний
+            # файл и заглушить настоящий источник, лежащий рядом.
+            source = mentions.get(rel)
+            by_name = None
+            if source is None:
+                by_name = mentions.get(os.path.basename(rel))
+                source = by_name
             # Отсев при построении карты сравнивает токен с полным путём и
             # потому не ловит файл в подпапке, упомянувший себя голым именем:
             # «orphan.md» внутри «sub/orphan.md» - это не тот же ключ. Ключ по
@@ -897,14 +923,32 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                 # Здесь «агент его не увидит» было бы неправдой: по ссылке из
                 # индекса он дойдёт. Проблема в другом - строки этого файла мы
                 # не разбираем, и битые ссылки внутри него не проверяются.
-                errors.append(
-                    "L2 %s не упомянут ни в одном индексе. На него ссылается %s, "
-                    "но тот индексом не считается: его строки не разбираются, и "
-                    "битые ссылки внутри него не ловятся. Индексом считается файл "
-                    "с именем %s - переименуйте его так или задайте своё имя "
-                    "ключом --index" % (rel, source, index_name)
-                )
+                # Формулировка честная ровно настолько, насколько мы уверены:
+                # утвердительно - только по полному пути; по голому имени при
+                # нескольких однофамильцах - предположение, а не факт.
+                namesakes = sum(1 for other in exact
+                                if other.lower().endswith(".md")
+                                and os.path.basename(other) == os.path.basename(rel))
+                if by_name is not None and namesakes > 1:
+                    errors.append(
+                        "L2 %s не упомянут ни в одном индексе. Возможно, имеется в "
+                        "виду в %s - совпало голое имя файла, а файлов с таким "
+                        "именем несколько (%d). Индексом считается файл с именем "
+                        "%s - переименуйте нужный так или задайте своё имя ключом "
+                        "--index" % (rel, source, namesakes, index_name)
+                    )
+                else:
+                    errors.append(
+                        "L2 %s не упомянут ни в одном индексе. На него ссылается %s, "
+                        "но тот индексом не считается: его строки не разбираются, и "
+                        "битые ссылки внутри него не ловятся. Индексом считается файл "
+                        "с именем %s - переименуйте его так или задайте своё имя "
+                        "ключом --index" % (rel, source, index_name)
+                    )
                 continue
+        if not hint and has_unclosed_frontmatter(exact[rel]):
+            hint = (" (шапка `---` открыта, но не закрыта - метка `orphan: true` "
+                    "внутри неё не читается)")
         errors.append("L2 %s не упомянут ни в одном индексе - агент его не увидит%s"
                       % (rel, hint))
 
