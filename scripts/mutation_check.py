@@ -71,8 +71,8 @@ MUTATIONS = [
      r'DEFINITION = re.compile(r"^\[([^\]]+)\]:\s*(\S+)")'),
     ("метка orphan-ok действует изнутри блока кода", LINTER,
      "        if mark:\n            opened_fence = mark\n            continue\n"
-     "        if COMMENT_ORPHAN.search(line):",
-     "        if COMMENT_ORPHAN.search(line):"),
+     '        if COMMENT_ORPHAN.search(INLINE_CODE.sub("", line)):',
+     '        if COMMENT_ORPHAN.search(INLINE_CODE.sub("", line)):'),
     ("граница имени файла справа снята", LINTER,
      r'FILENAME_TOKEN = re.compile(r"[\w.\-/\\]+\.md(?![\w\-])(?!\.\w)", re.I)',
      r'FILENAME_TOKEN = re.compile(r"[\w.\-/\\]+\.md", re.I)'),
@@ -101,6 +101,21 @@ MUTATIONS = [
      "    allow_globs = list(allow_globs)"),
     ("дубли заголовков не сообщаются", LINTER,
      "        if len(paths) > 1:", "        if False:"),
+
+    # --- L4: ссылки [[...]] между фактами ---
+    ("битые ссылки [[...]] не сообщаются", LINTER,
+     "    dangling = dangling_wiki_links(exact, cache)", "    dangling = []"),
+    ("ссылка [[...]] не резолвится по полю name", LINTER,
+     "                names.add(match.group(1).strip())", "                pass"),
+    ("проза в двойных скобках считается ссылкой", LINTER,
+     r'WIKI_LINK = re.compile(r"\[\[([^\s\[\]|#]{2,})(?:\|[^\]\n]*)?\]\]")',
+     r'WIKI_LINK = re.compile(r"\[\[([^\[\]|#]{2,})(?:\|[^\]\n]*)?\]\]")'),
+    ("список битых ссылок не обрезается", LINTER,
+     "    for rel, lineno, target in dangling[:LISTED_WIKI_LINKS]:",
+     "    for rel, lineno, target in dangling:"),
+    ("метка orphan-ok снова действует из инлайнового кода", LINTER,
+     '        if COMMENT_ORPHAN.search(INLINE_CODE.sub("", line)):',
+     "        if COMMENT_ORPHAN.search(line):"),
     ("строка индекса без адреса пропускается молча", LINTER,
      '                errors.append("L1 %s:%d строка без адреса: «%s»" % (where, lineno, title))',
      "                pass"),
@@ -149,6 +164,11 @@ MUTATIONS = [
     ("отсутствие корневого индекса не отказ", LINTER,
      "        if not any(os.path.dirname(p) == root for p in index_paths):",
      "        if False:"),
+    ("пропавший корневой индекс снова невыполнимая проверка", LINTER,
+     "            if orphaned:", "            if False:"),
+    ("памятью считается любой файл, шапка не смотрится", LINTER,
+     "    return any(MEMORY_FIELD.match(line) for line in head)",
+     "    return True"),
     ("незакрытый забор не делает прогон непроверяемым", LINTER,
      "    return errors, notices, warnings, row_count, bool(incomplete or unreadable_dirs)",
      "    return errors, notices, warnings, row_count, False"),
@@ -244,7 +264,15 @@ def suite_fails():
         [sys.executable, "-m", "unittest", "discover", "-s", "scripts",
          "-p", "test_check_memory_index.py", "-f"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+        # MEMCHECK_REQUIRE_SH здесь по той же причине, что и в CI. Без sh
+        # тесты хука пропускаются, и три мутации по .githooks/pre-commit
+        # печатались бы как ВЫЖИВШИЕ - то есть «ветку не держит ни один
+        # тест», хотя тесты просто не запускались. Инструмент, который
+        # спрашивает «врут ли тесты», соврал бы сам, и ровно тем способом,
+        # который ищет. С переменной набор краснеет ДО мутаций, на первом же
+        # прогоне «зелёный ли он без них», и причина названа вслух.
+        env=dict(os.environ, PYTHONIOENCODING="utf-8",
+                 MEMCHECK_REQUIRE_SH="1"))
     return result.returncode != 0
 
 

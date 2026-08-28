@@ -1101,6 +1101,39 @@ class PanelReviewFindings(MemoryFixture):
         self.assertEqual(code, 1, output)
         self.assertIn("zametka.md", output)
 
+    def test_marker_in_inline_code_does_not_free_the_file(self):
+        """Метка, названная в прозе, - это её название, а не она сама.
+
+        Блок кода уже пропускался, но заметка объясняет метку обычно одной
+        строкой посреди абзаца, без блока: «поставьте `<!-- linter:
+        orphan-ok -->` в текст». Такой файл молча освобождал сам себя -
+        ровно то, ради чего `orphan: true` читается только из шапки.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "zametka.md": "Чтобы исключить файл, поставьте "
+                          "`<!-- linter: orphan-ok -->` в его текст.\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("zametka.md", output)
+
+    def test_real_marker_in_prose_still_frees_the_file(self):
+        """Вторая половина пары: настоящая метка обязана работать по-прежнему.
+
+        Без этого теста правка выше закрывала бы одну сторону и открывала
+        другую - метка перестала бы действовать вообще, и человек, честно
+        её поставивший, получал бы вечное обвинение.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "zagotovka.md": "Черновик.\n\n<!-- linter: orphan-ok -->\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
     def test_shortcut_reference_row_is_a_real_row(self):
         """Третья законная форма CommonMark: `- [prof]` без вторых скобок.
 
@@ -1822,16 +1855,28 @@ class HotPathStaysLinear(MemoryFixture):
     """Защита от возврата квадратичности - мутациями её не поймать.
 
     Мутационная проверка отвечает на вопрос «изменилось ли поведение», а
-    квадратичная и линейная версии ведут себя одинаково: разница только во
-    времени. Именно поэтому возврат перебора всех файлов на каждую сироту
+    квадратичная и линейная версии ведут себя одинаково: разница только в
+    цене. Именно поэтому возврат перебора всех файлов на каждую сироту
     прошёл незамеченным - и дал 15 секунд на памяти в тысячу файлов, то есть
     на каждом коммите.
 
-    Потолок взят с большим запасом: на линейной версии этот вход считается
-    десятые доли секунды, на квадратичной - десятки секунд.
+    Сторожей двое, и это намеренно.
+
+    Первый считает РАБОТУ, а не время: сколько раз прогон открыл файлы и
+    сколько раз строил карту упоминаний. Квадратичность - это буквально
+    «карта строится на каждую сироту», и счётчик её видит независимо от
+    того, на какой машине и под какой нагрузкой идёт прогон.
+
+    Второй меряет время и оставлен сетью на случай квадратичности, которую
+    счётчики не заметят (например перебор по уже прочитанному тексту). Но
+    потолок ему поднят: прежние 5 секунд стояли всего вдвое выше обычного
+    прогона, и на нагруженной машине набор падал по чужой причине. Тест,
+    который иногда краснеет сам по себе, учит пролистывать красноту - а это
+    ровно та привычка, из-за которой не заметили бы настоящую находку.
     """
 
-    def test_many_orphans_do_not_make_the_run_quadratic(self):
+    def build_memory(self):
+        """500 файлов, 200 из них сироты: 300 в индексе, 200 мимо него."""
         files = {}
         rows = []
         for number in range(300):
@@ -1842,13 +1887,56 @@ class HotPathStaysLinear(MemoryFixture):
             files["sirota_%03d.md" % number] = "см. fakt_001.md рядом\n"
         files["MEMORY.md"] = "".join(rows)
         self.write(files)
+        return len(files)
+
+    def test_orphan_hints_are_built_once_not_once_per_orphan(self):
+        """Карта упоминаний строится один раз на прогон.
+
+        Это и есть определение той регрессии: «для КАЖДОЙ сироты заново
+        сканировались все остальные файлы». Проверка не зависит от скорости
+        машины, поэтому она здесь главная, а не таймер.
+        """
+        total = self.build_memory()
+        calls = []
+        real_map = linter.map_mentions
+        real_read = linter.read_text
+
+        def counted_map(*args, **kwargs):
+            calls.append("map")
+            return real_map(*args, **kwargs)
+
+        def counted_read(path):
+            calls.append("read")
+            return real_read(path)
+
+        linter.map_mentions = counted_map
+        linter.read_text = counted_read
+        try:
+            code, output = self.run_linter("--quiet")
+        finally:
+            linter.map_mentions = real_map
+            linter.read_text = real_read
+
+        self.assertEqual(code, 1, output)
+        maps = calls.count("map")
+        reads = calls.count("read")
+        self.assertLessEqual(maps, 1,
+                             "карта упоминаний построена %d раз - на 200 сирот "
+                             "это и есть перебор всех файлов на каждую" % maps)
+        self.assertLessEqual(
+            reads, 2 * total,
+            "%d открытий файла на %d файлов - файл читается заново вместо "
+            "общего кэша" % (reads, total))
+
+    def test_many_orphans_do_not_make_the_run_quadratic(self):
+        self.build_memory()
 
         started = time.perf_counter()
         code, output = self.run_linter("--quiet")
         spent = time.perf_counter() - started
 
         self.assertEqual(code, 1, output)
-        self.assertLess(spent, 5.0,
+        self.assertLess(spent, 20.0,
                         "500 файлов с 200 сиротами заняли %.1f с - похоже на "
                         "возврат перебора всех файлов на каждую сироту" % spent)
 
@@ -1889,6 +1977,76 @@ class MemoryFolderBoundary(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
+
+
+class RootIndexLost(MemoryFixture):
+    """Пропавший корневой индекс - нарушение, а не невыполнимая проверка.
+
+    Худшее, что может случиться с этой памятью: в контекст не грузится
+    ничего, а строка импорта `@memory/MEMORY.md` указывает в пустоту. Пока
+    случай делил код 2 с «указана не та папка», хук такой коммит пропускал:
+    `git rm memory/MEMORY.md` проходил молча, а забытый черновик рядом -
+    блокировался.
+    """
+
+    FACT = "---\nname: %s\ndescription: крючок\n---\n\nфакт\n"
+
+    def test_memory_without_root_index_is_a_violation(self):
+        """Файлы памяти есть, входа в них нет - агент не увидит ни одного.
+
+        Вход намеренно держит файлы и в корне, и в подпапке: у файла из
+        подпапки путь и имя не совпадают, а прежняя реализация возвращала
+        код 2 независимо от содержимого - на вырожденном входе из одного
+        файла в корне обе реализации были бы неразличимы по коду возврата.
+        """
+        self.write({
+            "user.md": self.FACT % "user",
+            "infra/prod.md": self.FACT % "prod",
+            "infra/staging.md": self.FACT % "staging",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("L2", output)
+        self.assertIn("3 файла", output)
+
+    def test_folder_that_is_not_memory_stays_a_usage_error(self):
+        """Вторая половина пары: указали не ту папку - совет прежний, код 2.
+
+        Без этого различения проверка, направленная на корень репозитория,
+        обвиняла бы человека в разъехавшейся памяти из-за README.md.
+        """
+        self.write({
+            "README.md": "не память, обычный readme\n",
+            "docs/ustanovka.md": "инструкция без шапки\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 2, output)
+        self.assertIn("не найден", output.lower())
+
+    def test_sub_indexes_without_root_are_still_a_usage_error(self):
+        """Прежний случай не переехал в нарушения: файлов памяти в папке нет."""
+        self.write({
+            "sub/MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "sub/user.md": "факт без шапки\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 2, output)
+        self.assertIn("корневой индекс не найден", output.lower())
+
+    def test_losing_the_index_is_not_quieter_than_forgetting_one_file(self):
+        """Ущерб и громкость должны идти в одну сторону, а шли в разные."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": self.FACT % "user",
+            "zabytyj.md": self.FACT % "zabytyj",
+        })
+        forgotten_one, _ = self.run_linter()
+
+        os.remove(os.path.join(self.root, "MEMORY.md"))
+        lost_index, output = self.run_linter()
+
+        self.assertEqual(forgotten_one, 1)
+        self.assertEqual(lost_index, 1, output)
 
 
 class LinkedSubtrees(MemoryFixture):
@@ -2249,6 +2407,107 @@ class DuplicateTitles(MemoryFixture):
         self.assertIn("L3", output)
 
 
+class WikiLinksBetweenFacts(MemoryFixture):
+    """L4: [[ссылка]] из тела факта ведёт к существующей памяти.
+
+    Форма, которую предписывает сам формат («Связанные памяти линкуем через
+    [[их-name]]»), и по портфелю их почти втрое больше, чем строк индекса.
+    Рвутся они чаще: строку индекса при переименовании человек правит
+    сразу, а упоминания в соседних файлах умирают молча.
+    """
+
+    INDEX = "- [Профиль](user.md) - кто\n- [Правило](feedback_rule.md) - как\n"
+
+    def test_dangling_wiki_link_is_reported(self):
+        """Вход держит ссылку из ПОДПАПКИ: там путь и имя не совпадают."""
+        self.write({
+            "MEMORY.md": self.INDEX + "- [Инфра](infra/prod.md) - прод\n",
+            "user.md": "факт\n",
+            "feedback_rule.md": "правило\n",
+            "infra/prod.md": "см. [[project_udalennyj]] рядом\n",
+        })
+        code, output = self.run_linter()
+        self.assertIn("L4", output)
+        self.assertIn("project_udalennyj", output)
+        self.assertEqual(code, 0, output)
+
+    def test_wiki_link_does_not_change_the_exit_code(self):
+        """Вторая половина пары: L4 сигналит, но коммит не блокирует.
+
+        Проверка приезжает в память, где такие связи уже накопились. Стань
+        она блокирующей - первый же коммит отправил бы человека жать
+        --no-verify, и вместе с L4 он выключил бы L1 и L2.
+        """
+        self.write({
+            "MEMORY.md": self.INDEX,
+            "user.md": "см. [[net_takogo]] и [[i_takogo_net]]\n",
+            "feedback_rule.md": "правило\n",
+        })
+        code, _output = self.run_linter()
+        self.assertEqual(code, 0)
+
+    def test_link_resolves_by_file_name_and_by_name_field(self):
+        """Имён у памяти два, и в живых памятях они расходятся у большинства.
+
+        Проверять только имя файла значило бы выдумывать нарушения там, где
+        человек сослался по полю name - той самой форме, которую README и
+        называет «[[их-name]]».
+        """
+        self.write({
+            "MEMORY.md": self.INDEX,
+            "user.md": "см. [[feedback_rule]] и [[pravilo-korotko]]\n",
+            "feedback_rule.md": "---\nname: pravilo-korotko\n---\n\nправило\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("L4", output)
+
+    def test_link_with_a_caption_resolves(self):
+        self.write({
+            "MEMORY.md": self.INDEX,
+            "user.md": "см. [[feedback_rule|как надо]]\n",
+            "feedback_rule.md": "правило\n",
+        })
+        code, output = self.run_linter()
+        self.assertNotIn("L4", output)
+        self.assertEqual(code, 0, output)
+
+    def test_prose_in_double_brackets_is_not_a_link(self):
+        """«[[в /ideas]]» - это проза, а не ссылка: имя памяти без пробелов."""
+        self.write({
+            "MEMORY.md": self.INDEX,
+            "user.md": "решение принимает [[владелец проекта]]\n",
+            "feedback_rule.md": "правило\n",
+        })
+        code, output = self.run_linter()
+        self.assertNotIn("L4", output)
+        self.assertEqual(code, 0, output)
+
+    def test_example_inside_a_code_fence_is_not_a_link(self):
+        """Файл, объясняющий формат, не должен объявлять сам себя сломанным."""
+        self.write({
+            "MEMORY.md": self.INDEX,
+            "user.md": "факт\n",
+            "feedback_rule.md": "Связи пишутся так:\n\n```\n[[imya-drugoj-pamyati]]\n```\n",
+        })
+        code, output = self.run_linter()
+        self.assertNotIn("L4", output)
+        self.assertEqual(code, 0, output)
+
+    def test_long_list_of_dangling_links_is_cut(self):
+        """Стена одинаковых строк читается как поломка самой проверки."""
+        body = "".join("см. [[net_%02d]]\n" % number for number in range(25))
+        self.write({
+            "MEMORY.md": self.INDEX,
+            "user.md": body,
+            "feedback_rule.md": "правило\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output.count("не ведёт ни к одному файлу памяти"), 10)
+        self.assertIn("список обрезан", output)
+
+
 class ExitCodes(MemoryFixture):
     """Код 1 - только нарушения. Всё остальное не должно им притворяться."""
 
@@ -2493,13 +2752,39 @@ class PreCommitHook(unittest.TestCase):
         self.assertIn("L1", text)
 
     def test_hook_is_committed_executable(self):
-        """Неисполняемый хук git пропускает молча - и это уже случалось."""
+        """Неисполняемый хук git пропускает молча - и это уже случалось.
+
+        Три исхода, и различать их обязательно. README велит копировать
+        scripts/ и .githooks/ к себе - значит набор будут гонять и там, где
+        git-репозитория нет. Прежняя редакция звала git без перехвата и
+        падала трейсбеком CalledProcessError: первое, что видел взявший
+        инструмент, - «сломанные тесты», хотя сломано ничего. Режим файла
+        хранит индекс git, поэтому вне репозитория проверять нечем.
+
+        А файл, лежащий в репозитории, но не добавленный в индекс, - это не
+        пропуск: такой хук не уедет ни в один клон. Прежняя редакция и здесь
+        молчала по-своему - ls-files отдаёт пустую строку, и человек получал
+        assertTrue с пустым сообщением. Говорим, что делать: ровно те две
+        команды, что стоят в README.
+        """
         if not shutil.which("git"):
             self.skipTest("нужен git")
-        listing = subprocess.check_output(
-            ["git", "ls-files", "-s", ".githooks/pre-commit"], cwd=REPO_DIR)
+        try:
+            listing = subprocess.check_output(
+                ["git", "ls-files", "-s", ".githooks/pre-commit"],
+                cwd=REPO_DIR, stderr=subprocess.DEVNULL)
+        except (subprocess.CalledProcessError, OSError):
+            self.skipTest("не git-репозиторий - режим хука хранит индекс git, "
+                          "проверять нечем")
+        if not listing.strip():
+            self.fail("хук не добавлен в индекс git - в клон он не уедет вовсе: "
+                      "git add .githooks/pre-commit && "
+                      "git update-index --chmod=+x .githooks/pre-commit")
         self.assertTrue(listing.startswith(b"100755"),
-                        listing.decode("utf-8", "replace"))
+                        "хук лежит в индексе неисполняемым, а такой хук git "
+                        "пропускает МОЛЧА: git update-index --chmod=+x "
+                        ".githooks/pre-commit (сейчас: %s)"
+                        % listing.decode("utf-8", "replace").strip())
 
     def test_blocks_when_memory_file_is_deleted(self):
         """Удаление файла - самый частый способ осиротить строку индекса."""
