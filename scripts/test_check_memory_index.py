@@ -6,6 +6,36 @@
     python -m unittest discover -s scripts -v
 
 Зависимостей нет, только стандартная библиотека.
+
+Карта: где искать проверки инварианта
+-------------------------------------
+
+Часть классов названа по кругам ревью (`PanelReviewFindings`,
+`SecondRoundFindings` и далее). Для автора это ценно - по ним виден маятник
+правок, - но постороннему такое имя говорит, КОГДА находку заметили, а не ЧТО
+она держит. Пока набор не переименован, вот карта:
+
+  L1, разбор строк индекса  IndexLinksToFiles, IndexParsing, PanelReviewFindings,
+                            SecondRoundFindings, ThirdRoundFindings
+  L2, достижимость          FilesAppearInIndex, StrictRootIndexModel, RootIndexLost,
+                            FifthRoundFindings, SixthRoundFindings
+  L3, дубли заголовков      DuplicateTitles
+  L4, связи [[имя]]         WikiLinksBetweenFacts
+  коды возврата 0/1/2       ExitCodes, ExitCodeContract, SilentFailures
+  качество сообщений        HintsDoNotOverclaim, SmallerFindings, MinorPanelFindings
+  обход файловой системы    MemoryFolderBoundary, LinkedSubtrees, UnreadableEntries
+  цена прогона              HotPathStaysLinear, FilenameTokenScan
+  хук и CI                  PreCommitHook, HookPrerequisite, CiGuards,
+                            DocumentationMatchesReality
+
+Два теста тут дублируют друг друга байт в байт: пары
+`test_sub_indexes_count_by_default_without_flags` /
+`test_sub_index_in_subfolder_is_reachable` и
+`test_unreferenced_sub_index_is_error` /
+`test_sub_index_in_subfolder_without_a_link_is_error`. Это прямое следствие
+деления по кругам: шестой круг завёл свой класс, не заглянув, что тот же
+случай уже стоит в старом. Оставлены намеренно - докстринги у них разные, и
+каждый фиксирует свою причину.
 """
 
 import hashlib
@@ -696,6 +726,28 @@ class StrictRootIndexModel(MemoryFixture):
         self.assertEqual(code, 2, output)
         self.assertIn("MEMORY.md", output)
 
+    def test_index_name_is_matched_case_sensitively(self):
+        """`infra/memory.md` строчными - обычный файл, а не под-индекс.
+
+        Инвариант объявлен в коде (`find_indexes`), но не проверялся ничем:
+        ни тестом, ни мутацией. А цена ровно та, ради которой в CI держат
+        матрицу из двух систем: на Windows сравнение без учёта регистра
+        прошло бы, и человек получил бы зелёный локальный прогон против
+        красного в CI на Linux - при одинаковом наборе файлов.
+
+        Вход различает две реализации: при сравнении без учёта регистра
+        `infra/memory.md` стал бы под-индексом, его строки разобрались бы, и
+        `infra/server.md` перестал бы быть сиротой.
+        """
+        self.write({
+            "MEMORY.md": "- [Инфра](infra/memory.md) - список, но не индекс\n",
+            "infra/memory.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("infra/server.md", output)
+
     def test_sub_index_in_subfolder_is_reachable(self):
         """Канон строгой модели: под-индекс - это подпапка/<то же имя>."""
         self.write({
@@ -884,7 +936,9 @@ class CiGuards(unittest.TestCase):
     def workflow(self):
         path = os.path.join(REPO_DIR, ".github", "workflows", "memory-check.yml")
         if not os.path.isfile(path):
-            self.skipTest("workflow не найден")
+            self.skipTest("workflow не найден - набор гоняется не в репозитории "
+                          "инструмента; в нём самом этот пропуск означал бы, "
+                          "что весь класс проверок CI молча исчез")
         with io.open(path, encoding="utf-8") as fh:
             return fh.read()
 
@@ -916,7 +970,11 @@ class CiGuards(unittest.TestCase):
         match = re.search(r"n >= (\d+)", text)
         self.assertIsNotNone(match, "порог в гарде не найден")
         threshold = int(match.group(1))
-        actual = unittest.defaultTestLoader.discover(SCRIPTS_DIR, "test_*.py").countTestCases()
+        # Свой загрузчик, а не общий: у `defaultTestLoader` ключ -k из
+        # командной строки уже выставлен, и при точечном запуске тест считал
+        # ОТОБРАННЫЕ тесты вместо всех - «порог 150 выше реального числа 1».
+        # Красное по причине, к порогу отношения не имеющей, учит пролистывать.
+        actual = unittest.TestLoader().discover(SCRIPTS_DIR, "test_*.py").countTestCases()
         self.assertLessEqual(threshold, actual,
                              "порог %d выше реального числа тестов %d" % (threshold, actual))
         self.assertGreaterEqual(threshold * 2, actual,
@@ -942,9 +1000,29 @@ class CiGuards(unittest.TestCase):
         Свой возврат 5 «ни одного теста не собрано» unittest получил только в
         3.12, а в матрице есть 3.9. Тот же класс, что MEMCHECK_REQUIRE_SH: без
         гарда галочка зелёная, а проверка не выполнялась.
+
+        Гард ЗАПУСКАЕТСЯ, а не грепается. Прежняя редакция искала слово
+        `countTestCases` в тексте workflow - и оставалась зелёной, если
+        `sys.exit(...)` в гарде заменить на `print(...)`: гард мёртв,
+        галочка зелёная, тестов ноль. Дешёвый признак сторожил защиту от
+        тихого отказа и сам был тихим отказом.
         """
         text = self.workflow()
-        self.assertIn("countTestCases", text)
+        match = re.search(r'run: python -c "([^"]+)"', text)
+        self.assertIsNotNone(match, "гард «тесты вообще собрались» не найден")
+
+        folder = tempfile.mkdtemp(prefix="memcheck-ci-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        os.makedirs(os.path.join(folder, "scripts"))
+        result = subprocess.run(
+            [sys.executable, "-c", match.group(1)], cwd=folder,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+        self.assertNotEqual(
+            result.returncode, 0,
+            "гард не упал на пустом наборе - значит в CI ноль собранных "
+            "тестов даст зелёную галочку: %s"
+            % result.stdout.decode("utf-8", "replace"))
 
 
 class PanelReviewFindings(MemoryFixture):
@@ -1233,7 +1311,17 @@ class MinorPanelFindings(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        self.assertIn("подпапк", output)
+        # Ищем именно заметку про этот файл, а не слово «подпапка» где угодно
+        # в выводе. Прежняя редакция проверяла весь вывод - и умерла молча,
+        # как только то же слово появилось в тексте L2-ошибки: заметку можно
+        # было убрать целиком, а тест оставался зелёным. Ровно тот дешёвый
+        # признак, от которого страхует мутационная проверка (она это и
+        # поймала).
+        notice = [line for line in output.splitlines()
+                  if line.startswith("memory_infra.md:")]
+        self.assertEqual(len(notice), 1,
+                         "заметка про плоскую раскладку не напечатана: %s" % output)
+        self.assertIn("подпапк", notice[0])
 
     def test_folder_is_walked_only_once(self):
         """Дерево обходится один раз, а не дважды на каждый коммит.
@@ -1941,6 +2029,54 @@ class HotPathStaysLinear(MemoryFixture):
                         "возврат перебора всех файлов на каждую сироту" % spent)
 
 
+class FilenameTokenScan(unittest.TestCase):
+    """Поиск имён файлов в тексте: та же граница, но линейной ценой.
+
+    Квадратичность тут была не по числу файлов, а по СОДЕРЖИМОМУ одного:
+    точка входила и в класс имени, и в обязательный хвост «.md», и на длинном
+    прогоне подходящих символов движок откатывался. Достаточно было одного
+    факта с base64-блобом внутри и одной сироты где угодно - и pre-commit хук
+    задумывался на десятки секунд.
+    """
+
+    def test_boundaries_are_exactly_as_before(self):
+        """Первая половина пары: смысл не изменился, изменилась только цена.
+
+        Каждая строка тут - чья-то прошлая находка: «user.md» внутри
+        «superuser.md», «user.mdx» как другой файл, точка в конце предложения,
+        «user.md.txt» как третий файл.
+        """
+        cases = [
+            ("лежит в user.md рядом", ["user.md"]),
+            ("файл superuser.md", ["superuser.md"]),
+            ("был файл user.mdx, другой формат", []),
+            ("правила лежат в user.md.", ["user.md"]),
+            ("это user.md.txt, не наш", []),
+            ("см. vendor/user.md", ["vendor/user.md"]),
+            ("путь docs\\user.md", ["docs\\user.md"]),
+            ("голое .md именем не является", []),
+            ("сразу два: a.md и b.md", ["a.md", "b.md"]),
+        ]
+        for text, expected in cases:
+            self.assertEqual(linter.filename_tokens(text), expected, text)
+
+    def test_a_long_run_of_name_characters_does_not_blow_up(self):
+        """Вторая половина: 40 000 символов без «.md» - это не десятки секунд.
+
+        Потолок тут честный, а не двукратный: прежняя редакция считала этот
+        вход 18.8 с, нынешняя - сотые доли. Между ними три порядка, и от
+        загрузки машины такой разрыв не зависит.
+        """
+        blob = "a" * 40000
+        started = time.perf_counter()
+        found = linter.filename_tokens(blob)
+        spent = time.perf_counter() - started
+        self.assertEqual(found, [])
+        self.assertLess(spent, 5.0,
+                        "40 000 символов заняли %.1f с - похоже на возврат "
+                        "отката в поиске имени файла" % spent)
+
+
 class MemoryFolderBoundary(MemoryFixture):
     """Линтер отвечает только за папку памяти и не выходит за её пределы."""
 
@@ -2472,6 +2608,22 @@ class WikiLinksBetweenFacts(MemoryFixture):
         self.assertNotIn("L4", output)
         self.assertEqual(code, 0, output)
 
+    def test_link_with_an_anchor_resolves_by_the_name_before_it(self):
+        """«[[правило#раздел]]» ведёт к той же памяти, что «[[правило]]».
+
+        Прежде якорь обрывал разбор, и такая ссылка молча не проверялась
+        вовсе - ни как целая, ни как битая.
+        """
+        self.write({
+            "MEMORY.md": self.INDEX,
+            "user.md": "см. [[feedback_rule#kak-nado]] и [[net_takogo#razdel]]\n",
+            "feedback_rule.md": "правило\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertIn("net_takogo", output)
+        self.assertNotIn("feedback_rule]]", output)
+
     def test_prose_in_double_brackets_is_not_a_link(self):
         """«[[в /ideas]]» - это проза, а не ссылка: имя памяти без пробелов."""
         self.write({
@@ -2506,6 +2658,48 @@ class WikiLinksBetweenFacts(MemoryFixture):
         self.assertEqual(code, 0, output)
         self.assertEqual(output.count("не ведёт ни к одному файлу памяти"), 10)
         self.assertIn("список обрезан", output)
+
+
+class HintsDoNotOverclaim(MemoryFixture):
+    """Подсказка обязана быть верна, иначе она хуже своего отсутствия."""
+
+    def test_namesake_does_not_produce_a_false_format_hint(self):
+        """Два файла с одним именем: подсказка говорила про чужую строку.
+
+        Индекс упоминает `user.md` из корня. Сирота `infra/user.md` носит то
+        же голое имя - и получала «имя файла в тексте индекса встречается, но
+        ссылкой не разобралось». Ложно каждое слово: встречается имя ДРУГОГО
+        файла, и оно прекрасно разобралось ссылкой. Заодно эта ветка глушила
+        верную подсказку про источник.
+
+        Совет README «бейте индекс на под-индексы по каталогам» ведёт ровно к
+        однофамильцам, так что вход тут не выдуманный.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто я\n",
+            "user.md": "факт\n",
+            "infra/user.md": "другой файл с тем же именем\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("infra/user.md", output)
+        self.assertNotIn("ссылкой не разобралось", output)
+
+    def test_unique_name_still_gets_the_format_hint(self):
+        """Вторая половина пары: без однофамильца подсказка обязана остаться.
+
+        Она отвечает на «я же вижу строку своими глазами»: имя в индексе
+        есть, но строкой индекса не разобралось.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "**Заготовка**: zabytyj.md - оформлено не строкой\n",
+            "user.md": "факт\n",
+            "zabytyj.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("ссылкой не разобралось", output)
 
 
 class ExitCodes(MemoryFixture):
@@ -2624,7 +2818,19 @@ class DocumentationMatchesReality(unittest.TestCase):
     """README - часть инструмента: неверная строка оттуда попадает людям в конфиг."""
 
     def readme(self):
-        with io.open(os.path.join(REPO_DIR, "README.md"), encoding="utf-8") as fh:
+        """README лаборатории - или пропуск, если набор гоняют не в ней.
+
+        README велит копировать `scripts/` к себе, а эти тесты читают файл,
+        который в чужой проект не едет. Прежде получался FileNotFoundError:
+        человек, взявший инструмент, видел два упавших теста про чужой
+        документ и делал верный вывод «эти тесты не про меня» - вместе с
+        третьим, который как раз был про него (бит исполняемости хука).
+        """
+        path = os.path.join(REPO_DIR, "README.md")
+        if not os.path.isfile(path):
+            self.skipTest("README.md рядом нет - набор гоняется не в репозитории "
+                          "инструмента, проверять соответствие нечему")
+        with io.open(path, encoding="utf-8") as fh:
             return fh.read()
 
     def test_lefthook_snippet_is_a_config_not_a_bare_line(self):
@@ -2926,16 +3132,50 @@ class PreCommitHook(unittest.TestCase):
         self.assertNotIn("разошлись", text)
         # Блокируем - значит обязаны сказать, как обойти.
         self.assertIn("--no-verify", text)
+        # И как отключить совсем - в ВЫВОДЕ, а не только в исходнике хука.
+        # Три соседних теста читают текст файла и грепают строки: убери все
+        # вызовы advise_how_to_disable, оставив саму функцию, - и они
+        # останутся зелёными, а человек с husky, которого хук заблокировал,
+        # не получит ни строки о том, как выйти.
+        self.assertIn("--show-origin", text)
 
-    def test_usage_error_points_at_the_user_own_config(self):
-        """Опечатка в ключах даёт код 2 и выключает блокировку - связь надо назвать."""
-        self.stub_checker("import sys\nsys.exit(2)\n")
+    def test_broken_config_args_no_longer_switch_blocking_off(self):
+        """Опечатка в ключах выключала блокировку насовсем и молча.
+
+        Неизвестный ключ - код 2, а на коде 2 хук не блокирует: файл-сирота
+        уезжал в коммит с нулём. Настройку ставят один раз и забывают, а
+        подсказку, которая печатается на каждом коммите, перестают читать.
+        Тихий отказ ровно того вида, ради которого проверка и написана.
+
+        Теперь при коде 2 с непустыми ключами прогон повторяется БЕЗ них, и
+        если без них ответ определённый - берётся он. Заглушка отвечает
+        по-разному на два набора аргументов, иначе вход не различал бы
+        старую реализацию и новую.
+        """
+        self.stub_checker(
+            "import sys\n"
+            "extra = [a for a in sys.argv[1:] if a not in ('memory', '--quiet')]\n"
+            "sys.exit(2 if extra else 1)\n")
         self.git("config", "memorycheck.args", "--alow-orphan opechatka")
         self.git("add", "-A")
         result = self.run_hook()
         text = result.stdout.decode("utf-8", "replace")
-        self.assertEqual(result.returncode, 0, text)
+        self.assertEqual(result.returncode, 1, text)
         self.assertIn("memorycheck.args", text)
+
+    def test_genuine_usage_error_does_not_blame_the_config(self):
+        """Вторая половина пары: ключи ни при чём - не блокируем и не обвиняем их.
+
+        Прежняя редакция валила вину на настройку при любом коде 2, в том
+        числе когда проверка не смогла отработать по своей причине.
+        """
+        self.stub_checker("import sys\nsys.exit(2)\n")
+        self.git("config", "memorycheck.args", "--allow-orphan templates/*.md")
+        self.git("add", "-A")
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, text)
+        self.assertNotIn("memorycheck.args", text)
 
     def test_does_not_block_when_checker_is_missing(self):
         os.remove(os.path.join(self.repo, "scripts", "check_memory_index.py"))

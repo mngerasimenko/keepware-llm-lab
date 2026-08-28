@@ -47,6 +47,13 @@ import tempfile
 
 LINTER = os.path.join("scripts", "check_memory_index.py")
 HOOK = os.path.join(".githooks", "pre-commit")
+# Слепок файла, пока он мутирован. try/finally спасает от Ctrl+C, но не от
+# закрытого терминала, kill, OOM или пропавшего электричества. Оставшаяся
+# мутация в глаза не бросается: файл выглядит правдоподобно, линтер отвечает
+# «Память согласована», хук пропускает коммиты - то есть инструмент, который
+# ищет тихие отказы, производит тихий отказ в самой защите. Проверено: убил
+# прогон, `TASK_MARKS = set()` осталось в дереве, прогон по памяти - код 0.
+BACKUP = ".mutation-backup"
 
 # (что ломаем, файл, точный фрагмент, чем заменить)
 MUTATIONS = [
@@ -74,10 +81,17 @@ MUTATIONS = [
      '        if COMMENT_ORPHAN.search(INLINE_CODE.sub("", line)):',
      '        if COMMENT_ORPHAN.search(INLINE_CODE.sub("", line)):'),
     ("граница имени файла справа снята", LINTER,
-     r'FILENAME_TOKEN = re.compile(r"[\w.\-/\\]+\.md(?![\w\-])(?!\.\w)", re.I)',
-     r'FILENAME_TOKEN = re.compile(r"[\w.\-/\\]+\.md", re.I)'),
+     r'MD_ANCHOR = re.compile(r"\.md(?![\w\-])(?!\.\w)", re.I)',
+     r'MD_ANCHOR = re.compile(r"\.md", re.I)'),
+    ("граница имени файла слева снята", LINTER,
+     "        while start > 0 and is_name_char(text[start - 1]):\n"
+     "            start -= 1",
+     "        pass"),
 
     # --- три инварианта ---
+    ("имя индекса сравнивается без учёта регистра", LINTER,
+     "            if os.path.basename(rel) == index_name]",
+     "            if os.path.basename(rel).casefold() == index_name.casefold()]"),
     ("корневым считается любой найденный индекс", LINTER,
      "    roots = {index_name} if index_name in index_rels else set()",
      "    roots = set(index_rels)"),
@@ -108,8 +122,14 @@ MUTATIONS = [
     ("ссылка [[...]] не резолвится по полю name", LINTER,
      "                names.add(match.group(1).strip())", "                pass"),
     ("проза в двойных скобках считается ссылкой", LINTER,
-     r'WIKI_LINK = re.compile(r"\[\[([^\s\[\]|#]{2,})(?:\|[^\]\n]*)?\]\]")',
-     r'WIKI_LINK = re.compile(r"\[\[([^\[\]|#]{2,})(?:\|[^\]\n]*)?\]\]")'),
+     r'WIKI_LINK = re.compile(r"\[\[([^\s\[\]|#]{2,})(?:#[^\]|\n]*)?(?:\|[^\]\n]*)?\]\]")',
+     r'WIKI_LINK = re.compile(r"\[\[([^\[\]|#]{2,})(?:#[^\]|\n]*)?(?:\|[^\]\n]*)?\]\]")'),
+    ("якорь в ссылке [[имя#раздел]] обрывает разбор", LINTER,
+     r'WIKI_LINK = re.compile(r"\[\[([^\s\[\]|#]{2,})(?:#[^\]|\n]*)?(?:\|[^\]\n]*)?\]\]")',
+     r'WIKI_LINK = re.compile(r"\[\[([^\s\[\]|#]{2,})(?:\|[^\]\n]*)?\]\]")'),
+    ("подсказка про формат берёт голое имя при однофамильцах", LINTER,
+     "        unique_name = basename if namesake_counts[basename] == 1 else None",
+     "        unique_name = basename"),
     ("список битых ссылок не обрезается", LINTER,
      "    for rel, lineno, target in dangling[:LISTED_WIKI_LINKS]:",
      "    for rel, lineno, target in dangling:"),
@@ -230,6 +250,35 @@ def write_atomically(path, text):
         raise
 
 
+def save_backup(path, text):
+    """Кладёт оригинал рядом на время, пока файл мутирован."""
+    write_atomically(BACKUP, path + "\n" + text)
+
+
+def drop_backup():
+    try:
+        os.remove(BACKUP)
+    except OSError:
+        pass
+
+
+def restore_interrupted():
+    """Возвращает файл, если прошлый прогон оборвали. True, если пришлось."""
+    if not os.path.isfile(BACKUP):
+        return False
+    with io.open(BACKUP, encoding="utf-8") as stream:
+        saved = stream.read()
+    path, _newline, text = saved.partition("\n")
+    if not path:
+        drop_backup()
+        return False
+    write_atomically(path, text)
+    drop_backup()
+    print("Прошлый прогон был оборван на середине - %s восстановлен из слепка."
+          % path)
+    return True
+
+
 def missing_anchors():
     """Мутации, чей фрагмент больше не находится ровно один раз."""
     stale = []
@@ -287,6 +336,11 @@ def main():
         print("Запускать из корня репозитория: %s не найден" % LINTER, file=sys.stderr)
         return 1
 
+    # Прибираемся за прошлым прогоном ДО всего остального: пока мутация лежит
+    # в дереве, и якоря протухли, и набор красный - обе следующие проверки
+    # отчитались бы о чужой беде.
+    restore_interrupted()
+
     # Протухший якорь - это молчаливо пропущенная мутация, то есть ровно тот
     # тихий отказ, который инструмент и ищет. Поэтому проверяем ДО прогона и
     # отказываемся работать, а не рапортуем неполный успех.
@@ -312,11 +366,13 @@ def main():
     survived = []
     for number, (name, path, old, new) in enumerate(MUTATIONS, 1):
         original = io.open(path, encoding="utf-8").read()
+        save_backup(path, original)
         try:
             write_atomically(path, original.replace(old, new))
             caught = suite_fails()
         finally:
             write_atomically(path, original)
+            drop_backup()
         print("[%2d/%d] %-8s %s" % (number, len(MUTATIONS),
                                     "поймана" if caught else "ВЫЖИЛА", name))
         if not caught:

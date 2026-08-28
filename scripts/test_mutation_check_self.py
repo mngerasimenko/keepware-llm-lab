@@ -16,8 +16,13 @@
 
 import io
 import os
+import shutil
+import stat
 import sys
+import tempfile
 import unittest
+import unittest.mock
+from contextlib import redirect_stdout
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(SCRIPTS_DIR)
@@ -59,11 +64,124 @@ class MutationCheckIsAlive(unittest.TestCase):
 
         Иначе «поймана» печаталось бы на каждой мутации по механической
         причине - и весь отчёт инструмента терял бы смысл.
+
+        Проверяется ВЫЗОВ, а не строка в исходнике. Прежняя редакция искала
+        литерал `"-p", "test_check_memory_index.py"` в тексте файла и
+        оставалась зелёной, если живой аргумент подменить на `test_*.py`,
+        а литерал оставить рядом комментарием. Ровно тот дешёвый признак,
+        от которого этот инструмент и страхует.
         """
-        source = io.open(os.path.join(SCRIPTS_DIR, "mutation_check.py"),
-                         encoding="utf-8").read()
-        self.assertIn('"-p", "test_check_memory_index.py"', source,
-                      "suite_fails гоняет не только основной файл тестов")
+        seen = {}
+
+        class FakeResult(object):
+            returncode = 0
+
+        def fake_run(command, **kwargs):
+            seen["command"] = list(command)
+            seen["env"] = kwargs.get("env") or {}
+            return FakeResult()
+
+        with unittest.mock.patch.object(mutation_check.subprocess, "run", fake_run):
+            mutation_check.suite_fails()
+
+        command = seen["command"]
+        self.assertIn("-p", command)
+        self.assertEqual(command[command.index("-p") + 1],
+                         "test_check_memory_index.py",
+                         "измеряемый набор захватывает самотесты инструмента")
+        self.assertEqual(
+            seen["env"].get("MEMCHECK_REQUIRE_SH"), "1",
+            "без этой переменной тесты хука пропускаются, и три мутации по "
+            "хуку печатаются как ВЫЖИВШИЕ - хотя их просто не проверяли")
+
+
+class InterruptedRunCleansUpAfterItself(unittest.TestCase):
+    """Оборванный прогон не должен оставить линтер молча сломанным.
+
+    `try/finally` спасает от Ctrl+C, но не от закрытого терминала, kill,
+    OOM или пропавшего электричества. Проверено вживую: прогон убит, в
+    дереве осталось `TASK_MARKS = set()`, и линтер на этом дереве отвечает
+    «Память согласована» с кодом 0 - то есть инструмент, который ищет тихие
+    отказы, произвёл тихий отказ в самой защите. Ущерб не в пустом файле
+    (его видно сразу), а в правдоподобно мутировавшем.
+    """
+
+    def sandbox(self):
+        folder = tempfile.mkdtemp(prefix="memcheck-interrupt-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        target = os.path.join(folder, "check.py")
+        with io.open(target, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("ОРИГИНАЛ\n")
+        return folder, target
+
+    def test_next_start_restores_the_file(self):
+        folder, target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup):
+            mutation_check.save_backup(target, "ОРИГИНАЛ\n")
+            with io.open(target, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("МУТАЦИЯ\n")           # здесь прогон оборвали
+            # Сообщение о восстановлении - для человека за терминалом, в
+            # выводе набора оно только мусорит.
+            with redirect_stdout(io.StringIO()):
+                restored = mutation_check.restore_interrupted()
+
+        self.assertTrue(restored)
+        with io.open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "ОРИГИНАЛ\n")
+        self.assertFalse(os.path.exists(backup), "слепок остался лежать")
+
+    def test_without_a_backup_nothing_is_touched(self):
+        """Вторая половина пары: на чистом дереве восстановление молчит.
+
+        Иначе инструмент правил бы файлы там, где его об этом не просили, -
+        а это ровно та беда, от которой он тут страхует.
+        """
+        folder, target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup):
+            restored = mutation_check.restore_interrupted()
+
+        self.assertFalse(restored)
+        with io.open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "ОРИГИНАЛ\n")
+
+
+class AtomicWriteKeepsPermissions(unittest.TestCase):
+    """Права файла обязаны пережить подмену - иначе защита гаснет молча.
+
+    Инструмент переписывает `.githooks/pre-commit` и возвращает обратно.
+    `mkstemp` создаёт файл с правами 0600, а `os.replace` оставляет права
+    ИСТОЧНИКА - значит без явного переноса первый же прогон снимал бы с хука
+    бит исполняемости. Неисполняемый хук git пропускает МОЛЧА.
+
+    Это уже случалось (шестой круг) и было единственным классом дефектов,
+    где регрессия невидима, - и единственным без регрессионного теста.
+    """
+
+    def rewrite(self, mode):
+        folder = tempfile.mkdtemp(prefix="memcheck-atomic-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, "pre-commit")
+        with io.open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(path, mode)
+        mutation_check.write_atomically(path, "#!/bin/sh\nexit 1\n")
+        return path
+
+    def test_executable_bit_survives(self):
+        if os.name == "nt":
+            self.skipTest("бит исполняемости на Windows не хранится - "
+                          "эту сторону закрывает прогон в CI на ubuntu")
+        path = self.rewrite(0o755)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o755,
+                         "с хука снят бит исполняемости - git пропустит его молча")
+
+    def test_content_is_actually_replaced(self):
+        """Вторая половина пары: перенос прав не должен отменить саму запись."""
+        path = self.rewrite(0o644)
+        with io.open(path, encoding="utf-8") as fh:
+            self.assertIn("exit 1", fh.read())
 
 
 if __name__ == "__main__":
