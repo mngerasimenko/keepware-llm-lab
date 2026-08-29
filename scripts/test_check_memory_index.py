@@ -2765,6 +2765,60 @@ class HintsDoNotOverclaim(MemoryFixture):
         self.assertIn("infra/user.md", output)
         self.assertNotIn("ссылкой не разобралось", output)
 
+    CUT_INDEX = ("- [Профиль](user.md) - кто\n"
+                 "\n"
+                 "<!-- временно спрятал старое\n"
+                 "\n"
+                 "- [Правило](feedback.md) - как работать\n")
+
+    def test_file_listed_below_a_cut_is_not_called_forgotten(self):
+        """Строка про файл в индексе ЕСТЬ - её не успели разобрать.
+
+        Прежде такой файл получал «не упомянут ни в одном индексе - агент его
+        не увидит»: ложно и то и другое. Агент читает индекс как текст, и
+        строка в контекст ему приезжает; не разобрала её проверка, а не он.
+        А после того как в сообщение добавили действие, оно стало ещё и
+        вредным - «добавьте строку в индекс» велит вписать дубль вместо того,
+        чтобы закрыть комментарий. Задание, выполнив которое агент сделает
+        хуже, - худший вид сообщения.
+
+        Причину проверка знает: заметка про незакрытый комментарий печатается
+        строкой выше. Здесь она связывается с конкретным файлом.
+
+        Это заметка и код 2 - «проверить не удалось», а не «память
+        разъехалась»: пока индекс дочитан наполовину, судить не из чего.
+        """
+        self.write({
+            "MEMORY.md": self.CUT_INDEX,
+            "user.md": "факт\n",
+            "feedback.md": "правило\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 2, output)
+        self.assertFalse(findings(output, "L2"), output)
+        self.assertIn("строка про него в MEMORY.md есть", output)
+        self.assertIn("не закрыт html-комментарий", output)
+        self.assertNotIn("`- [Заголовок](feedback.md) - крючок`", output)
+
+    def test_a_real_orphan_below_a_cut_is_still_reported(self):
+        """Вторая половина пары: правку нельзя превращать в глушилку.
+
+        В том же недоразобранном индексе файла `zabytyj.md` нет вовсе - ни
+        выше комментария, ни ниже. Про него сказать есть что, и говорим по
+        прежнему: нарушение и готовая строка для индекса.
+        """
+        self.write({
+            "MEMORY.md": self.CUT_INDEX,
+            "user.md": "факт\n",
+            "feedback.md": "правило\n",
+            "zabytyj.md": "меня нет в индексе совсем\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(len(findings(output, "L2")), 1, output)
+        self.assertIn("zabytyj.md", findings(output, "L2")[0])
+        self.assertIn("`- [Заголовок](zabytyj.md) - крючок`", output)
+
     def test_orphan_message_names_both_lawful_actions(self):
         """Самая частая находка обязана говорить, что делать.
 

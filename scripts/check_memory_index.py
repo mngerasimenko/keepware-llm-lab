@@ -864,7 +864,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
     index_links = defaultdict(set)
     empty_indexes = []
     unreadable = []
-    incomplete = []
+    incomplete = {}
     row_count = 0
 
     # Пути внутри проверки нормализованы через прямой слэш, а на Windows
@@ -932,7 +932,11 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             # Часть индекса не прочитана - тот же случай, что нечитаемый индекс.
             # Прежде печаталась заметка, а код оставался нулевым: CI зеленел на
             # индексе, разобранном наполовину.
-            incomplete.append(where)
+            #
+            # Причину запоминаем поимённо: ниже она понадобится, чтобы не
+            # обвинять файл, строка про который в индексе ЕСТЬ, - её просто не
+            # успели разобрать.
+            incomplete[where] = (unclosed, index_path)
         if not index_rows:
             empty_indexes.append(where)
         for title, raw_target, lineno, kind in index_rows:
@@ -1140,6 +1144,34 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             head_note = (" (шапка `---` открыта, но не закрыта - метка "
                          "`orphan: true` внутри неё не читается)")
         hint = ""
+        # Голое имя годится в подсказке, только если оно однозначно: при двух
+        # «user.md» в разных папках оно указывало бы на чужую строку. Считаем
+        # до всех ветвлений - ниже им пользуются две из них.
+        basename = os.path.basename(rel)
+        unique_name = basename if namesake_counts[basename] == 1 else None
+        # Индекс, который не дочитали до конца, - особый случай, и разбирать
+        # его надо ПЕРВЫМ. Строка про файл там есть, её просто не успели
+        # разобрать: сказать «не упомянут ни в одном индексе» значит соврать,
+        # а совет «добавьте строку в индекс» - отправить дописывать дубль
+        # вместо того, чтобы закрыть незакрытый комментарий. Причина уже
+        # названа заметкой строкой выше; связываем её с файлом здесь.
+        #
+        # Это заметка, а не нарушение: память может быть в полном порядке,
+        # проверка просто не смогла её прочесть. Тот же разбор, что у
+        # нечитаемого индекса, и тот же код 2 на выходе.
+        cut_at = next(
+            (where for where, (_kind, path) in sorted(incomplete.items())
+             if mentioned_in_raw_text({path: index_texts.get(path, "")},
+                                      rel, unique_name)),
+            None)
+        if cut_at:
+            kind, _path = incomplete[cut_at]
+            notices.append(
+                "%s: строка про него в %s есть, но в разбор не попала - там не "
+                "закрыт %s, и всё ниже проверка не читает. Закройте его в %s; "
+                "пока он открыт, сказать, упомянут файл или забыт, нельзя"
+                % (rel, cut_at, kind, cut_at))
+            continue
         if rel in stranded:
             # Чинить надо не этот файл, а путь до индекса, который его
             # перечисляет: сам он ни в чём не виноват, и правка его шапки
@@ -1153,14 +1185,11 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                 % (rel, stranded[rel], index_name, index_name, stranded[rel])
             )
             continue
-        # Голое имя годится в подсказку, только если оно однозначно. Ветка
-        # «на него ссылается X» ниже от однофамильцев уже прикрыта, а эта
+        # Ветка «на него ссылается X» ниже от однофамильцев прикрыта, а эта
         # стояла раньше неё и без гарда: при двух «user.md» в разных папках
         # сирота из подпапки получала «имя файла в тексте индекса встречается»
         # про строку, которая ведёт на ДРУГОЙ файл, - и заодно заглушала
         # правильную подсказку про источник. Ложно было каждое слово.
-        basename = os.path.basename(rel)
-        unique_name = basename if namesake_counts[basename] == 1 else None
         if mentioned_in_raw_text(index_texts, rel, unique_name):
             hint = (" (имя файла в тексте индекса встречается, но ссылкой не "
                     "разобралось - проверьте формат строки, блок кода, комментарий)")

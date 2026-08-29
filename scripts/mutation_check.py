@@ -124,6 +124,12 @@ MUTATIONS = [
      "            % (rel, hint, head_note, index_name, rel))",
      '            "L2 %s не упомянут ни в одном индексе - агент его не увидит%s%s"\n'
      "            % (rel, hint, head_note))"),
+    ("файл из недочитанного индекса снова объявляют забытым", LINTER,
+     "        if cut_at:", "        if False:"),
+    ("недочитанный индекс глушит и настоящих сирот", LINTER,
+     "             if mentioned_in_raw_text({path: index_texts.get(path, \"\")},\n"
+     "                                      rel, unique_name)),",
+     "             if True),"),
     ("сироту за недостижимым индексом шлют чинить не туда", LINTER,
      "                % (rel, stranded[rel], index_name, index_name, stranded[rel])",
      "                % (rel, stranded[rel], index_name, index_name, rel)"),
