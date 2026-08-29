@@ -59,6 +59,28 @@ class MutationCheckIsAlive(unittest.TestCase):
         self.assertGreater(len(mutation_check.MUTATIONS), 20,
                            "набор мутаций подозрительно мал")
 
+    def test_anchors_do_not_lean_on_comment_text(self):
+        """Якорь держится за код, а не за прозу рядом с ним.
+
+        Три якоря включали в себя строки русского комментария. Отказ при
+        протухшем якоре громкий и это правильно - но повод для него был
+        выдуманный: перефразировка комментария, к проверяемой ветке
+        отношения не имеющего, роняла весь инструмент («фрагмент найден 0
+        раз»), и сопровождающий получал красноту там, где ничего не менял.
+
+        Если якорь без комментария перестаёт быть уникальным - опирайтесь на
+        соседнюю строку КОДА, как сделано для сброса счётчика потерянных
+        строк: там взята следующая строка, а не комментарий над ней.
+        """
+        offenders = []
+        for name, _path, old, _new in mutation_check.MUTATIONS:
+            for line in old.splitlines():
+                if line.strip().startswith("#"):
+                    offenders.append("%s: %s" % (name, line.strip()))
+        self.assertEqual(offenders, [],
+                         "якорь опирается на текст комментария:\n" +
+                         "\n".join(offenders))
+
     def test_self_tests_are_excluded_from_the_measured_suite(self):
         """Прогон, чью реакцию мы измеряем, не должен включать этот файл.
 
