@@ -2963,6 +2963,91 @@ class PreCommitHook(unittest.TestCase):
         self.assertEqual(result.returncode, 1, text)
         self.assertIn("L1", text)
 
+    def write_config(self, name, body):
+        """Кладёт конфиг агента (CLAUDE.md и подобные) в репозиторий."""
+        path = os.path.join(self.repo, name)
+        folder = os.path.dirname(path)
+        if folder and not os.path.isdir(folder):
+            os.makedirs(folder)
+        with io.open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(body)
+
+    def test_missing_import_line_is_reported(self):
+        """Без строки импорта агент не увидит НИ ОДНОГО факта.
+
+        Она одна затаскивает индекс в контекст. Нет её - папка на месте, всё
+        внутри согласовано, а для агента памяти просто не существует. Любая
+        другая поломка стоит одного факта или ветки, эта - всех сразу, и до
+        сих пор её не проверял никто: `grep CLAUDE` по линтеру давал ноль.
+
+        Предупреждение, а не блокировка: grep подтверждает, что строка
+        написана, но не то, что она сработала.
+        """
+        self.write_config("CLAUDE.md", "# Проект\n\nОбычные инструкции.\n")
+        self.git("add", "-A")
+
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, text)
+        self.assertIn("@memory/MEMORY.md", text)
+
+    def test_import_line_in_a_nested_config_is_accepted(self):
+        """Вторая половина пары: строка есть - и хук молчит.
+
+        Вход подобран так, чтобы различать реализации. В корне лежит конфиг
+        БЕЗ строки, а строка - в `.claude/CLAUDE.md`, с путём на уровень выше
+        (`@../memory/MEMORY.md`); это законная и частая раскладка, README про
+        неё пишет отдельно.
+
+        Реализация, смотрящая только в корень, увидит там конфиг без строки и
+        выдаст предупреждение - тест покраснеет. Если положить строку в
+        корневой конфиг, обе реализации молчали бы одинаково, и тест не
+        гарантировал бы ничего (проверено: на такой фикстуре он проходил и с
+        урезанным списком мест).
+        """
+        self.write_config("CLAUDE.md", "# Проект\n\nСтроки импорта тут нет.\n")
+        self.write_config(".claude/CLAUDE.md", "# Проект\n\n@../memory/MEMORY.md\n")
+        self.git("add", "-A")
+
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, text)
+        self.assertNotIn("НИ ОДНОГО факта", text)
+
+    def test_no_agent_config_at_all_stays_silent(self):
+        """Конфига нет вовсе - судить не по чему, молчим.
+
+        Иначе предупреждение печаталось бы в любом репозитории, который
+        просто держит папку `memory/` под git, - в том числе в самой
+        лаборатории, где лежит только `CLAUDE.example.md`. Ругаемся лишь
+        когда конфиг ЕСТЬ, а строки в нём нет: это забытый шаг установки, а
+        не догадка.
+        """
+        self.git("add", "-A")
+
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, text)
+        self.assertNotIn("НИ ОДНОГО факта", text)
+
+    def test_custom_index_name_does_not_trigger_a_false_warning(self):
+        """Своё имя индекса не должно оборачиваться ложной тревогой.
+
+        Хук обязан искать в конфиге то же имя, что задано проверке ключом
+        --index, иначе человек со своим `INDEX.md` получал бы предупреждение
+        на исправной настройке - а ложная тревога учит жать --no-verify.
+        """
+        os.rename(os.path.join(self.repo, "memory", "MEMORY.md"),
+                  os.path.join(self.repo, "memory", "INDEX.md"))
+        self.git("config", "memorycheck.args", "--index INDEX.md")
+        self.write_config("CLAUDE.md", "# Проект\n\n@memory/INDEX.md\n")
+        self.git("add", "-A")
+
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, text)
+        self.assertNotIn("НИ ОДНОГО факта", text)
+
     def fake_python3(self, body):
         """Кладёт в PATH подставной python3 и возвращает окружение с ним."""
         folder = tempfile.mkdtemp(prefix="memcheck-bin-")
