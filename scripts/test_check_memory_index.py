@@ -66,6 +66,19 @@ HOOK = os.path.join(REPO_DIR, ".githooks", "pre-commit")
 MISSING_SH_MESSAGE = "не нашёл sh - тесты хука НЕ выполнялись, это не значит, что хук исправен"
 
 
+def findings(output, code):
+    """Строки-находки с этим кодом, по началу строки.
+
+    Не подстрокой. Итог вывода называет коды словами («L1 ... и L2 ...
+    блокируют коммит»), и `assertIn("L4", output)` проходил бы по этой
+    строке, ничего не гарантируя, а `assertNotIn("L2", output)` краснел бы
+    на исправной памяти. Обе беды - один и тот же дешёвый признак: проверка
+    наличия слова вместо проверки находки.
+    """
+    return [line for line in output.splitlines()
+            if line.startswith(code + " ")]
+
+
 class HookPrerequisite(unittest.TestCase):
     """Один внятный провал вместо девятнадцати одинаковых.
 
@@ -152,7 +165,7 @@ class IndexLinksToFiles(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1)
-        self.assertIn("L1", output)
+        self.assertTrue(findings(output, "L1"), output)
 
     def test_case_mismatch_is_error_even_on_case_insensitive_fs(self):
         """Windows такую ссылку проглотит, Linux в CI - нет. Ловим на обеих."""
@@ -171,7 +184,7 @@ class IndexLinksToFiles(MemoryFixture):
             "user.md": "факт\n",
         })
         _code, output = self.run_linter()
-        self.assertNotIn("L2", output)
+        self.assertFalse(findings(output, "L2"), output)
         self.assertIn("Нарушений: 1", output)
 
     def test_case_mismatch_in_directory_part_is_caught(self):
@@ -260,7 +273,7 @@ class IndexLinksToFiles(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        self.assertIn("L1", output)
+        self.assertTrue(findings(output, "L1"), output)
 
     def test_link_to_another_drive_is_a_finding_not_a_crash(self):
         """Разные диски: относительный путь между ними не вычисляется вообще.
@@ -275,7 +288,7 @@ class IndexLinksToFiles(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        self.assertIn("L1", output)
+        self.assertTrue(findings(output, "L1"), output)
 
     def test_unc_path_is_a_finding_not_a_crash(self):
         self.write({
@@ -285,7 +298,7 @@ class IndexLinksToFiles(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        self.assertIn("L1", output)
+        self.assertTrue(findings(output, "L1"), output)
 
     def test_file_named_like_parent_dir_is_not_mistaken_for_escape(self):
         self.write({
@@ -440,7 +453,7 @@ class IndexParsing(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        self.assertIn("L1", output)
+        self.assertTrue(findings(output, "L1"), output)
 
     def test_row_indented_by_three_spaces_still_counts(self):
         """Три пробела - всё ещё список, а не код."""
@@ -2142,7 +2155,7 @@ class RootIndexLost(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        self.assertIn("L2", output)
+        self.assertTrue(findings(output, "L2"), output)
         self.assertIn("3 файла", output)
 
     def test_folder_that_is_not_memory_stays_a_usage_error(self):
@@ -2438,7 +2451,7 @@ class ExitCodeContract(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        self.assertIn("L1", output)
+        self.assertTrue(findings(output, "L1"), output)
 
     def test_unreadable_index_does_not_abort_the_run(self):
         self.write({
@@ -2482,7 +2495,7 @@ class ExitCodeContract(MemoryFixture):
         with unittest.mock.patch.object(linter, "read_text", failing_read):
             code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        self.assertIn("L1", output)
+        self.assertTrue(findings(output, "L1"), output)
 
     def test_internal_failure_is_exit_two_not_one(self):
         """Иначе хук скажет «память разъехалась» поверх трейсбека."""
@@ -2531,7 +2544,7 @@ class DuplicateTitles(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
-        self.assertIn("L3", output)
+        self.assertTrue(findings(output, "L3"), output)
 
     def test_same_row_twice_is_warned(self):
         self.write({
@@ -2540,7 +2553,7 @@ class DuplicateTitles(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
-        self.assertIn("L3", output)
+        self.assertTrue(findings(output, "L3"), output)
 
 
 class WikiLinksBetweenFacts(MemoryFixture):
@@ -2563,7 +2576,7 @@ class WikiLinksBetweenFacts(MemoryFixture):
             "infra/prod.md": "см. [[project_udalennyj]] рядом\n",
         })
         code, output = self.run_linter()
-        self.assertIn("L4", output)
+        self.assertTrue(findings(output, "L4"), output)
         self.assertIn("project_udalennyj", output)
         self.assertEqual(code, 0, output)
 
@@ -2596,7 +2609,7 @@ class WikiLinksBetweenFacts(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
-        self.assertNotIn("L4", output)
+        self.assertFalse(findings(output, "L4"), output)
 
     def test_link_with_a_caption_resolves(self):
         self.write({
@@ -2605,8 +2618,64 @@ class WikiLinksBetweenFacts(MemoryFixture):
             "feedback_rule.md": "правило\n",
         })
         code, output = self.run_linter()
-        self.assertNotIn("L4", output)
+        self.assertFalse(findings(output, "L4"), output)
         self.assertEqual(code, 0, output)
+
+    def test_dash_for_underscore_gets_a_concrete_instruction(self):
+        """Сообщение должно быть выполнимым, а не только верным.
+
+        «Не ведёт никуда» - диагноз: по нему нельзя починить, не поискав
+        руками. Дефис вместо подчёркивания - причина подавляющего
+        большинства битых связей в живых памятях (52 из 98), и в этом случае
+        файл называется однозначно. Тогда называем и его, и оба способа
+        починки: поправить ссылку либо объявить это имя в шапке файла.
+        """
+        self.write({
+            "MEMORY.md": self.INDEX,
+            "user.md": "см. [[feedback-rule]] рядом\n",
+            "feedback_rule.md": "правило\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertIn("Похоже, имелся в виду feedback_rule.md", output)
+        self.assertIn("[[feedback_rule]]", output)
+        self.assertIn("name: feedback-rule", output)
+
+    def test_ambiguous_spelling_gets_no_guess(self):
+        """Вторая половина пары: под одно написание попали двое - молчим.
+
+        Подсказка, которая иногда указывает не на тот файл, хуже отсутствия
+        подсказки: по ней правят не тот файл и получают вторую поломку.
+
+        Двойники различаются дефисом и подчёркиванием, а не регистром:
+        регистровая пара на Windows схлопывается в один файл, и вход перестал
+        бы быть неоднозначным ровно на той системе, где его гоняют чаще
+        всего.
+        """
+        self.write({
+            "MEMORY.md": "- [Раз](pravilo_odin.md) - раз\n"
+                         "- [Два](pravilo-odin.md) - два\n"
+                         "- [Заметка](zametka.md) - три\n",
+            "pravilo_odin.md": "первое\n",
+            "pravilo-odin.md": "второе\n",
+            "zametka.md": "см. [[Pravilo_Odin]] рядом\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertIn("никуда не ведёт", output)
+        self.assertNotIn("Похоже, имелся в виду", output)
+
+    def test_nothing_similar_still_says_what_to_do(self):
+        """Похожего нет - но действие назвать всё равно обязаны."""
+        self.write({
+            "MEMORY.md": self.INDEX,
+            "user.md": "см. [[sovsem_drugoe_slovo]] рядом\n",
+            "feedback_rule.md": "правило\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("Похоже, имелся в виду", output)
+        self.assertIn("Поправьте имя в ссылке или заведите такой файл", output)
 
     def test_link_with_an_anchor_resolves_by_the_name_before_it(self):
         """«[[правило#раздел]]» ведёт к той же памяти, что «[[правило]]».
@@ -2632,7 +2701,7 @@ class WikiLinksBetweenFacts(MemoryFixture):
             "feedback_rule.md": "правило\n",
         })
         code, output = self.run_linter()
-        self.assertNotIn("L4", output)
+        self.assertFalse(findings(output, "L4"), output)
         self.assertEqual(code, 0, output)
 
     def test_example_inside_a_code_fence_is_not_a_link(self):
@@ -2643,7 +2712,7 @@ class WikiLinksBetweenFacts(MemoryFixture):
             "feedback_rule.md": "Связи пишутся так:\n\n```\n[[imya-drugoj-pamyati]]\n```\n",
         })
         code, output = self.run_linter()
-        self.assertNotIn("L4", output)
+        self.assertFalse(findings(output, "L4"), output)
         self.assertEqual(code, 0, output)
 
     def test_every_dangling_link_is_named(self):
@@ -2666,7 +2735,7 @@ class WikiLinksBetweenFacts(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
-        self.assertEqual(output.count("не ведёт ни к одному файлу памяти"), 25)
+        self.assertEqual(output.count("никуда не ведёт"), 25)
         self.assertIn("net_00", output)
         self.assertIn("net_24", output)
 
@@ -2711,6 +2780,66 @@ class HintsDoNotOverclaim(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
         self.assertIn("ссылкой не разобралось", output)
+
+
+class SummaryTellsWhatBlocks(MemoryFixture):
+    """Итог отвечает на первый вопрос: чинить сейчас или можно коммитить.
+
+    По самим строкам этого не видно. Буква перед адресом отличает нарушение
+    от предупреждения, но что она значит, из вывода не следовало никак. А с
+    тех пор как предупреждения перестали молчать под --quiet, в одном потоке
+    идут и те и другие: шесть строк L4 при коммите человек читает как причину
+    отказа, хотя они ничего не блокируют.
+    """
+
+    def test_warnings_only_end_with_a_verdict(self):
+        """Память с одними предупреждениями обрывалась без единого слова.
+
+        Итог печатался ТОЛЬКО при нарушениях: человек видел стену находок и
+        не знал, чем всё кончилось. Под --quiet - как зовёт хук - тем более.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "см. [[net_takogo_fakta]] рядом\n",
+        })
+        code, output = self.run_linter("--quiet")
+        self.assertEqual(code, 0, output)
+        self.assertIn("Нарушений нет", output)
+        self.assertIn("не блокируют", output)
+
+    def test_violations_name_both_counts_and_the_legend(self):
+        """Вторая половина пары: при нарушениях итог называет и те и другие.
+
+        Вход держит нарушение И предупреждение одновременно - только на таком
+        видно, что счётчики не перепутаны и что легенда объясняет обе буквы.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Битая](net.md) - файла нет\n",
+            "user.md": "см. [[net_takogo_fakta]] рядом\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertTrue(findings(output, "L1"), output)
+        self.assertTrue(findings(output, "L4"), output)
+        self.assertIn("Нарушений: 1", output)
+        self.assertIn("предупреждений: 1", output)
+        self.assertIn("Блокируют коммит только", output)
+
+    def test_the_legend_is_not_mistaken_for_a_finding(self):
+        """Легенда называет коды словами - и не должна сойти за находку.
+
+        Находки узнаются по началу строки. Начнись легенда с «L1», и любой
+        тест на отсутствие L1 краснел бы на исправной памяти, а тест на его
+        наличие проходил бы, ничего не проверяя. Двадцать четыре проверки в
+        этом наборе стояли ровно на такой подстроке.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Битая](net.md) - файла нет\n",
+            "user.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        self.assertEqual(len(findings(output, "L1")), 1, output)
+        self.assertFalse(findings(output, "L2"), output)
 
 
 class ExitCodes(MemoryFixture):
@@ -2761,8 +2890,8 @@ class ExitCodes(MemoryFixture):
         })
         code, output = self.run_linter("--quiet")
         self.assertEqual(code, 0, output)
-        self.assertIn("L3", output)
-        self.assertIn("L4", output)
+        self.assertTrue(findings(output, "L3"), output)
+        self.assertTrue(findings(output, "L4"), output)
         self.assertIn("net_takogo_fakta", output)
 
     def test_quiet_still_shows_warnings_that_explain_errors(self):
@@ -2998,7 +3127,7 @@ class PreCommitHook(unittest.TestCase):
         result = self.run_hook()
         text = result.stdout.decode("utf-8", "replace")
         self.assertEqual(result.returncode, 1, text)
-        self.assertIn("L1", text)
+        self.assertTrue(findings(text, "L1"), text)
 
     def write_config(self, name, body):
         """Кладёт конфиг агента (CLAUDE.md и подобные) в репозиторий."""
@@ -3102,7 +3231,7 @@ class PreCommitHook(unittest.TestCase):
         result = self.run_hook()
         text = result.stdout.decode("utf-8", "replace")
         self.assertEqual(result.returncode, 1, text)
-        self.assertIn("L1", text)
+        self.assertTrue(findings(text, "L1"), text)
 
     def test_passes_on_consistent_memory(self):
         self.git("add", "-A")
@@ -3121,7 +3250,7 @@ class PreCommitHook(unittest.TestCase):
         result = self.run_hook(env)
         text = result.stdout.decode("utf-8", "replace")
         self.assertEqual(result.returncode, 1, text)
-        self.assertIn("L1", text)
+        self.assertTrue(findings(text, "L1"), text)
 
     def test_rejects_python_below_required_version(self):
         """Самозванец не только заглушка: подойдёт и Питон старее нашей планки.
@@ -3141,7 +3270,7 @@ class PreCommitHook(unittest.TestCase):
         result = self.run_hook(env)
         text = result.stdout.decode("utf-8", "replace")
         self.assertEqual(result.returncode, 1, text)
-        self.assertIn("L1", text)
+        self.assertTrue(findings(text, "L1"), text)
 
     def test_hook_is_committed_executable(self):
         """Неисполняемый хук git пропускает молча - и это уже случалось.
@@ -3186,7 +3315,7 @@ class PreCommitHook(unittest.TestCase):
         result = self.run_hook()
         text = result.stdout.decode("utf-8", "replace")
         self.assertEqual(result.returncode, 1, text)
-        self.assertIn("L1", text)
+        self.assertTrue(findings(text, "L1"), text)
 
     def test_skips_during_rebase_but_says_so_out_loud(self):
         """Маркеры rebase залипают - молчаливый пропуск выключил бы хук насовсем."""
@@ -3208,7 +3337,7 @@ class PreCommitHook(unittest.TestCase):
         result = self.run_hook()
         text = result.stdout.decode("utf-8", "replace")
         self.assertEqual(result.returncode, 1, text)
-        self.assertIn("L1", text)
+        self.assertTrue(findings(text, "L1"), text)
 
     def test_skips_when_nothing_staged_under_memory(self):
         """Незастейдженная правка памяти не должна блокировать посторонний коммит."""

@@ -630,27 +630,49 @@ def cached_text(path, rel, cache):
     return text
 
 
+def loose(name):
+    """Написание имени с точностью до того, чем люди в нём ошибаются.
+
+    Дефис против подчёркивания и регистр - вот и вся разница в подавляющем
+    большинстве битых связей: слаг пишут по привычке через дефис, а файлы в
+    памяти названы через подчёркивание. Ничего более догадливого (расстояния
+    редактирования и прочего) тут нет намеренно: подсказка, которая иногда
+    указывает не на тот файл, хуже отсутствия подсказки.
+    """
+    return name.replace("-", "_").casefold()
+
+
 def known_memory_names(exact, cache):
     """Имена, под которыми на память можно сослаться из [[...]].
 
-    Их два вида, и оба в ходу: имя файла и поле `name` из шапки. В девяти
-    живых памятях портфеля они расходятся у 224 файлов из 351 - то есть
-    проверять только одно значило бы выдумывать нарушения на ровном месте.
+    Возвращает (точные имена, приблизительные -> файлы).
+
+    Имён у памяти два вида, и оба в ходу: имя файла и поле `name` из шапки.
+    В девяти живых памятях портфеля они расходятся у 237 файлов из 385 - то
+    есть проверять только одно значило бы выдумывать нарушения на ровном
+    месте.
+
+    Второй словарь нужен для подсказки «похоже, имелся в виду вот этот файл».
+    Ключ в нём - приблизительное написание, значение - множество файлов:
+    если под одно написание попали двое, угадывать нельзя.
     """
     names = set()
-    for rel, path in exact.items():
+    similar = defaultdict(set)
+    for rel, path in sorted(exact.items()):
         if not rel.lower().endswith(".md"):
             continue
         base = os.path.basename(rel)
-        names.update((rel, os.path.splitext(rel)[0],
-                      base, os.path.splitext(base)[0]))
+        forms = {rel, os.path.splitext(rel)[0], base, os.path.splitext(base)[0]}
         head, _unclosed = frontmatter_lines(cached_text(path, rel, cache))
         for line in head:
             match = NAME_FIELD.match(line)
             if match:
-                names.add(match.group(1).strip())
+                forms.add(match.group(1).strip())
                 break
-    return names
+        names.update(forms)
+        for form in forms:
+            similar[loose(form)].add(rel)
+    return names, similar
 
 
 def dangling_wiki_links(exact, cache):
@@ -670,8 +692,12 @@ def dangling_wiki_links(exact, cache):
 
     Блоки кода пропускаются: файл, объясняющий формат памяти, приводит
     [[примеры]] - и без этого условия сам себя объявлял бы сломанным.
+
+    Каждая находка несёт третьим значением догадку - файл, который, судя по
+    написанию, имелся в виду, либо None. Без неё сообщение остаётся
+    диагнозом: «не ведёт никуда» верно, но чинить по нему нечего.
     """
-    names = known_memory_names(exact, cache)
+    names, similar = known_memory_names(exact, cache)
     found = []
     for rel in sorted(exact):
         if not rel.lower().endswith(".md"):
@@ -688,8 +714,15 @@ def dangling_wiki_links(exact, cache):
                 opened_fence = mark
                 continue
             for target in WIKI_LINK.findall(line):
-                if target.strip() not in names:
-                    found.append((rel, lineno, target.strip()))
+                target = target.strip()
+                if target in names:
+                    continue
+                # Догадка только когда она однозначна. Двое под одним
+                # приблизительным написанием - и мы отправили бы чинить не
+                # тот файл; молчание тут честнее.
+                candidates = similar.get(loose(target), set()) - {rel}
+                guess = next(iter(candidates)) if len(candidates) == 1 else None
+                found.append((rel, lineno, target, guess))
     return found
 
 
@@ -1198,11 +1231,26 @@ def check(root, index_paths, allow_globs, index_name, file_map):
     # проверки, - и это была ошибка: проверка, которая нашла и не назвала,
     # оставляет человека с числом вместо адресов, а починить по числу нельзя.
     # Каждая строка - это файл, строка в нём и имя, которого нет.
+    #
+    # Сообщение обязано быть выполнимым: его читает и человек, и агент,
+    # которому эту память чинить. Поэтому в строке есть адрес (файл и номер
+    # строки), что именно не сходится и что с этим делать. Когда написание
+    # выдаёт опечатку однозначно - называем файл и оба способа починки:
+    # поправить ссылку либо объявить это имя в шапке файла.
     dangling = dangling_wiki_links(exact, cache)
-    for rel, lineno, target in dangling:
-        warnings.append("L4 %s:%d ссылка [[%s]] не ведёт ни к одному файлу "
-                        "памяти: ни файла с таким именем, ни шапки с таким "
-                        "полем name" % (rel, lineno, target))
+    for rel, lineno, target, guess in dangling:
+        if guess:
+            warnings.append(
+                "L4 %s:%d ссылка [[%s]] никуда не ведёт. Похоже, имелся в виду "
+                "%s: исправьте ссылку на [[%s]] либо добавьте в шапку того "
+                "файла строку `name: %s`"
+                % (rel, lineno, target, guess, os.path.splitext(guess)[0], target))
+        else:
+            warnings.append(
+                "L4 %s:%d ссылка [[%s]] никуда не ведёт: файла с таким именем "
+                "нет, и ни в одной шапке нет строки `name: %s`. Поправьте имя "
+                "в ссылке или заведите такой файл"
+                % (rel, lineno, target, target))
 
     return errors, notices, warnings, row_count, bool(incomplete or unreadable_dirs)
 
@@ -1326,12 +1374,31 @@ def main(argv=None):
 
     if unverifiable and not errors:
         return EXIT_USAGE
+
+    # Итог отвечает на первый вопрос человека: чинить прямо сейчас или можно
+    # коммитить. По самим строкам этого не видно - буква перед адресом
+    # отличает нарушение от предупреждения, но что она значит, из вывода не
+    # следовало никак. А с тех пор как предупреждения перестали молчать под
+    # --quiet, в одном потоке идут и те и другие: шесть строк L4 при коммите
+    # человек читает как причину отказа, хотя они ничего не блокируют.
+    #
+    # Раньше итог печатался ТОЛЬКО при нарушениях: память с одними
+    # предупреждениями обрывалась на последней строке без единого слова о
+    # том, чем всё кончилось.
     if errors:
-        print("\nНарушений: %d (строк в индексе: %d)" % (len(errors), row_count))
+        print("\nНарушений: %d (строк в индексе: %d), предупреждений: %d."
+              % (len(errors), row_count, len(warnings)))
+        # Строка намеренно не начинается с кода: находки узнаются по началу
+        # строки, и легенда, начинающаяся с «L1», сама сошла бы за находку.
+        print("Блокируют коммит только L1 (битая ссылка из индекса) и "
+              "L2 (файл вне индекса); L3 и L4 - предупреждения.")
         return EXIT_VIOLATION
+    if warnings:
+        print("\nНарушений нет. Предупреждений: %d - L3 (дубль заголовка) и "
+              "L4 (битая связь [[имя]]) коммит не блокируют." % len(warnings))
+        return EXIT_OK
     if not args.quiet:
-        total_notes = len(notices) + len(warnings)
-        note = ", предупреждений: %d" % total_notes if total_notes else ""
+        note = ", заметок: %d" % len(notices) if notices else ""
         print("Память согласована: строк в индексе %d, индексов %d%s"
               % (row_count, len(index_paths), note))
     return EXIT_OK
