@@ -1335,6 +1335,57 @@ def build_parser():
     return parser
 
 
+# Ведущий адрес строки: «L2 draft.md ...», «L1 MEMORY.md:2 ...», «draft.md: ...».
+# Двоеточие в путь не берём - внутри папки памяти его в именах не бывает, а
+# отделяет оно как раз номер строки.
+LEADING_ADDRESS = re.compile(r"^(L\d )?([^\s:]+)(:\d+)?(:?)(\s|$)")
+
+
+def with_memory_folder(line, folder, known):
+    """Дописывает папку памяти к ведущему адресу строки.
+
+    Пути внутри проверки отсчитываются от папки памяти, а читают вывод из
+    того каталога, откуда её запустили: строка «L2 draft.md» указывает на
+    файл, которого по этому пути нет - он лежит в `memory/draft.md`. По
+    такой строке не прыгнет ни редактор, ни grep, а агент, получивший вывод
+    как задание, не найдёт файл с первой попытки.
+
+    Правится ТОЛЬКО ведущий адрес и только если он совпал с реально
+    существующим путём. Ссылки внутри сообщений - «Добавьте строку
+    `- [Заголовок](draft.md)`» - обязаны остаться как есть: они пишутся в
+    индекс и отсчитываются от него, а не от текущего каталога. Разбор по
+    началу строки к ним физически не подступается.
+    """
+    if not folder:
+        return line
+    match = LEADING_ADDRESS.match(line)
+    if not match or match.group(2) not in known:
+        return line
+    code, path, lineno, colon, tail = match.groups()
+    return "%s%s/%s%s%s%s%s" % (code or "", folder, path, lineno or "",
+                                colon, tail, line[match.end():])
+
+
+def display_folder(memory_dir):
+    """Как назвать папку памяти в выводе - и надо ли называть вовсе.
+
+    Приписываем ровно то написание, которым папку назвали нам: тогда путь в
+    выводе верен из того же каталога, откуда запускали. Так работает и хук -
+    он зовёт проверку с «memory» из корня репозитория, и адреса выходят
+    кликабельными: `memory/draft.md`.
+
+    Абсолютный путь не приписываем. Выигрыш тот же, а цена - сотня лишних
+    символов в КАЖДОЙ строке; на памяти с шестью десятками находок это
+    превращает вывод в стену, и тот, кто дал абсолютный путь, уже знает, где
+    он находится. Текущий каталог («.») не приписываем по той же причине:
+    он ничего не уточняет.
+    """
+    folder = memory_dir.replace(os.sep, "/").rstrip("/")
+    if folder in ("", ".") or os.path.isabs(memory_dir):
+        return ""
+    return folder
+
+
 def main(argv=None):
     force_utf8_output()
     args = build_parser().parse_args(argv)
@@ -1427,6 +1478,15 @@ def main(argv=None):
     #
     # Заметки печатались всегда и раньше: они говорят, что часть проверки не
     # выполнилась.
+    # Адреса в выводе дописываем папкой памяти - см. with_memory_folder.
+    # Список известных путей берём из карты файлов: приписка ставится только
+    # там, где ведущий токен и правда путь, а не начало фразы.
+    folder = display_folder(args.memory_dir)
+    known = set(file_map[0])
+    notices = [with_memory_folder(line, folder, known) for line in notices]
+    warnings = [with_memory_folder(line, folder, known) for line in warnings]
+    errors = [with_memory_folder(line, folder, known) for line in errors]
+
     for line in notices:
         print(line)
     for line in warnings:

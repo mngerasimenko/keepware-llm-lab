@@ -2245,6 +2245,78 @@ class RootIndexLost(MemoryFixture):
         self.assertEqual(lost_index, 1, output)
 
 
+class AddressesAreClickable(MemoryFixture):
+    """Адрес в выводе должен указывать туда, откуда проверку запустили.
+
+    Пути внутри проверки отсчитываются от папки памяти, а читают вывод из
+    каталога запуска: «L2 draft.md» указывает на файл, которого по этому
+    пути нет - он лежит в `memory/draft.md`. По такой строке не прыгнет ни
+    редактор, ни grep, а агент, получивший вывод как задание, не найдёт файл
+    с первой попытки. Хук зовёт проверку именно так - «memory» из корня
+    репозитория.
+    """
+
+    FILES = {
+        "MEMORY.md": "- [Профиль](user.md) - кто\n",
+        "user.md": "факт\n",
+        "draft.md": "черновик\n",
+    }
+
+    def test_relative_run_prefixes_the_address(self):
+        self.write(self.FILES)
+        name = os.path.basename(self.root)
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = linter.main([name])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertEqual(code, 1, output)
+        self.assertIn("L2 %s/draft.md" % name, output)
+        # А вот ссылка ВНУТРИ сообщения обязана остаться прежней: её впишут
+        # в индекс, и отсчитывается она от него, а не от каталога запуска.
+        self.assertIn("`- [Заголовок](draft.md) - крючок`", output)
+
+    def test_prefix_does_not_touch_lines_that_start_with_a_word(self):
+        """Третья сторона: приписка ставится только там, где ведущий токен - путь.
+
+        Разбор идёт по началу строки, и без сверки с реальными путями он
+        приписал бы папку к первому слову любой фразы: «Индекс пуст: ...»
+        превратилось бы в «memory/Индекс пуст: ...». Проверка, коверкающая
+        собственные сообщения, хуже, чем проверка с неудобными адресами.
+        """
+        self.write({"MEMORY.md": "Пока пусто, ни одной строки формата\n"})
+        name = os.path.basename(self.root)
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = linter.main([name])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertEqual(code, 0, output)
+        self.assertIn("Индекс пуст", output)
+        self.assertNotIn("%s/Индекс" % name, output)
+
+    def test_absolute_run_leaves_addresses_bare(self):
+        """Вторая половина пары: абсолютный путь в каждую строку не дублируем.
+
+        Выигрыш тот же, а цена - сотня лишних символов в каждой строке; на
+        памяти с шестью десятками находок это стена. Тот, кто дал абсолютный
+        путь, и так знает, где находится.
+        """
+        self.write(self.FILES)
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("L2 draft.md", output)
+        self.assertNotIn(self.root, output)
+
+
 class LinkedSubtrees(MemoryFixture):
     """Связанные каталоги внутри памяти: junction на Windows, симлинк на POSIX."""
 

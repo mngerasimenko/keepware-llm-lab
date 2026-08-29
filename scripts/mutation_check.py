@@ -134,6 +134,13 @@ MUTATIONS = [
      "                % (rel, stranded[rel], index_name, index_name, stranded[rel])",
      "                % (rel, stranded[rel], index_name, index_name, rel)"),
 
+    ("адреса в выводе снова не дописываются папкой памяти", LINTER,
+     "    errors = [with_memory_folder(line, folder, known) for line in errors]",
+     "    errors = list(errors)"),
+    ("приписка лезет в ссылки внутри сообщений", LINTER,
+     "    if not match or match.group(2) not in known:\n        return line",
+     "    if not match:\n        return line"),
+
     # --- L4: ссылки [[...]] между фактами ---
     ("битые ссылки [[...]] не сообщаются", LINTER,
      "    dangling = dangling_wiki_links(exact, cache)", "    dangling = []"),
