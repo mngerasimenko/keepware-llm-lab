@@ -2646,8 +2646,18 @@ class WikiLinksBetweenFacts(MemoryFixture):
         self.assertNotIn("L4", output)
         self.assertEqual(code, 0, output)
 
-    def test_long_list_of_dangling_links_is_cut(self):
-        """Стена одинаковых строк читается как поломка самой проверки."""
+    def test_every_dangling_link_is_named(self):
+        """Названы все до одной, сколько бы их ни было.
+
+        Первая редакция резала список на десятой строке, чтобы стена
+        одинаковых сообщений не читалась как поломка самой проверки. Это была
+        ошибка: чинить по числу нельзя, чинят по адресу. Каждая строка -
+        файл, строка в нём и имя, которого нет; смысл проверки в том, чтобы
+        назвать их, а не сосчитать.
+
+        Двадцать пять - заведомо больше любого разумного порога, поэтому вход
+        различает «печатаю всё» и «печатаю первые N».
+        """
         body = "".join("см. [[net_%02d]]\n" % number for number in range(25))
         self.write({
             "MEMORY.md": self.INDEX,
@@ -2656,8 +2666,9 @@ class WikiLinksBetweenFacts(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
-        self.assertEqual(output.count("не ведёт ни к одному файлу памяти"), 10)
-        self.assertIn("список обрезан", output)
+        self.assertEqual(output.count("не ведёт ни к одному файлу памяти"), 25)
+        self.assertIn("net_00", output)
+        self.assertIn("net_24", output)
 
 
 class HintsDoNotOverclaim(MemoryFixture):
@@ -2717,16 +2728,42 @@ class ExitCodes(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 2, output)
 
-    def test_quiet_hides_standalone_warnings(self):
-        """Хук зовёт проверку с --quiet. Бурчание на здоровой памяти приучает к --no-verify."""
+    def test_quiet_is_silent_only_when_nothing_is_wrong(self):
+        """Ключ гасит ровно то, что обещает справкой: строку про согласованность.
+
+        На здоровой памяти под --quiet вывода нет вовсе - хук зовёт проверку
+        именно так, и бурчать ему не на что.
+        """
         self.write({
-            "MEMORY.md": "- [Профиль](user.md) - раз\n- [Профиль](user2.md) - два\n",
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
             "user.md": "факт\n",
-            "user2.md": "факт\n",
         })
         code, output = self.run_linter("--quiet")
         self.assertEqual(code, 0)
         self.assertEqual(output.strip(), "")
+
+    def test_quiet_does_not_hide_findings(self):
+        """Вторая половина пары: найденное под --quiet не прячется.
+
+        Прежде ключ глушил и предупреждения - чтобы хук не бурчал на каждом
+        коммите. Цена вскрылась на живых данных: L4 нашёл 97 битых связей в
+        девяти памятях, и ни одна не попадалась человеку на глаза, потому что
+        хук зовёт проверку с --quiet. Проверка, которая нашла и промолчала,
+        отвечает «всё хорошо» о памяти, в которой сама же нашла поломку.
+
+        Вход даёт предупреждение БЕЗ единой ошибки: только на таком и видно
+        разницу между «молчит, когда нечего сказать» и «молчит всегда».
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - раз\n- [Профиль](user2.md) - два\n",
+            "user.md": "факт\n",
+            "user2.md": "см. [[net_takogo_fakta]] рядом\n",
+        })
+        code, output = self.run_linter("--quiet")
+        self.assertEqual(code, 0, output)
+        self.assertIn("L3", output)
+        self.assertIn("L4", output)
+        self.assertIn("net_takogo_fakta", output)
 
     def test_quiet_still_shows_warnings_that_explain_errors(self):
         """При блокировке причина нужна: иначе обвинения без объяснения."""
