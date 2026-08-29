@@ -80,10 +80,13 @@ MUTATIONS = [
     ("адрес метки не понимает угловые скобки", LINTER,
      r'DEFINITION = re.compile(r"^\[([^\]]+)\]:\s*(<[^>]*>|\S+)")',
      r'DEFINITION = re.compile(r"^\[([^\]]+)\]:\s*(\S+)")'),
-    ("метка orphan-ok действует изнутри блока кода", LINTER,
-     "        if mark:\n            opened_fence = mark\n            continue\n"
-     '        if COMMENT_ORPHAN.search(INLINE_CODE.sub("", line)):',
-     '        if COMMENT_ORPHAN.search(INLINE_CODE.sub("", line)):'),
+    # Две мутации про метку-комментарий («действует изнутри блока кода» и
+    # «действует из инлайнового кода») удалены вместе с самой меткой: способ
+    # пометить файл теперь один, и держится он шапкой, а не обходом заборов.
+    ("метка orphan читается не только из шапки", LINTER,
+     "    head, unclosed_head = frontmatter_lines(text)\n"
+     "    return any(FRONTMATTER_ORPHAN.match(line) for line in head)",
+     "    return any(FRONTMATTER_ORPHAN.match(line) for line in text.splitlines())"),
     ("граница имени файла справа снята", LINTER,
      r'MD_ANCHOR = re.compile(r"\.md(?![\w\-])(?!\.\w)", re.I)',
      r'MD_ANCHOR = re.compile(r"\.md", re.I)'),
@@ -184,9 +187,6 @@ MUTATIONS = [
     ("под --quiet найденное снова прячется", LINTER,
      "    for line in warnings:\n        print(line)",
      "    if not args.quiet:\n        for line in warnings:\n            print(line)"),
-    ("метка orphan-ok снова действует из инлайнового кода", LINTER,
-     '        if COMMENT_ORPHAN.search(INLINE_CODE.sub("", line)):',
-     "        if COMMENT_ORPHAN.search(line):"),
     ("строка индекса без адреса пропускается молча", LINTER,
      '                errors.append(\n'
      '                    "L1 %s:%d строка без адреса: «%s». Допишите путь к файлу в "\n'

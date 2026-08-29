@@ -633,14 +633,51 @@ class FilesAppearInIndex(MemoryFixture):
         self.assertEqual(code, 1, output)
         self.assertIn("howto.md", output)
 
-    def test_html_comment_marker_allows_file_outside_index(self):
+    def test_html_comment_marker_no_longer_excuses_a_file(self):
+        """Способ пометить файл ровно один - `orphan: true` в шапке.
+
+        Комментарий `<!-- linter: orphan-ok -->` значил ровно то же самое и
+        удалён: два написания одного и того же - это два прочтения. И он был
+        самой дорогой строчкой функциональности во всём файле: метку в теле
+        приходилось искать вне блоков кода и вне бэктиков, иначе заметка ПРО
+        метку освобождала себя. На этом сгорели два круга ревью подряд.
+        """
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто пользователь\n",
             "user.md": "факт\n",
             "zametka.md": "<!-- linter: orphan-ok -->\n\nвторой способ пометки\n",
         })
         code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertTrue(findings(output, "L2"), output)
+
+    def test_frontmatter_marker_excuses_a_file(self):
+        """Вторая половина пары: оставшийся способ обязан работать."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто пользователь\n",
+            "user.md": "факт\n",
+            "zagotovka.md": "---\nname: zagotovka\norphan: true\n---\n\nчерновик\n",
+        })
+        code, output = self.run_linter()
         self.assertEqual(code, 0, output)
+
+    def test_marker_in_the_body_does_not_excuse_the_file(self):
+        """Инвариант, ради которого метку и читают только из шапки.
+
+        Файл, ОБЪЯСНЯЮЩИЙ метку, не должен освобождать себя. Прежде это
+        держалось обходом заборов и бэктиков, и каждая починка закрывала одну
+        лазейку, открывая соседнюю. Теперь держится конструкцией: шапка - это
+        шапка, в примере кода её не бывает.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто пользователь\n",
+            "user.md": "факт\n",
+            "zametka.md": "Чтобы исключить файл, впишите в шапку "
+                          "`orphan: true` - вот так:\n\n```\norphan: true\n```\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("zametka.md", output)
 
     def test_allow_orphan_glob_excludes_file(self):
         self.write({
@@ -1250,62 +1287,26 @@ class PanelReviewFindings(MemoryFixture):
         self.assertEqual(code, 1, output)
         self.assertIn("net-takogo.md", output)
 
-    def test_orphan_marker_works_below_the_twentieth_line(self):
-        """Метка-комментарий не должна зависеть от того, на какой она строке.
+    def test_marker_works_anywhere_in_a_long_frontmatter(self):
+        """Метка не зависит от того, какой строкой шапки записана.
 
-        Наша же конвенция памяти - шапка плюс обязательные разделы - легко
-        съедает двадцать строк раньше, чем автор дойдёт до пометки.
+        Прежде здесь проверялась метка-комментарий и её независимость от
+        номера строки в теле - вместе с меткой этот вопрос не исчез, а
+        переехал: наша конвенция держит в шапке и `name`, и `description`, и
+        `metadata`, так что `orphan` легко оказывается не первым.
+
+        Три соседних теста, проверявшие метку в блоке кода, в бэктиках и в
+        прозе, удалены вместе с ней. Инвариант, ради которого они писались -
+        файл, ОБЪЯСНЯЮЩИЙ метку, себя не освобождает, - теперь держится
+        конструкцией и проверяется в FilesAppearInIndex.
         """
-        head = "---\n" + "".join("pole_%d: znachenie\n" % i for i in range(1, 19)) + "---\n"
+        head = ("---\nname: draft\n"
+                + "".join("pole_%d: znachenie\n" % i for i in range(1, 19))
+                + "orphan: true\n---\n")
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n",
             "user.md": "факт\n",
-            "draft.md": head + "\nТекст заметки.\n\n<!-- linter: orphan-ok -->\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-
-    def test_marker_inside_a_fence_still_does_not_free_the_file(self):
-        """Снятие лимита строк не должно вернуть дефект с меткой в блоке кода."""
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n",
-            "user.md": "факт\n",
-            "zametka.md": "Заметка про линтер.\n" * 30 +
-                          "\n```\n<!-- linter: orphan-ok -->\n```\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        self.assertIn("zametka.md", output)
-
-    def test_marker_in_inline_code_does_not_free_the_file(self):
-        """Метка, названная в прозе, - это её название, а не она сама.
-
-        Блок кода уже пропускался, но заметка объясняет метку обычно одной
-        строкой посреди абзаца, без блока: «поставьте `<!-- linter:
-        orphan-ok -->` в текст». Такой файл молча освобождал сам себя -
-        ровно то, ради чего `orphan: true` читается только из шапки.
-        """
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n",
-            "user.md": "факт\n",
-            "zametka.md": "Чтобы исключить файл, поставьте "
-                          "`<!-- linter: orphan-ok -->` в его текст.\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        self.assertIn("zametka.md", output)
-
-    def test_real_marker_in_prose_still_frees_the_file(self):
-        """Вторая половина пары: настоящая метка обязана работать по-прежнему.
-
-        Без этого теста правка выше закрывала бы одну сторону и открывала
-        другую - метка перестала бы действовать вообще, и человек, честно
-        её поставивший, получал бы вечное обвинение.
-        """
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n",
-            "user.md": "факт\n",
-            "zagotovka.md": "Черновик.\n\n<!-- linter: orphan-ok -->\n",
+            "draft.md": head + "\nТекст заметки.\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
@@ -2534,11 +2535,11 @@ class SilentFailures(MemoryFixture):
         self.assertIn("zametka.md", output)
 
     def test_real_orphan_marker_still_frees_the_file(self):
-        """Обратная сторона: настоящая метка вне блока кода работать не перестала."""
+        """Обратная сторона: настоящая метка работать не перестала."""
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n",
             "user.md": "факт\n",
-            "zagotovka.md": "<!-- linter: orphan-ok -->\n\nчерновик\n",
+            "zagotovka.md": "---\nname: zagotovka\norphan: true\n---\n\nчерновик\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
