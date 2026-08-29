@@ -2899,6 +2899,70 @@ class PreCommitHook(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
 
+    def test_untracked_draft_does_not_block_a_healthy_commit(self):
+        """Черновик, которого в коммите нет, блокировал коммит, в котором всё цело.
+
+        Git кладёт в коммит только добавленное, а проверка ходит по диску -
+        это две разные кучи файлов. Недописанный черновик в папке памяти -
+        нормальное рабочее состояние, а человек получал «файл не упомянут в
+        индексе» и блокировку за то, чего в коммите нет. Дважды получив её,
+        он заводит привычку к --no-verify, и вместе с ней выключает L1 и L2.
+
+        Черновик лежит в ПОДПАПКЕ намеренно: ключ ждёт путь относительно
+        папки памяти, а git отдаёт его от корня репозитория. На файле в
+        корне памяти обе реализации - со срезом префикса и без - дают один
+        и тот же результат, и тест ничего бы не гарантировал.
+        """
+        self.write_memory("- [Профиль](user.md) - кто\n- [Второй](two.md) - крючок\n",
+                          {"two.md": "второй факт\n"})
+        os.makedirs(os.path.join(self.repo, "memory", "chernoviki"))
+        with io.open(os.path.join(self.repo, "memory", "chernoviki", "draft.md"),
+                     "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("ещё не дописано\n")
+        self.git("add", "memory/MEMORY.md", "memory/user.md", "memory/two.md")
+
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, text)
+        self.assertNotIn("draft.md", text)
+
+    def test_staged_file_outside_the_index_still_blocks(self):
+        """Вторая половина пары: то, что уезжает в коммит, спрашивается как прежде.
+
+        Иначе правка выше превратилась бы в дыру: достаточно было бы не
+        упоминать файл в индексе, чтобы проверка молчала.
+        """
+        self.write_memory("- [Профиль](user.md) - кто\n",
+                          {"zabytyj.md": "факт мимо индекса\n"})
+        self.git("add", "-A")
+
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("zabytyj.md", text)
+
+    def test_tracked_file_is_not_excused_by_being_uncommitted(self):
+        """Отслеживаемый файл под исключение не попадает, даже если правки не сохранены.
+
+        Исключение узкое - только то, что в репозиторий не поедет вовсе.
+        Спутать «git о нём не знает» с «изменения ещё не закоммичены» значило
+        бы отпустить половину памяти.
+        """
+        self.write_memory("- [Профиль](user.md) - кто\n- [Второй](two.md) - крючок\n",
+                          {"two.md": "второй факт\n"})
+        self.git("add", "-A")
+        self.git("-c", "user.email=t@e.st", "-c", "user.name=test",
+                 "commit", "-qm", "init")
+        # Файл отслеживается, но из индекса его убрали - строка на него остаётся.
+        self.write_memory("- [Профиль](user.md) - кто\n- [Второй](two.md) - крючок\n")
+        os.remove(os.path.join(self.repo, "memory", "two.md"))
+        self.git("add", "-A")
+
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 1, text)
+        self.assertIn("L1", text)
+
     def fake_python3(self, body):
         """Кладёт в PATH подставной python3 и возвращает окружение с ним."""
         folder = tempfile.mkdtemp(prefix="memcheck-bin-")
