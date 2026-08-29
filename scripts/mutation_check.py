@@ -235,6 +235,15 @@ MUTATIONS = [
      "    for stray in []:"),
 
     # --- хук ---
+    ("на пропущенном коммите снова печатается всё дерево", HOOK,
+     '    say "pre-commit: поставьте Python 3.9+ либо отключите хук."\n'
+     "    advise_briefly",
+     '    say "pre-commit: поставьте Python 3.9+ либо отключите хук."\n'
+     "    advise_how_to_disable"),
+    ("короткая форма молчит про core.hooksPath", HOOK,
+     '    say "pre-commit: ключ core.hooksPath вслепую не снимайте - у husky в нём"\n'
+     '    say "pre-commit: лежит свой набор, и он уберётся молча, без ошибки."',
+     '    say "pre-commit: подробности - в README."'),
     ("печать подсказки снова может уронить хук", HOOK,
      "    printf '%s\\n' \"$*\" >&2 || :", "    printf '%s\\n' \"$*\" >&2"),
     ("хук блокирует коммит на непроверяемом прогоне", HOOK,

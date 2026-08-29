@@ -3166,6 +3166,30 @@ class DocumentationMatchesReality(unittest.TestCase):
         """Тот же разрушительный совет не должен переехать из хука в документацию."""
         self.assertNotIn("--unset core.hooksPath", self.readme())
 
+    def test_section_the_hook_points_at_exists(self):
+        """Хук отсылает к разделу README - раздел обязан существовать.
+
+        Дерево решений «как отключить» переехало из вывода в документацию:
+        десять строк на КАЖДОМ успешном коммите - тот самый шум, от которого
+        начинают пролистывать вывод. Взамен хук печатает ссылку, а ссылка,
+        ведущая в никуда, - ровно тот дефект, который эта проверка ищет в
+        чужих памятях.
+
+        Имя раздела достаём из самого хука, а не пишем здесь второй раз:
+        иначе переименование в хуке разъехалось бы с тестом молча.
+        """
+        with io.open(HOOK, encoding="utf-8") as fh:
+            hook = fh.read()
+        named = re.search(r"README, раздел «([^»]+)»", hook)
+        self.assertIsNotNone(named, "хук больше не ссылается на раздел README")
+        heading = "## " + named.group(1)
+        readme = self.readme()
+        self.assertTrue(
+            any(line.strip().lstrip("#").strip() == named.group(1)
+                for line in readme.splitlines() if line.lstrip().startswith("#")),
+            "в README нет раздела «%s», на который ссылается хук (искали %r)"
+            % (named.group(1), heading))
+
 
 
 class PreCommitHook(unittest.TestCase):
@@ -3380,6 +3404,45 @@ class PreCommitHook(unittest.TestCase):
         self.git("add", "-A")
         result = self.run_hook()
         self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
+
+    def test_skipping_branch_does_not_lecture_on_every_commit(self):
+        """Пропустили коммит - значит человек не заперт, и лекция ему не нужна.
+
+        Измерено на живом репозитории: успешный коммит без Питона печатал
+        ДВЕНАДЦАТЬ строк, из них десять - дерево решений «как отключить», и
+        так на каждом коммите, пока Питон не появится. Это ровно тот шум, про
+        который проверка сама предупреждает: он приучает пролистывать вывод,
+        а оттуда рукой подать до --no-verify.
+
+        Три строки диагноза и ссылка на README остаются - вместе с
+        предупреждением про ключ core.hooksPath, которое и есть главное, что
+        нельзя потерять при сокращении. Полное дерево остаётся в блокирующей
+        ветке: там человек заперт, и выход ему нужен немедленно (за этим
+        следит test_unusual_exit_code_is_not_called_a_memory_problem).
+        """
+        self.write_memory("- [Профиль](user.md) - кто\n", {"user.md": "факт\n"})
+        self.git("add", "-A")
+        # Заглушки на ВСЕ три имени: хук пробует python3, python и py, и с
+        # подменённым только первым он нашёл бы настоящий Питон, отработал
+        # начисто и напечатал пусто - тест проходил бы, ничего не проверяя.
+        folder = tempfile.mkdtemp(prefix="memcheck-bin-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        body = '#!/bin/sh\ncase "$*" in *version_info*) exit 1 ;; *) exit 0 ;; esac\n'
+        for name in ("python3", "python", "py"):
+            stub = os.path.join(folder, name)
+            with io.open(stub, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(body)
+            os.chmod(stub, 0o755)
+        env = dict(os.environ,
+                   PATH=folder + os.pathsep + os.environ.get("PATH", ""))
+        result = self.run_hook(env)
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, text)
+        printed = [line for line in text.splitlines() if "pre-commit:" in line]
+        self.assertLessEqual(len(printed), 6,
+                             "на пропущенном коммите снова лекция:\n%s" % text)
+        self.assertIn("core.hooksPath", text)
+        self.assertNotIn("--show-origin", text)
 
     def test_ignores_fake_python3_stub(self):
         """python3 на Windows часто заглушка Microsoft Store, а не Питон.
