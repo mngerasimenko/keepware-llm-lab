@@ -542,14 +542,29 @@ class IndexParsing(MemoryFixture):
         self.assertIn("MEMORY.md: ни одной строки формата", output)
 
     def test_format_hint_names_the_index_that_failed(self):
-        """При кривом корневом и рабочем под-индексе иначе не понять, где чинить."""
+        """При кривом корневом и рабочем под-индексе иначе не понять, где чинить.
+
+        Под-индекс тут настоящий - `infra/MEMORY.md`, файл с тем же именем в
+        подпапке. Прежняя фикстура клала рядом с корневым `MEMORY_infra.md`,
+        а в строгой модели это вообще не индекс: индексов в памяти был ОДИН,
+        и на таком входе «считаем по каждому индексу отдельно» неотличимо от
+        «считаем по всем сразу» - тест не гарантировал ничего.
+
+        Различие видно только на двух индексах: корневой в формате таблицы
+        разобрался в ноль строк, под-индекс - нормально. Общий счётчик тут
+        ненулевой, и реализация «по всем сразу» промолчала бы, оставив
+        человека со стеной сирот без единого намёка на причину.
+        """
         self.write({
-            "MEMORY.md": "| Заголовок | Файл |\n|---|---|\n| Инфра | MEMORY_infra.md |\n",
-            "MEMORY_infra.md": "- [Сервер](server.md) - прод\n",
-            "server.md": "факт\n",
+            "MEMORY.md": "| Заголовок | Файл |\n|---|---|\n| Инфра | infra/MEMORY.md |\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
         })
         _code, output = self.run_linter()
-        self.assertIn("MEMORY.md:", output)
+        named = [line for line in output.splitlines()
+                 if line.startswith("MEMORY.md:") and "ни одной строки" in line]
+        self.assertEqual(len(named), 1, output)
+        self.assertNotIn("infra/MEMORY.md: ни одной строки", output)
 
     def test_bom_and_crlf_index_is_read(self):
         self.write({"MEMORY.md": "- [Профиль](user.md) - кто\n"},
@@ -988,6 +1003,29 @@ class SmallerFindings(MemoryFixture):
         })
         code, output = self.run_linter("--allow-orphan", "templates\\*.md")
         self.assertEqual(code, 0, output)
+
+
+class OwnMemoryIsConsistent(unittest.TestCase):
+    """Проверка обязана проходить на памяти собственного репозитория.
+
+    До сих пор это был только шаг CI: локально, перед коммитом, инструмент на
+    своей же памяти не запускался ни разу. Репозиторий выкладывается как
+    образец подхода - память в нём часть примера, и разъехаться ей нельзя;
+    узнавать об этом из красной галочки после push поздно и стыдно.
+
+    Заодно это единственный тест, который гоняет проверку на НЕ синтетическом
+    входе: все остальные строят память из словаря в паре строк.
+    """
+
+    def test_repository_memory_passes(self):
+        folder = os.path.join(REPO_DIR, "memory")
+        if not os.path.isdir(folder):
+            self.skipTest("папки memory рядом нет - набор гоняется не в "
+                          "репозитории инструмента")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = linter.main([folder])
+        self.assertEqual(code, 0, out.getvalue() + err.getvalue())
 
 
 class CiGuards(unittest.TestCase):
@@ -2937,6 +2975,36 @@ class HintsDoNotOverclaim(MemoryFixture):
         self.assertEqual(len(findings(output, "L2")), 1, output)
         self.assertIn("zabytyj.md", findings(output, "L2")[0])
         self.assertIn("`- [Заголовок](zabytyj.md) - крючок`", output)
+
+    def test_unreadable_file_is_not_excused_as_a_deliberate_orphan(self):
+        """Нечитаемый файл - это не «лежит вне индекса намеренно».
+
+        Ветку держал единственный тест - про битый симлинк, - и на Windows он
+        пропускается: нужны привилегии на создание ссылок. То есть на машине,
+        с которой инструмент разрабатывали, эту ветку не проверяло НИЧТО, а
+        мутации у неё не было вовсе. Дыра, прикрытая зелёной галочкой.
+
+        Подменяем чтение вместо того, чтобы отбирать права: вход перестаёт
+        зависеть и от системы, и от привилегий, и ветка проверяется везде.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "draft.md": "черновик\n",
+        })
+        real_read = linter.read_text
+
+        def refuse_one(path):
+            if path.replace(os.sep, "/").endswith("/draft.md"):
+                raise OSError(13, "нет доступа")
+            return real_read(path)
+
+        with unittest.mock.patch.object(linter, "read_text", refuse_one):
+            code, output = self.run_linter()
+
+        self.assertEqual(code, 1, output)
+        self.assertTrue(findings(output, "L2"), output)
+        self.assertIn("draft.md", output)
 
     def test_orphan_message_names_both_lawful_actions(self):
         """Самая частая находка обязана говорить, что делать.

@@ -107,6 +107,13 @@ MUTATIONS = [
      "        if where not in reachable:\n            continue", "        pass"),
     ("метка orphan на под-индексе отмывает ветку за ним", LINTER,
      "            if is_orphan_ok(exact[rel]):", "            if True:"),
+    # Та же конструкция стоит в has_unclosed_frontmatter, поэтому якорь
+    # дотянут до следующей строки кода - она у двух функций разная.
+    ("нечитаемый файл сходит за намеренную сироту", LINTER,
+     "    except OSError:\n        return False\n"
+     "    head, unclosed_head = frontmatter_lines(text)",
+     "    except OSError:\n        return True\n"
+     "    head, unclosed_head = frontmatter_lines(text)"),
     ("обход скрытого перестал помнить посещённые узлы", LINTER,
      "            if (actual_rel in seen or actual_rel == start\n"
      "                    or actual_rel in reachable or actual_rel in referenced):",
@@ -119,6 +126,9 @@ MUTATIONS = [
      "    allow_globs = list(allow_globs)"),
     ("дубли заголовков не сообщаются", LINTER,
      "        if len(paths) > 1:", "        if False:"),
+    ("пустые индексы считаются по всем сразу, а не по одному", LINTER,
+     "            for where in empty_indexes:",
+     "            for where in (empty_indexes if row_count == 0 else []):"),
     # Плаcходержатели убираем вместе с текстом: настоящая регрессия выглядит
     # именно так - действие выпало целиком, а строка осталась связной.
     ("сообщение про сироту снова без действия", LINTER,
