@@ -2752,21 +2752,39 @@ class WikiLinksBetweenFacts(MemoryFixture):
         code, _output = self.run_linter()
         self.assertEqual(code, 0)
 
-    def test_link_resolves_by_file_name_and_by_name_field(self):
-        """Имён у памяти два, и в живых памятях они расходятся у большинства.
+    def test_link_resolves_by_the_file_name_only(self):
+        """Имя у памяти одно - имя её файла.
 
-        Проверять только имя файла значило бы выдумывать нарушения там, где
-        человек сослался по полю name - той самой форме, которую README и
-        называет «[[их-name]]».
+        Прежде ссылка засчитывалась и по полю `name` из шапки. Это был
+        обработчик вместо правила: два написания на одну память, и промахнуться
+        мимо обоих оказывалось легче, чем попасть. За совпадение поля с именем
+        файла отвечает теперь L5, а L4 разрешает ровно одно имя.
         """
         self.write({
             "MEMORY.md": self.INDEX,
-            "user.md": "см. [[feedback_rule]] и [[pravilo-korotko]]\n",
-            "feedback_rule.md": "---\nname: pravilo-korotko\n---\n\nправило\n",
+            "user.md": "см. [[feedback_rule]] рядом\n",
+            "feedback_rule.md": "---\nname: feedback_rule\n---\n\nправило\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
         self.assertFalse(findings(output, "L4"), output)
+
+    def test_link_by_the_name_field_no_longer_counts(self):
+        """Вторая половина пары: второе написание больше не принимается.
+
+        Ссылка по полю `name`, разошедшемуся с именем файла, - ровно тот
+        случай, ради которого правило и вводилось. Тут он виден дважды: как
+        битая связь L4 и как расхождение имён L5.
+        """
+        self.write({
+            "MEMORY.md": self.INDEX,
+            "user.md": "см. [[pravilo-korotko]] рядом\n",
+            "feedback_rule.md": "---\nname: pravilo-korotko\n---\n\nправило\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertTrue(findings(output, "L4"), output)
+        self.assertTrue(findings(output, "L5"), output)
 
     def test_link_with_a_caption_resolves(self):
         self.write({
@@ -3106,7 +3124,7 @@ class SummaryTellsWhatBlocks(MemoryFixture):
         self.assertTrue(findings(output, "L4"), output)
         self.assertIn("Нарушений: 1", output)
         self.assertIn("предупреждений: 1", output)
-        self.assertIn("Блокируют коммит только", output)
+        self.assertIn("Блокируют коммит L1", output)
 
     def test_the_legend_is_not_mistaken_for_a_finding(self):
         """Легенда называет коды словами - и не должна сойти за находку.

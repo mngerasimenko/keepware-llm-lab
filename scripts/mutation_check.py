@@ -158,8 +158,11 @@ MUTATIONS = [
     # --- L4: ссылки [[...]] между фактами ---
     ("битые ссылки [[...]] не сообщаются", LINTER,
      "    dangling = dangling_wiki_links(exact, cache)", "    dangling = []"),
-    ("ссылка [[...]] не резолвится по полю name", LINTER,
-     "                forms.add(match.group(1).strip())", "                pass"),
+    ("расхождение имени файла и поля name не ошибка", LINTER,
+     "                if declared != expected:", "                if False:"),
+    ("L5 сравнивает имена без учёта регистра", LINTER,
+     "                expected = os.path.splitext(os.path.basename(rel))[0]",
+     "                expected = declared"),
     ("проза в двойных скобках считается ссылкой", LINTER,
      r'WIKI_LINK = re.compile(r"\[\[([^\s\[\]|#]{2,})(?:#[^\]|\n]*)?(?:\|[^\]\n]*)?\]\]")',
      r'WIKI_LINK = re.compile(r"\[\[([^\[\]|#]{2,})(?:#[^\]|\n]*)?(?:\|[^\]\n]*)?\]\]")'),
