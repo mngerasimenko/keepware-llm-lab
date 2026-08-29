@@ -177,6 +177,53 @@ class IndexLinksToFiles(MemoryFixture):
         self.assertEqual(code, 1, output)
         self.assertIn("регистр", output.lower())
 
+    def test_every_l1_message_names_an_action(self):
+        """Инструмент не должен вести себя по-разному в зависимости от буквы.
+
+        L2 и L4 говорят, что делать, а пять из шести вариантов L1 называли
+        только диагноз. Читает вывод и человек, и агент, которому эту память
+        чинить: «ссылка в никуда: net.md» - верно и невыполнимо.
+
+        Вход поднимает пять вариантов сразу, чтобы правило проверялось как
+        правило, а не на одном удачном примере: новый вариант L1 без действия
+        покраснит этот тест.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Битая](net.md) - файла нет\n"
+                         "- [Без адреса]() - пусто\n"
+                         "- [Каталог](infra) - это папка\n"
+                         "- [Регистр](User2.md) - не тот регистр\n"
+                         "- [Метка][nowhere] - метка не определена\n",
+            "user.md": "факт\n",
+            "user2.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "сервер\n",
+        })
+        _code, output = self.run_linter()
+        lines = findings(output, "L1")
+        self.assertEqual(len(lines), 5, output)
+        imperatives = ("Создайте", "Допишите", "Сошлитесь", "Приведите",
+                       "Добавьте", "Перенесите", "уберите")
+        for line in lines:
+            self.assertTrue(any(word in line for word in imperatives),
+                            "сообщение без действия: %s" % line)
+
+    def test_broken_link_names_all_three_ways_out(self):
+        """Самый частый вариант L1 - и все три законных выхода из него.
+
+        Файл можно создать, путь поправить, а строку убрать, если факт
+        больше не нужен. Агенту важно, что выбор назван: иначе он выберет
+        первый попавшийся.
+        """
+        self.write({
+            "MEMORY.md": "- [Битая](net.md) - файла нет\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("Создайте этот файл либо поправьте путь", output)
+        self.assertIn("уберите строку", output)
+
     def test_case_mismatch_reports_exactly_one_error(self):
         """Один дефект - одна строка. Файл не должен всплыть ещё и как сирота."""
         self.write({

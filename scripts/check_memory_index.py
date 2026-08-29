@@ -943,16 +943,20 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             row_count += 1
             if kind == "ref-missing":
                 errors.append(
-                    "L1 %s:%d ссылка-метка «%s» нигде не определена: строки "
-                    "«[%s]: файл.md» в индексе нет"
-                    % (where, lineno, raw_target, raw_target)
+                    "L1 %s:%d ссылка-метка «%s» нигде не определена. Добавьте "
+                    "в %s строку `[%s]: имя-файла.md` либо замените ссылку на "
+                    "обычную: `- [Заголовок](имя-файла.md) - крючок`"
+                    % (where, lineno, raw_target, where, raw_target)
                 )
                 continue
             target = clean_target(raw_target)
             if not target:
                 # Прежде такая строка отбрасывалась вместе с якорями: человек
                 # видит строку в индексе и считает файл упомянутым, а адреса нет.
-                errors.append("L1 %s:%d строка без адреса: «%s»" % (where, lineno, title))
+                errors.append(
+                    "L1 %s:%d строка без адреса: «%s». Допишите путь к файлу в "
+                    "круглых скобках: `- [%s](имя-файла.md) - крючок`"
+                    % (where, lineno, title, title))
                 continue
             if target.startswith("#"):
                 continue  # якорь внутри того же документа - не ссылка на файл
@@ -967,7 +971,8 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                 errors.append(
                     "L1 %s:%d ссылка выходит за папку памяти: %s "
                     "(такой путь разрешается по-разному в зависимости от того, "
-                    "откуда открыли файл)" % (where, lineno, target)
+                    "откуда открыли файл). Перенесите файл внутрь папки памяти "
+                    "и сошлитесь на него оттуда" % (where, lineno, target)
                 )
                 continue
 
@@ -994,17 +999,29 @@ def check(root, index_paths, allow_globs, index_name, file_map):
 
             if hit is not None:
                 continue
+            # Действие называем в каждой ветке. Инструмент, который про одну
+            # находку говорит «что делать», а про соседнюю только «что не
+            # так», ведёт себя по-разному в зависимости от того, какую букву
+            # напечатал, - а читать его будет и человек, и агент, которому
+            # эту память чинить.
             if twin is not None:
                 errors.append(
                     "L1 %s:%d регистр не совпадает: в индексе «%s», на диске «%s» "
-                    "(на Windows пройдёт, в CI на Linux упадёт)"
-                    % (where, lineno, rel, relative_to_root(root, twin))
+                    "(на Windows пройдёт, в CI на Linux упадёт). Приведите ссылку "
+                    "к тому, что на диске: `%s`"
+                    % (where, lineno, rel, relative_to_root(root, twin),
+                       relative_to_root(root, twin))
                 )
             elif os.path.isdir(absolute):
-                errors.append("L1 %s:%d ссылка на каталог, а не на файл: %s"
-                              % (where, lineno, target))
+                errors.append(
+                    "L1 %s:%d ссылка на каталог, а не на файл: %s. Сошлитесь на "
+                    "файл внутри него - например `%s/%s`"
+                    % (where, lineno, target, target.rstrip("/"), index_name))
             else:
-                errors.append("L1 %s:%d ссылка в никуда: %s" % (where, lineno, target))
+                errors.append(
+                    "L1 %s:%d ссылка в никуда: %s. Создайте этот файл либо "
+                    "поправьте путь в строке индекса; если файл больше не нужен "
+                    "- уберите строку" % (where, lineno, target))
 
     # Ноль разобранных строк - это «я не понял индекс», а не «память разъехалась».
     # Ошибкой это быть не должно: иначе первый же коммит новой, ещё пустой памяти

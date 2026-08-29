@@ -164,8 +164,16 @@ MUTATIONS = [
      '        if COMMENT_ORPHAN.search(INLINE_CODE.sub("", line)):',
      "        if COMMENT_ORPHAN.search(line):"),
     ("строка индекса без адреса пропускается молча", LINTER,
-     '                errors.append("L1 %s:%d строка без адреса: «%s»" % (where, lineno, title))',
+     '                errors.append(\n'
+     '                    "L1 %s:%d строка без адреса: «%s». Допишите путь к файлу в "\n'
+     '                    "круглых скобках: `- [%s](имя-файла.md) - крючок`"\n'
+     "                    % (where, lineno, title, title))",
      "                pass"),
+    ("сообщения L1 снова без действия", LINTER,
+     '                    "L1 %s:%d ссылка в никуда: %s. Создайте этот файл либо "\n'
+     '                    "поправьте путь в строке индекса; если файл больше не нужен "\n'
+     '                    "- уберите строку" % (where, lineno, target))',
+     '                    "L1 %s:%d ссылка в никуда: %s" % (where, lineno, target))'),
     ("расхождение регистра в ссылке не ошибка", LINTER,
      '                errors.append(\n                    "L1 %s:%d регистр не совпадает:',
      '                pass or errors.append(\n                    "L1 %s:%d регистр не совпадает:'),
