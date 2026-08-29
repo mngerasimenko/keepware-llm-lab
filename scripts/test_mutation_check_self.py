@@ -206,5 +206,59 @@ class AtomicWriteKeepsPermissions(unittest.TestCase):
             self.assertIn("exit 1", fh.read())
 
 
+class LineEndingsSurviveTheRewrite(unittest.TestCase):
+    """Инструмент не должен переводить чужие файлы в LF за компанию.
+
+    Читает он с трансляцией - иначе якоря, записанные через `\\n`, не нашлись
+    бы на CRLF-файле ни разу, - а писал всегда LF. В этом репозитории беды не
+    видно: `.gitattributes` держит LF. У того, кто скопировал инструмент на
+    CRLF-чекаут, первый же прогон переписывал `.githooks/pre-commit` и линтер
+    целиком, от первой строки до последней.
+    """
+
+    def written_back(self, newline):
+        folder = tempfile.mkdtemp(prefix="memcheck-eol-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, "file.txt")
+        with io.open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write("первая" + newline + "вторая" + newline)
+        text, seen = mutation_check.read_source(path)
+        mutation_check.write_atomically(path, text, seen)
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    def test_crlf_file_stays_crlf(self):
+        self.assertEqual(self.written_back("\r\n").count(b"\r\n"), 2)
+
+    def test_lf_file_stays_lf(self):
+        """Вторая половина пары: LF не должен превратиться в CRLF."""
+        written = self.written_back("\n")
+        self.assertNotIn(b"\r", written)
+        self.assertEqual(written.count(b"\n"), 2)
+
+    def test_backup_remembers_the_line_endings(self):
+        """Восстановление после обрыва тоже обязано вернуть те же окончания.
+
+        Иначе оно чинило бы одно и молча переписывало другое.
+        """
+        folder = tempfile.mkdtemp(prefix="memcheck-eol-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, "file.txt")
+        with io.open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write("первая\r\nвторая\r\n")
+        backup = os.path.join(folder, ".mutation-backup")
+
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup):
+            text, seen = mutation_check.read_source(path)
+            mutation_check.save_backup(path, text, seen)
+            with io.open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("МУТАЦИЯ\n")          # здесь прогон оборвали
+            with redirect_stdout(io.StringIO()):
+                mutation_check.restore_interrupted()
+
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read().count(b"\r\n"), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

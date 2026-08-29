@@ -255,6 +255,10 @@ MUTATIONS = [
      '    say "pre-commit: ключ core.hooksPath вслепую не снимайте - у husky в нём"\n'
      '    say "pre-commit: лежит свой набор, и он уберётся молча, без ошибки."',
      '    say "pre-commit: подробности - в README."'),
+    # Сохранение переводов строк (read_source) мутацией не проверяется: оно
+    # живёт в ЭТОМ файле, а инструмент правит только линтер и хук - мутировать
+    # сам себя во время прогона он не может. Ветку держат три теста в
+    # test_mutation_check_self.py (LineEndingsSurviveTheRewrite).
     ("печать подсказки снова может уронить хук", HOOK,
      "    printf '%s\\n' \"$*\" >&2 || :", "    printf '%s\\n' \"$*\" >&2"),
     # Якорь - только код: комментарий рядом к проверяемой ветке отношения не
@@ -284,7 +288,26 @@ MUTATIONS = [
 ]
 
 
-def write_atomically(path, text):
+def read_source(path):
+    """Текст файла и то, какими у него были переводы строк.
+
+    Читаем с трансляцией: якоря мутаций записаны через `\\n`, и на файле с
+    CRLF без неё не нашёлся бы ни один. Но записать обратно надо тем же, чем
+    было, - иначе первый же прогон молча переводит `.githooks/pre-commit` и
+    линтер в LF целиком. В этом репозитории беды не видно, `.gitattributes`
+    держит LF; у того, кто скопировал инструмент на CRLF-чекаут, оба файла
+    после прогона оказываются переписаны от первой строки до последней.
+
+    Смешанные окончания (кортеж) сводим к LF: гадать, какое из двух вернуть,
+    нельзя, а файл и так уже неоднороден.
+    """
+    with io.open(path, encoding="utf-8") as stream:
+        text = stream.read()
+        seen = stream.newlines
+    return text, seen if isinstance(seen, str) else "\n"
+
+
+def write_atomically(path, text, newline="\n"):
     """Замена содержимого без окна, в котором файл пуст.
 
     `open(path, "w")` усекает файл до нуля ЕЩЁ ДО записи. Между усечением и
@@ -310,7 +333,7 @@ def write_atomically(path, text):
             os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
         except OSError:
             pass  # оригинала ещё нет - оставляем права по умолчанию
-        with io.open(handle, "w", encoding="utf-8", newline="\n") as stream:
+        with io.open(handle, "w", encoding="utf-8", newline=newline) as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
@@ -323,9 +346,19 @@ def write_atomically(path, text):
         raise
 
 
-def save_backup(path, text):
-    """Кладёт оригинал рядом на время, пока файл мутирован."""
-    write_atomically(BACKUP, path + "\n" + text)
+NEWLINE_NAMES = {"\n": "lf", "\r\n": "crlf", "\r": "cr"}
+NEWLINE_BY_NAME = {name: value for value, name in NEWLINE_NAMES.items()}
+
+
+def save_backup(path, text, newline="\n"):
+    """Кладёт оригинал рядом на время, пока файл мутирован.
+
+    В шапке слепка не только путь, но и вид переводов строк: восстановление
+    иначе вернуло бы содержимое в LF - то есть починило бы одно и молча
+    переписало другое.
+    """
+    header = "%s\t%s" % (path, NEWLINE_NAMES.get(newline, "lf"))
+    write_atomically(BACKUP, header + "\n" + text)
 
 
 def drop_backup():
@@ -341,11 +374,12 @@ def restore_interrupted():
         return False
     with io.open(BACKUP, encoding="utf-8") as stream:
         saved = stream.read()
-    path, _newline, text = saved.partition("\n")
+    header, _split, text = saved.partition("\n")
+    path, _tab, kind = header.partition("\t")
     if not path:
         drop_backup()
         return False
-    write_atomically(path, text)
+    write_atomically(path, text, NEWLINE_BY_NAME.get(kind, "\n"))
     drop_backup()
     print("Прошлый прогон был оборван на середине - %s восстановлен из слепка."
           % path)
@@ -438,13 +472,13 @@ def main():
 
     survived = []
     for number, (name, path, old, new) in enumerate(MUTATIONS, 1):
-        original = io.open(path, encoding="utf-8").read()
-        save_backup(path, original)
+        original, newline = read_source(path)
+        save_backup(path, original, newline)
         try:
-            write_atomically(path, original.replace(old, new))
+            write_atomically(path, original.replace(old, new), newline)
             caught = suite_fails()
         finally:
-            write_atomically(path, original)
+            write_atomically(path, original, newline)
             drop_backup()
         print("[%2d/%d] %-8s %s" % (number, len(MUTATIONS),
                                     "поймана" if caught else "ВЫЖИЛА", name))
