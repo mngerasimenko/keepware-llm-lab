@@ -2765,6 +2765,48 @@ class HintsDoNotOverclaim(MemoryFixture):
         self.assertIn("infra/user.md", output)
         self.assertNotIn("ссылкой не разобралось", output)
 
+    def test_orphan_message_names_both_lawful_actions(self):
+        """Самая частая находка обязана говорить, что делать.
+
+        Ответов два: внести файл в индекс либо объявить, что он лежит вне
+        него намеренно. Ни один в сообщении не назывался. Заодно это
+        единственное место, где вывод произносит `orphan` - слово, которое
+        связывает его с ключом --allow-orphan и с разделом README. Термин
+        «сирота» в выводе не встречался ни разу, и человек, ищущий свою
+        ошибку по тексту сообщения, документацию не находил.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "draft.md": "черновик\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("`- [Заголовок](draft.md) - крючок`", output)
+        self.assertIn("orphan: true", output)
+
+    def test_stranded_file_points_at_the_index_not_at_itself(self):
+        """Вторая половина пары: чинить надо путь до индекса, а не файл.
+
+        Файл за недостижимым под-индексом ни в чём не виноват, и правка его
+        шапки ничего не даст. Совет обязан указывать на под-индекс, который
+        его перечисляет, - вход с файлом в ПОДПАПКЕ различает эти два адреса,
+        на файле в корне они совпали бы.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "сервер\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        stranded = [line for line in output.splitlines()
+                    if "infra/server.md не упомянут" in line]
+        self.assertEqual(len(stranded), 1, output)
+        self.assertIn("`- [Заголовок](infra/MEMORY.md) - крючок`", stranded[0])
+        self.assertNotIn("(infra/server.md) - крючок", stranded[0])
+
     def test_unique_name_still_gets_the_format_hint(self):
         """Вторая половина пары: без однофамильца подсказка обязана остаться.
 
