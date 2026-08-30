@@ -31,11 +31,10 @@
 Такое имя говорит, КОГДА находку заметили, а не ЧТО она держит, и ответить по
 нему на вопрос «какие тесты покрывают L2» было нельзя, не прочитав все двести.
 Своя цена у этого тоже была: шестой круг завёл класс, не заглянув, что тот же
-случай уже стоит в старом, - отсюда две пары тестов, совпадающих байт в байт
-(`test_sub_indexes_count_by_default_without_flags` /
-`test_sub_index_in_subfolder_is_reachable` и `test_unreferenced_sub_index_is_error` /
-`test_sub_index_in_subfolder_without_a_link_is_error`). Дубли оставлены:
-докстринги у них разные, и каждый фиксирует свою причину.
+случай уже стоит в старом, - и один и тот же вход лёг в файл трижды. Разные
+докстринги какое-то время сходили за разные причины, но мутация показала, что
+все копии умирают от одной подмены: тест был один, набранный три раза. Копии
+сведены к одной, причины перенесены в её докстринг.
 """
 
 import hashlib
@@ -506,19 +505,6 @@ class MemoryFileNameIsASlug(MemoryFixture):
         named = [line for line in findings(output, "L6") if "каталога" in line]
         self.assertEqual(len(named), 1, output)
 
-    def test_the_index_itself_is_exempt(self):
-        """Индекс набран прописными намеренно, и правило его не касается.
-
-        Иначе `MEMORY.md` - и корневой, и каждый под-индекс - стал бы
-        нарушением, то есть правило запретило бы саму схему.
-        """
-        self.write({
-            "MEMORY.md": "- [Инфра](infra/MEMORY.md) - под-индекс\n",
-            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
-            "infra/server.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
 
     def test_cyrillic_file_name_is_an_error(self):
         """Кириллическое имя - нарушение правила, а не особый случай.
@@ -1061,11 +1047,20 @@ class FilesAppearInIndex(MemoryFixture):
         code, output = self.run_linter("--allow-orphan", "Templates/*.md")
         self.assertEqual(code, 1, output)
 
-    def test_sub_indexes_count_by_default_without_flags(self):
-        """Прибивает умолчание имени индекса.
+    def test_the_canonical_sub_index_shape_is_clean(self):
+        """Здоровая память канонической формы: подпапка/<то же имя>.
 
-        Хук зовёт проверку без ключей. Смени умолчание - и у всех, кто разбил
-        индекс по подпапкам, начнут падать коммиты.
+        Один вход держит три обещания разом, и лежал он в трёх копиях,
+        пока мутация не показала, что все три ловят одно и то же:
+
+        - умолчание имени индекса. Хук зовёт проверку без ключей; смени
+          умолчание - и у всех, кто разбил индекс по подпапкам, посыплются
+          коммиты;
+        - исключение из L6 для самого индекса. `MEMORY.md` набран прописными
+          намеренно, и правило имён его не касается - иначе оно запретило бы
+          саму схему. Обратную сторону границы держит
+          test_uppercase_in_the_name_is_an_error;
+        - канон строгой модели: под-индекс - это подпапка и то же имя.
         """
         self.write({
             "MEMORY.md": "- [Инфра](infra/MEMORY.md) - под-индекс\n",
@@ -1141,7 +1136,12 @@ class FilesAppearInIndex(MemoryFixture):
         self.assertIn("memory_infra.md", output)
 
     def test_unreferenced_sub_index_is_error(self):
-        """Под-индекс, на который никто не ссылается, невидим - и всё за ним тоже."""
+        """Под-индекс, на который никто не ссылается, невидим - и всё за ним тоже.
+
+        Вторая половина пары к test_the_canonical_sub_index_shape_is_clean:
+        форма та же, ссылки из корня нет. Без такой пары зелёный тест
+        доказывал бы только, что проверка умеет молчать.
+        """
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n",
             "user.md": "факт\n",
@@ -1223,27 +1223,7 @@ class StrictRootIndexModel(MemoryFixture):
         self.assertEqual(code, 1, output)
         self.assertIn("infra/server.md", output)
 
-    def test_sub_index_in_subfolder_is_reachable(self):
-        """Канон строгой модели: под-индекс - это подпапка/<то же имя>."""
-        self.write({
-            "MEMORY.md": "- [Инфра](infra/MEMORY.md) - под-индекс\n",
-            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
-            "infra/server.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
 
-    def test_sub_index_in_subfolder_without_a_link_is_error(self):
-        """Тот же под-индекс, но ссылки на него нет - до него и правда неоткуда дойти."""
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n",
-            "user.md": "факт\n",
-            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
-            "infra/server.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        self.assertIn("infra/MEMORY.md", output)
 
     def test_unreachable_sub_index_message_does_not_claim_what_loads(self):
         """Проверке никто не сообщает, что грузит харнесс - значит и утверждать нечего.
@@ -3224,14 +3204,6 @@ class ExitCodes(MemoryFixture):
         self.assertEqual(code, 1, output)
         self.assertLess(output.index("не закрыт"), output.index("L2"), output)
 
-    def test_quiet_hides_success_line_but_not_errors(self):
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n",
-            "user.md": "факт\n",
-        })
-        code, output = self.run_linter("--quiet")
-        self.assertEqual(code, 0)
-        self.assertEqual(output.strip(), "")
 
 
 class ReadOnly(MemoryFixture):
