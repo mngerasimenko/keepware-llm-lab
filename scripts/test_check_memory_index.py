@@ -261,14 +261,6 @@ class IndexLinksToFiles(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
 
-    def test_percent_encoded_name_resolves(self):
-        self.write({
-            "MEMORY.md": "- [Профиль](ok%20space.md) - пробел в имени\n",
-            "ok space.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-
     def test_external_url_is_not_checked(self):
         self.write({
             "MEMORY.md": "- [Дашборд](https://example.com/grafana) - внешний адрес\n"
@@ -282,14 +274,6 @@ class IndexLinksToFiles(MemoryFixture):
         self.write({
             "MEMORY.md": '- [Профиль](user.md "Профиль пользователя") - кто\n',
             "user.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-
-    def test_angle_bracket_destination_is_stripped(self):
-        self.write({
-            "MEMORY.md": "- [Профиль](<ok space.md>) - угловые скобки\n",
-            "ok space.md": "факт\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
@@ -347,10 +331,125 @@ class IndexLinksToFiles(MemoryFixture):
         self.assertEqual(code, 1, output)
         self.assertTrue(findings(output, "L1"), output)
 
-    def test_file_named_like_parent_dir_is_not_mistaken_for_escape(self):
+    def test_name_starting_with_dots_is_not_mistaken_for_escape(self):
+        """`..dotdot` - имя, а не выход наверх.
+
+        Имя файла памяти с точек теперь начинаться не может (L6), поэтому
+        проверяем на каталоге: правило про имена на них не распространяется,
+        а спутать «..dotdot/» с «../» по-прежнему нельзя.
+        """
         self.write({
-            "MEMORY.md": "- [Странное имя](..dotdot.md) - файл, а не выход наверх\n",
-            "..dotdot.md": "факт\n",
+            "MEMORY.md": "- [Странное имя](..dotdot/user.md) - каталог, не выход наверх\n",
+            "..dotdot/user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+
+class MemoryFileNameIsASlug(MemoryFixture):
+    """L6: имя файла памяти - строчная латиница, цифры, дефис, подчёркивание.
+
+    Имя здесь не украшение, а идентификатор: по нему ссылается индекс, по нему
+    же ведут [[связи]], и с ним обязано совпадать поле `name`. Пока оно могло
+    быть любым, каждая вольность обзаводилась своим обработчиком - пробел,
+    процент, регистр.
+
+    Замер на девяти живых памятях: 405 файлов, ни одного нарушения. Правило
+    описывает то, как уже пишут, - переименовывать нечего.
+    """
+
+    def test_space_in_the_name_is_an_error(self):
+        """Пробел - причина, по которой `[[имя со словами]]` не проверялось.
+
+        Ссылка отличается от прозы в двойных скобках только тем, что в имени
+        пробела не бывает. Пока он был возможен, приходилось выбирать: либо
+        врать на прозе, либо молчать о части ссылок.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Плохое](<moya zametka.md>) - с пробелом\n",
+            "user.md": "факт\n",
+            "moya zametka.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertTrue(findings(output, "L6"), output)
+
+    def test_uppercase_in_the_name_is_an_error(self):
+        """`User.md` и `user.md` на Windows один файл, на Linux два."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Плохое](Zametka.md) - прописная\n",
+            "user.md": "факт\n",
+            "Zametka.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertTrue(findings(output, "L6"), output)
+
+    def test_lawful_names_pass(self):
+        """Вторая половина пары: правило описывает то, как уже пишут.
+
+        Дефис, подчёркивание, цифры и файл в подпапке - всё это законно, и
+        правило не должно превращаться в запрет на нормальные имена.
+        """
+        self.write({
+            "MEMORY.md": "- [Раз](feedback_ask_dont_guess.md) - подчёркивания\n"
+                         "- [Два](project-vpscan-2026.md) - дефисы и цифры\n"
+                         "- [Три](infra/prod.md) - в подпапке\n",
+            "feedback_ask_dont_guess.md": "факт\n",
+            "project-vpscan-2026.md": "факт\n",
+            "infra/prod.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_directory_names_obey_the_rule_too(self):
+        """Каталог входит в адрес наравне с именем файла.
+
+        `- [Сервер](Моя Папка/prod.md)` - тот же пробел и та же
+        неоднозначность, только этажом выше. Пока правило кончалось на файлах,
+        ради подпапок приходилось держать разворачивание `%20`, угловые
+        скобки в адресе и нормализацию юникода: три механизма на случай,
+        которого правило не допускает. Три теста, проверявшие их на именах
+        каталогов, удалены - законным путём такие имена больше недостижимы.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Сервер](<ok space/prod.md>) - пробел в каталоге\n",
+            "user.md": "факт\n",
+            "ok space/prod.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        broken = [line for line in findings(output, "L6") if "каталога" in line]
+        self.assertEqual(len(broken), 1, output)
+
+    def test_a_bad_directory_is_named_once_not_per_file(self):
+        """Вторая половина пары: каталог называется один раз.
+
+        Иначе одно нарушение печаталось бы столько раз, сколько файлов внутри,
+        и человек читал бы стену вместо одной строки.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "Bad Dir/one.md": "факт\n",
+            "Bad Dir/two.md": "факт\n",
+            "Bad Dir/three.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        named = [line for line in findings(output, "L6") if "каталога" in line]
+        self.assertEqual(len(named), 1, output)
+
+    def test_the_index_itself_is_exempt(self):
+        """Индекс набран прописными намеренно, и правило его не касается.
+
+        Иначе `MEMORY.md` - и корневой, и каждый под-индекс - стал бы
+        нарушением, то есть правило запретило бы саму схему.
+        """
+        self.write({
+            "MEMORY.md": "- [Инфра](infra/MEMORY.md) - под-индекс\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
@@ -837,13 +936,13 @@ class FilesAppearInIndex(MemoryFixture):
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n",
             "user.md": "факт\n",
-            "MEMORY_infra.md": "- [Я сам](MEMORY_infra.md) - самоссылка\n"
+            "memory_infra.md": "- [Я сам](memory_infra.md) - самоссылка\n"
                                "- [Сервер](server.md) - прод\n",
             "server.md": "факт\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        self.assertIn("MEMORY_infra.md", output)
+        self.assertIn("memory_infra.md", output)
 
     def test_unreferenced_sub_index_is_error(self):
         """Под-индекс, на который никто не ссылается, невидим - и всё за ним тоже."""
@@ -875,14 +974,14 @@ class StrictRootIndexModel(MemoryFixture):
     def test_second_index_like_file_in_root_is_a_plain_fact(self):
         """Файл рядом с корневым - обычный факт, а не под-индекс.
 
-        Прежняя модель короновала MEMORY.md, а MEMORY-work.md объявляла
+        Прежняя модель короновала MEMORY.md, а memory-work.md объявляла
         под-индексом, до которого неоткуда дойти, и давала код 1 на памяти,
         с которой всё в порядке. В строгой модели такой файл - обычный:
         упомянут в индексе, значит вопросов нет.
         """
         self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Рабочее](MEMORY-work.md) - заметки\n",
-            "MEMORY-work.md": "рабочие заметки\n",
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Рабочее](memory-work.md) - заметки\n",
+            "memory-work.md": "рабочие заметки\n",
             "user.md": "факт\n",
         })
         code, output = self.run_linter()
@@ -976,23 +1075,23 @@ class StrictRootIndexModel(MemoryFixture):
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n",
             "user.md": "факт\n",
-            "MEMORY_infra.md": "- [Сервер](server.md) - прод\n",
+            "memory_infra.md": "- [Сервер](server.md) - прод\n",
             "server.md": "факт\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        self.assertIn("MEMORY_infra.md", output)
+        self.assertIn("memory_infra.md", output)
         self.assertIn("подпапк", output)
 
     def test_plain_fact_with_index_like_name_does_not_trigger_the_hint(self):
         """Подсказка требует ДВУХ признаков: похожего имени и строк индекса внутри.
 
-        Иначе обычный факт вроде MEMORY_of_incident.md ловил бы заметку
+        Иначе обычный факт вроде memory_of_incident.md ловил бы заметку
         каждый прогон - шум, приучающий пролистывать вывод.
         """
         self.write({
-            "MEMORY.md": "- [Разбор](MEMORY_of_incident.md) - что случилось\n",
-            "MEMORY_of_incident.md": "в тот вечер сервис ответил 500\n",
+            "MEMORY.md": "- [Разбор](memory_of_incident.md) - что случилось\n",
+            "memory_of_incident.md": "в тот вечер сервис ответил 500\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
@@ -1895,25 +1994,6 @@ class SixthRoundFindings(MemoryFixture):
                          "```\n"
                          "````\n",
             "user.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-
-    def test_unicode_name_in_a_different_normal_form_still_resolves(self):
-        """Одно и то же имя в NFC и NFD - один файл для человека и для ФС.
-
-        Ссылка набрана в одной форме, файл на диске создан в другой: внешне
-        строки идентичны, и человек получает сразу две ошибки на исправной
-        памяти - «ссылка в никуда» и «файл не упомянут». Подсказка про
-        регистр тут не срабатывает: это не регистр, а другая
-        последовательность кодовых точек.
-        """
-        composed = unicodedata.normalize("NFC", "café.md")
-        decomposed = unicodedata.normalize("NFD", "café.md")
-        self.assertNotEqual(composed, decomposed, "формы совпали - тест бессмыслен")
-        self.write({
-            "MEMORY.md": "- [Кафе](%s) - крючок\n" % composed,
-            decomposed: "факт\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
