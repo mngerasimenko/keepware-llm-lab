@@ -94,13 +94,16 @@ MUTATIONS = [
     # «действует из инлайнового кода») удалены вместе с самой меткой: способ
     # пометить файл теперь один, и держится он шапкой, а не обходом заборов.
     ("метка orphan читается не только из шапки", LINTER,
-     "    head, unclosed_head = frontmatter_lines(cached_text(path, rel, cache))\n"
+     "    head, _unclosed = frontmatter_lines(cached_text(path, rel, cache))\n"
      "    return any(FRONTMATTER_ORPHAN.match(line) for line in head)",
      "    return any(FRONTMATTER_ORPHAN.match(line)\n"
      "               for line in cached_text(path, rel, cache).splitlines())"),
-    ("граница имени файла справа снята", LINTER,
+    ("граница «user.mdx - другой файл» снята", LINTER,
      r'MD_ANCHOR = re.compile(r"\.md(?![\w\-])(?!\.\w)", re.I)',
-     r'MD_ANCHOR = re.compile(r"\.md", re.I)'),
+     r'MD_ANCHOR = re.compile(r"\.md(?!\.\w)", re.I)'),
+    ("граница «user.md.txt - другой файл» снята", LINTER,
+     r'MD_ANCHOR = re.compile(r"\.md(?![\w\-])(?!\.\w)", re.I)',
+     r'MD_ANCHOR = re.compile(r"\.md(?![\w\-])", re.I)'),
     ("граница имени файла слева снята", LINTER,
      "        while start > floor and is_name_char(text[start - 1]):\n"
      "            start -= 1",
@@ -112,7 +115,7 @@ MUTATIONS = [
      "        floor = match.end()",
      "        floor = 0"),
     ("имя открывается разделителем", LINTER,
-     '        while start < match.start() and text[start] in "/\\\\":\n'
+     '        while start < match.start() and text[start] in "./\\\\":\n'
      "            start += 1",
      "        pass"),
 
@@ -141,8 +144,16 @@ MUTATIONS = [
      "                    or actual_rel in reachable or actual_rel in referenced):",
      "            if (actual_rel == start\n"
      "                    or actual_rel in reachable or actual_rel in referenced):"),
-    ("подсчёт скрытого считает и то, что видно другим путём", LINTER,
-     "or actual_rel in reachable or actual_rel in referenced):", "):"),
+    # Два независимых операнда - две мутации. Общая печаталась «поймана»
+    # целиком за счёт половины про `reachable`, а половину про `referenced`
+    # (узел, перечисленный в достижимом индексе, спрятанным не считается)
+    # не держал ни один тест. Тот же дефект, что расщепляли в bool(...).
+    ("скрытым считается и то, что видно из достижимого индекса", LINTER,
+     "or actual_rel in reachable or actual_rel in referenced):",
+     "or actual_rel in reachable):"),
+    ("скрытым считается и то, что уже достижимо", LINTER,
+     "or actual_rel in reachable or actual_rel in referenced):",
+     "or actual_rel in referenced):"),
     ("шаблоны --allow-orphan не нормализуются", LINTER,
      '    allow_globs = [pattern.replace("\\\\", "/") for pattern in allow_globs]',
      "    allow_globs = list(allow_globs)"),
@@ -384,11 +395,17 @@ MUTATIONS = [
      "DRAFTS=$(git -c core.quotePath=false ls-files --others --exclude-standard \\\n",
      "DRAFTS=$(git ls-files --others --exclude-standard \\\n"),
     ("путь черновика не срезается до папки памяти", HOOK,
-     '        RELATIVE=${draft#"$MEMORY_DIR"/}',
-     "        RELATIVE=$draft"),
+     '        | sed -e "s|^$MEMORY_DIR/||" ',
+     '        | sed -e "s|^||" '),
     ("значение ключа снова передаётся отдельным словом", HOOK,
-     'DRAFT_ARGS="${DRAFT_ARGS}--allow-orphan=${RELATIVE}',
-     'DRAFT_ARGS="${DRAFT_ARGS}--allow-orphan ${RELATIVE}'),
+     "              -e 's|^|--allow-orphan=|')",
+     "              -e 's|^|--allow-orphan |')"),
+    ("удаления из репозитория снова приезжают в кавычках", HOOK,
+     "REMOVED=$(git -c core.quotePath=false --no-pager diff --cached",
+     "REMOVED=$(git --no-pager diff --cached"),
+    ("переименование снова прячет удаление", HOOK,
+     "              --name-only --no-renames --diff-filter=D",
+     "              --name-only --diff-filter=D"),
     ("повтор без ключей теряет исключения черновиков", HOOK,
      '    "$PYTHON" "$CHECKER" "$MEMORY_DIR" --quiet "$@"\n    RETRY=$?',
      '    "$PYTHON" "$CHECKER" "$MEMORY_DIR" --quiet\n    RETRY=$?'),
@@ -410,7 +427,7 @@ MUTATIONS = [
      "        if indent >= item_indent + 4:",
      "        if indent >= 4:"),
     ("буллет перестал задавать отступ содержимого", LINTER,
-     "            item_indent = indent + len(bullet.group(0))",
+     "            item_indent = indent + 1 + (gap if gap <= 4 else 1)",
      "            item_indent = 0"),
     ("карта упоминаний снова читает файлы мимо кэша", LINTER,
      "        text = cached_text(path, rel, cache)",
@@ -423,9 +440,9 @@ MUTATIONS = [
     ("файлы скрытых каталогов снова съедают бюджет", HOOK,
      "    DRAFTS=$(printf '%s\\n' \"$DRAFTS\" | grep -v '/\\.[^/]*/' || true)",
      "    :"),
-    ("бюджет исключений снова считается в файлах", HOOK,
-     'if [ "$DRAFT_BYTES" -gt 24000 ]; then',
-     'if [ "$DRAFT_COUNT" -gt 200 ]; then'),
+    ("бюджет мерит список путей, а не строку аргументов", HOOK,
+     '    DRAFT_BYTES=$(printf \'%s\' "$DRAFT_ARGS" | wc -c | tr -d \' \')',
+     '    DRAFT_BYTES=$(printf \'%s\' "$DRAFTS" | wc -c | tr -d \' \')'),
     ("ключи читаются снова через --get", HOOK,
      "EXTRA_ARGS=$IMPORT_ARGS",
      "EXTRA_ARGS=$(git config --get memorycheck.args 2>/dev/null || true)"),
@@ -578,8 +595,13 @@ def restore_interrupted():
     """
     if not os.path.isfile(BACKUP):
         return False
-    with io.open(BACKUP, encoding="utf-8") as stream:
-        saved = stream.read()
+    try:
+        with io.open(BACKUP, encoding="utf-8") as stream:
+            saved = stream.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        print("Слепок %s не читается (%s). Не трогаю ни его, ни дерево - "
+              "разберитесь руками." % (BACKUP, exc))
+        return False
     header, _split, text = saved.partition("\n")
     parts = header.split("\t")
     path = parts[0] if parts else ""
@@ -598,10 +620,23 @@ def restore_interrupted():
         print("В %s лежит слепок постороннего файла (%s). Не трогаю ни файл, "
               "ни слепок - разберитесь руками." % (BACKUP, path or "имя пустое"))
         return False
+    # Причины отказа читать различаем. Файла нет - восстанавливать законно,
+    # это ровно тот случай, ради которого слепок и лежит. Любой другой отказ
+    # (отобранные права, файл занят - на Windows это транзиентно, тот же
+    # PermissionError, от которого write_atomically страхуется пятью
+    # попытками) означает, что мы НЕ ЗНАЕМ, что на диске. Прежде оба сторожа
+    # были написаны как «current is not None and ...», и такой отказ
+    # проваливался прямо в перезапись: механизм, поставленный охранять
+    # целостность дерева, затирал чужую работу, удалял единственную копию и
+    # рапортовал «восстановлен из слепка».
     try:
         current, _newline = read_source(path)
-    except OSError:
+    except FileNotFoundError:
         current = None
+    except OSError as exc:
+        print("Не могу прочитать %s (%s), поэтому не знаю, что там лежит. "
+              "Ничего не трогаю, слепок оригинала - в %s." % (path, exc, BACKUP))
+        return False
     # Совпало с ОРИГИНАЛОМ - значит восстанавливать нечего: прогон оборвали до
     # того, как мутация легла на диск, либо уже после того, как её убрали.
     # Без этой ветки такой обрыв печатал ложное «кто-то уже поправил», а
@@ -672,11 +707,17 @@ def shell_syntax_error(script):
     """Жалоба `sh -n` на текст скрипта, либо None.
 
     Если `sh` не найден - молчим: на такой машине и тесты хука пропускаются,
-    и требовать большего от мутационной проверки не за что. В CI переменная
-    MEMCHECK_REQUIRE_SH делает пропуск невозможным.
+    и требовать большего от мутационной проверки не за что. Но переменную
+    MEMCHECK_REQUIRE_SH при этом ЧИТАЕМ: докстрока обещала, что в CI пропуск
+    невозможен, а переменная только клалась в окружение потомка и здесь не
+    смотрелась - то есть обещание было условно ложным, и `--anchors-only`
+    рапортовал «мутант разбирается» про два десятка непроверенных.
     """
     shell = find_shell()
     if not shell:
+        if os.environ.get("MEMCHECK_REQUIRE_SH"):
+            return ("sh не найден, а MEMCHECK_REQUIRE_SH требует проверки - "
+                    "разобрать мутант хука нечем")
         return None
     handle, temporary = tempfile.mkstemp(suffix=".sh")
     try:
@@ -771,14 +812,26 @@ def suite_fails():
 
 
 def run_apart(command, apart, **kwargs):
-    """Запуск в своей группе процессов: по таймауту гибнет всё дерево."""
-    process = subprocess.Popen(command, **dict(kwargs, **apart))
-    try:
-        out, _err = process.communicate(timeout=SUITE_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        kill_tree(process)
-        process.communicate()
-        raise
+    """Запуск в своей группе процессов: по таймауту гибнет всё дерево.
+
+    `with` и `except BaseException` не украшение. Обёртка заменила
+    `subprocess.run`, который на ЛЮБОМ исключении убивает потомка и закрывает
+    трубы; первая редакция обрабатывала только таймаут, и на Ctrl+C оставляла
+    живой набор и открытый дескриптор. Складывается это скверно: своя группа
+    процессов выводит набор из-под Ctrl+C терминала, поэтому прерывание
+    убивает теперь только инструмент - а осиротевший набор продолжает
+    крутиться на дереве, которое под ним переписывает `finally`.
+    """
+    with subprocess.Popen(command, **dict(kwargs, **apart)) as process:
+        try:
+            out, _err = process.communicate(timeout=SUITE_TIMEOUT)
+        except BaseException:
+            kill_tree(process)
+            try:
+                process.communicate()
+            except Exception:
+                pass
+            raise
     return subprocess.CompletedProcess(command, process.returncode, out, None)
 
 

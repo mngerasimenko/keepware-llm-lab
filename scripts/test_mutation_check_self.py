@@ -138,6 +138,61 @@ class MutationCheckIsAlive(unittest.TestCase):
                       "вывод набора не перехватывается - судить будет не по чему")
         self.assertIs(seen["kwargs"].get("stderr"), subprocess.STDOUT,
                       "поток ошибок теряется мимо вывода")
+        # Своя группа процессов - тоже свойство вызова, и его надо спросить.
+        # Прежде `apart` захватывался и не проверялся ничем: убери его из
+        # вызова - то есть отмени изоляцию целиком, - и набор остался бы
+        # зелёным. Тот же урок, что с потерянным stdout, строкой ниже.
+        key = "creationflags" if os.name == "nt" else "start_new_session"
+        self.assertIn(key, seen["apart"],
+                      "набор запускается в группе процессов терминала - по "
+                      "таймауту переживут внуки")
+
+
+class TheSuiteRunsApartFromUs(unittest.TestCase):
+    """`run_apart` должна исполняться хоть одним тестом, а не только подменяться.
+
+    Шесть тестов выше подменяют её целиком. Подмена скрывает всё, о чём её не
+    спросили: сама функция вместе с `kill_tree` не выполнялась ни разу, хотя
+    обе добавлены ради того, чтобы по таймауту не выживали внуки.
+    """
+
+    def test_a_hung_grandchild_dies_with_the_timeout(self):
+        """Дерево «потомок → внук»: по таймауту гибнет всё."""
+        if os.name == "nt":
+            apart = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        else:
+            apart = {"start_new_session": True}
+        marker = os.path.join(tempfile.mkdtemp(prefix="apart-"), "alive.txt")
+        self.addCleanup(shutil.rmtree, os.path.dirname(marker), True)
+        # Внук пишет метку и живёт долго; если он переживёт таймаут, метка
+        # продолжит обновляться после того, как родителя убили.
+        grandchild = (
+            "import sys,time;"
+            "open(%r,'w').close();"
+            "time.sleep(60)" % marker)
+        child = ("import subprocess,sys;"
+                 "subprocess.run([sys.executable,'-c',%r])" % grandchild)
+        with unittest.mock.patch.object(mutation_check, "SUITE_TIMEOUT", 3):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                mutation_check.run_apart(
+                    [sys.executable, "-c", child], apart,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertTrue(os.path.exists(marker), "внук вообще не стартовал")
+
+    def test_a_quick_command_comes_back_with_its_output(self):
+        """Вторая половина пары: обычный запуск возвращает вывод и код.
+
+        Иначе первая доказывала бы только, что функция умеет падать.
+        """
+        if os.name == "nt":
+            apart = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        else:
+            apart = {"start_new_session": True}
+        done = mutation_check.run_apart(
+            [sys.executable, "-c", "print('privet')"], apart,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(done.returncode, 0)
+        self.assertIn(b"privet", done.stdout)
 
     def test_a_red_suite_is_reported_as_red(self):
         """Вторая половина пары: покрасневший набор возвращается как True.

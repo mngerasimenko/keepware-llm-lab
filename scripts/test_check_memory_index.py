@@ -621,6 +621,25 @@ class ExternalAddressesAreNotOurFormat(MemoryFixture):
         self.assertEqual(code, 0, output)
         self.assertEqual(findings(output, "L1"), [], output)
 
+    def test_an_unclosed_angle_bracket_outside_is_still_outside(self):
+        """Скобки снимаются по одной, а не парой.
+
+        `(<https://example.com` без закрывающей - опечатка, но адрес от этого
+        не перестаёт быть внешним. Пока снималась только пара, такой адрес
+        получал блокирующий L1 с советом заменить чужой URL именем файла
+        памяти: тот же дефект, что чинили порядком проверок, только через
+        опечатку. Единственная фикстура на эту ветку была со ЗАКРЫТОЙ парой,
+        то есть не различала реализации.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Дока](<https://example.com/d) - забыли закрыть\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(findings(output, "L1"), [], output)
+
     def test_the_same_forms_inside_memory_are_still_rejected(self):
         """Вторая половина пары: внутри памяти форма по-прежнему одна.
 
@@ -746,6 +765,23 @@ class IndexParsing(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
         self.assertEqual(findings(output, "L1"), [], output)
+
+    def test_a_wide_bullet_still_holds_its_nested_item(self):
+        """Отступ содержимого считается по маркеру, а не «всегда два».
+
+        Пункт «-   Инфраструктура» - маркер плюс три пробела, содержимое с
+        четвёртой колонки, значит блок кода начинается с восьмой, а строка на
+        шести - вложенный пункт. Гитхаб рисует его списком. Разбор брал два и
+        выбрасывал строку молча: блокирующий L2 с советом дописать строку,
+        которая в индексе уже есть.
+        """
+        self.write({
+            "MEMORY.md": "-   Инфраструктура\n"
+                         "      - [Сервер](server.md) - прод\n",
+            "server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
 
     def test_an_indented_block_after_plain_text_is_still_code(self):
         """Вторая половина пары: после обычного текста отступ - это блок кода.
@@ -1318,6 +1354,42 @@ class FilesAppearInIndex(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
         self.assertIn("infra/MEMORY.md", output)
+
+
+class MentionHintDrawsTheSameBoundary(MemoryFixture):
+    """Оба механизма поиска упоминаний считают точку частью имени.
+
+    Их два: `filename_tokens` разбирает тела фактов, `mentioned_in_raw_text`
+    ищет имя в тексте индекса. Правило про точку откатывали в первом, а во
+    втором граница осталась несведённой - и на один вопрос было два ответа.
+    Половину в `filename_tokens` тест держит; вторую не держал никто, потому
+    что единственная граничная фикстура (`superuser.md`) перекрывается уже
+    классом `\\w` и обе реализации на ней неразличимы.
+    """
+
+    def test_a_dotted_prefix_is_not_a_mention_of_our_file(self):
+        """`prefix.user.md` в индексе - другое имя, а не упоминание `user.md`."""
+        self.write({
+            "MEMORY.md": "- [Профиль](profil.md) - кто\n"
+                         "\nСм. также prefix.user.md - это другой файл.\n",
+            "profil.md": "факт\n",
+            "user.md": "меня забыли внести\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("имя файла в тексте индекса встречается", output)
+
+    def test_the_bare_name_in_the_index_is_a_mention(self):
+        """Вторая половина пары: голое имя в тексте индекса - упоминание."""
+        self.write({
+            "MEMORY.md": "- [Профиль](profil.md) - кто\n"
+                         "\nСм. также user.md - забыл дописать строку.\n",
+            "profil.md": "факт\n",
+            "user.md": "меня забыли внести\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("имя файла в тексте индекса встречается", output)
 
 
 class NamesakeCountIsUsedHonestly(MemoryFixture):
@@ -2606,6 +2678,39 @@ class AddressesAreClickable(MemoryFixture):
         # в индекс, и отсчитывается она от него, а не от каталога запуска.
         self.assertIn("`- [Заголовок](draft.md) - крючок`", output)
 
+    def test_a_directory_notice_gets_the_prefix_too(self):
+        """Каталог - тоже адрес.
+
+        Список известных путей собирался только из файлов, поэтому обе
+        каталожные заметки («связанный каталог пропущен», «каталог не
+        читается») выходили без приписки - с путём, по которому из каталога
+        запуска ничего нет. Ровно та беда, ради которой приписка написана.
+        Подделываем связанный каталог на уровне обхода: настоящий junction
+        требует привилегий, и тест иначе пропускался бы там, где его чаще
+        всего гоняют.
+        """
+        self.write(self.FILES)
+        name = os.path.basename(self.root)
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+        real = linter.build_file_map
+
+        def with_a_linked_dir(root, *args, **kwargs):
+            exact, folded, unreadable, linked = real(root, *args, **kwargs)
+            return (exact, folded, unreadable,
+                    list(linked) + [os.path.join(root, "chuzhaya")])
+
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(linter, "build_file_map",
+                                        with_a_linked_dir):
+            with redirect_stdout(out), redirect_stderr(err):
+                linter.main([name])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertIn("%s/chuzhaya" % name, output,
+                      "заметка про каталог осталась без приписки папки")
+
     def test_prefix_does_not_touch_lines_that_start_with_a_word(self):
         """Третья сторона: приписка ставится только там, где ведущий токен - путь.
 
@@ -3070,6 +3175,46 @@ class UnreadableEntries(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
         self.assertIn("zanyatyi.md: файл не читается", output)
+
+    def test_an_unreadable_file_under_the_key_is_not_reported(self):
+        """Исключённый путь не читается и как источник упоминания.
+
+        Карта упоминаний строилась по всем файлам подряд, поэтому нечитаемый
+        файл ПОД ШАБЛОНОМ попадал в список непрочитанных, давал заметку и
+        код 2. Ключ, обещающий «сюда проверка не смотрит», требовал починить
+        файл, который велено не трогать, - и одна и та же память отвечала
+        по-разному в зависимости от постороннего файла-сироты.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "vendor/chuzhoe.md": "чужое\n",
+            "zabytyi.md": "меня забыли внести\n",
+        })
+        self.unreadable("chuzhoe.md")
+        code, output = self.run_linter("--allow-orphan", "vendor/*.md")
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("chuzhoe.md", output)
+
+    def test_an_unreadable_index_does_not_cancel_the_file_level_rules(self):
+        """Нечитаемый индекс отменяет достижимость - и только её.
+
+        Ранний возврат уносил вместе с L2 и L3 ещё L4, L5 и L6, а заметка
+        называла только первые две. О невыполненной работе было сказано
+        вслух, но не о той: читатель заключал, что имена и связи проверены,
+        а коммит с нарушением L5 или L6 проходил - код 2 хук не блокирует.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "Plohoe Imya.md": "---\nname: ne_to\n---\nсм. [[nikuda_ne_vedet]]\n",
+        })
+        self.unreadable("MEMORY.md")
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertTrue(findings(output, "L6"), output)
+        self.assertTrue(findings(output, "L5"), output)
+        self.assertTrue(findings(output, "L4"), output)
 
     def test_the_same_file_readable_is_audited_as_usual(self):
         """Вторая половина пары: читается - проверяется как все.
@@ -3953,6 +4098,102 @@ class PreCommitHook(unittest.TestCase):
         printed = result.stdout.decode("utf-8", "replace")
         self.assertEqual(result.returncode, 1, printed)
         self.assertIn("L6", printed)
+
+    def test_a_cyrillic_staged_deletion_is_not_treated_as_a_draft(self):
+        """Обе стороны сравнения обязаны говорить на одном языке.
+
+        Запрос черновиков идёт с `core.quotePath=false`, а запрос удалений
+        шёл без него - и имя с кириллицей приезжало в кавычках с
+        восьмеричным экранированием. Совпадения не случалось никогда, то
+        есть вся починка «`git rm --cached` не прячется за исключением
+        черновиков» была выключена ровно на тех именах, которые в этом
+        проекте норма.
+        """
+        self.write_memory("- [Профиль](user.md) - кто\n"
+                          "- [Вторая](Вторая Заметка.md) - имя не по правилу\n",
+                          {"Вторая Заметка.md": "второй факт\n"})
+        self.git("add", "-A")
+        self.git("-c", "user.email=t@t", "-c", "user.name=t",
+                 "commit", "-q", "-m", "base", "--no-verify")
+        self.git("rm", "-q", "--cached", "memory/Вторая Заметка.md")
+        result = self.run_hook()
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 1, printed)
+        self.assertIn("L6", printed)
+
+    def test_a_rename_does_not_hide_the_index_leaving(self):
+        """Гарантия не должна зависеть от эвристики похожести содержимого.
+
+        `git` по умолчанию склеивает удаление с добавлением в переименование,
+        если содержимое похоже хотя бы наполовину, и тогда `--diff-filter=D`
+        не возвращает НИЧЕГО. Уход индекса из репозитория - самое громкое из
+        того, что хук обязан заметить, - становился невидимым.
+
+        Предпосылку тест проверяет явно: если git пару не склеил, сценария
+        нет вовсе, и тест прошёл бы впустую на обеих реализациях.
+        """
+        self.commit_base()
+        self.git("rm", "-q", "--cached", "memory/MEMORY.md")
+        with io.open(os.path.join(self.repo, "memory", "spisok.md"), "w",
+                     encoding="utf-8", newline="\n") as fh:
+            fh.write("- [Профиль](user.md) - кто\n")
+        self.git("add", "memory/spisok.md")
+        status = self.git("diff", "--cached", "--name-status").stdout.decode(
+            "utf-8", "replace")
+        self.assertTrue(status.startswith("R"),
+                        "git не увидел переименования - фикстура не про то:\n"
+                        + status)
+        result = self.run_hook()
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertIn("уходит из репозитория", printed,
+                      "переименование спрятало уход индекса")
+
+    def test_a_huge_number_of_drafts_never_ends_in_a_broken_run(self):
+        """Верхняя сторона бюджета: доходить до предела ОС нельзя.
+
+        Прежний потолок мерил не ту строку - список путей с префиксом
+        `memory/`, - а в командную строку уходит `--allow-orphan=` плюс путь
+        БЕЗ префикса. Замер на Windows: 1333 черновика уложились в потолок,
+        хук думал 3 мин 51 с и упал с кодом 126, заблокировав коммит. Это
+        худший из режимов: и работу не сделали, и человека заперли.
+        """
+        # Ровно тот диапазон, где старая мерка и новая расходятся: 1300 путей
+        # по 18 байт - это 23 400, под прежним потолком в 24 000; те же 1300
+        # аргументов по 25 байт - 32 500, то есть впритык к пределу argv.
+        for number in range(1300):
+            self.draft("c", "d%04d.md" % number)
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        result = self.run_hook()
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertNotEqual(result.returncode, 126, printed)
+        self.assertIn("слишком много", printed,
+                      "бюджет не сработал, а значит argv доехал до предела ОС")
+
+    def test_a_failing_sed_does_not_abort_the_hook(self):
+        """Упавший `sed` не должен обрывать скрипт до первого слова.
+
+        Под `set -e` код упавшей подстановки обрывает весь хук, и человек
+        получает отклонённый коммит без единой строки - тот самый режим
+        отказа, ради которого `say` написан с «|| :». Подменяем `sed`
+        заглушкой, выходящей с ненулевым кодом.
+        """
+        fake = os.path.join(self.repo, "fakebin")
+        os.makedirs(fake)
+        with io.open(os.path.join(fake, "sed"), "w", encoding="utf-8",
+                     newline="\n") as fh:
+            fh.write("#!/bin/sh\nexit 3\n")
+        os.chmod(os.path.join(fake, "sed"), 0o755)
+        self.draft("chernoviki", "draft.md")
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        env = os.environ.copy()
+        env["PATH"] = fake + os.pathsep + env.get("PATH", "")
+        result = self.run_hook(env=env)
+        printed = result.stdout.decode("utf-8", "replace")
+        # Непустоты вывода мало: оборванный хук успевает напечатать
+        # предыдущие строки, и тест проходит на обеих реализациях. Требуем,
+        # чтобы он ДОШЁЛ до вердикта - своя жалоба и код 1.
+        self.assertEqual(result.returncode, 1, printed)
+        self.assertIn("не смог подготовить исключения", printed)
 
     def test_ignored_files_do_not_eat_the_exclusion_budget(self):
         """Игнорируемое поддерево вытесняло настоящий черновик.
