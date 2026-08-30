@@ -450,6 +450,45 @@ class MemoryFileNameIsASlug(MemoryFixture):
         self.assertEqual(code, 1, output)
         self.assertTrue(findings(output, "L6"), output)
 
+    def test_excluded_paths_are_not_audited_at_all(self):
+        """Ключ значит «сюда проверка не смотрит» - целиком, а не только L2.
+
+        Прежде он гасил одно лишь «файл вне индекса», а правила имени и поля
+        `name` применялись ко всему, что лежит на диске. Из-за этого не
+        работали оба обещания README: чужой или сгенерированный каталог
+        закрыть было нечем (имя у него почти наверняка не слаг, а
+        переименовать чужое нельзя), а неотслеживаемый черновик,
+        который хук исключает именно этим ключом, всё равно блокировал
+        коммит - потому что черновики называют `Draft 2.md`, а не слагом.
+        Оставался ровно один выход, `--no-verify`, то есть выключение всей
+        проверки. Ключ с двумя прочтениями - это и есть двоякость.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "vendor/Sgenerirovano.md": "---\nname: sovsem_drugoe\n---\nчужое\n",
+            "vendor/Ещё Одно.md": "чужое\n",
+        })
+        code, output = self.run_linter("--allow-orphan", "vendor/*.md")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(findings(output, "L5"), [], output)
+        self.assertEqual(findings(output, "L6"), [], output)
+
+    def test_without_the_key_the_same_files_are_audited(self):
+        """Вторая половина пары: без ключа те же файлы проверяются как все.
+
+        Иначе первый тест доказывал бы только, что проверка умеет молчать.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "vendor/Sgenerirovano.md": "---\nname: sovsem_drugoe\n---\nчужое\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertTrue(findings(output, "L5"), output)
+        self.assertTrue(findings(output, "L6"), output)
+
     def test_lawful_names_pass(self):
         """Вторая половина пары: правило описывает то, как уже пишут.
 
@@ -527,6 +566,42 @@ class MemoryFileNameIsASlug(MemoryFixture):
         self.assertTrue(findings(output, "L6"), output)
 
 
+class ExternalAddressesAreNotOurFormat(MemoryFixture):
+    """Правила формата адреса действуют только внутри памяти.
+
+    Проверка формы стояла РАНЬШЕ отсечки внешних адресов, и обычная
+    markdown-ссылка наружу становилась блокирующей ошибкой. Совет при этом
+    предлагал заменить внешний URL именем файла памяти - то есть выполнимое
+    задание, выполнение которого ломает индекс.
+    """
+
+    def test_external_links_keep_their_markdown_forms(self):
+        """Первая половина пары: наружу можно писать как принято в markdown."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Дока](https://example.com/d \"страница\") - внешняя\n"
+                         "- [Спека](<https://example.com/s>) - в скобках\n"
+                         "- [Почта](mailto:kto@example.com) - тоже наружу\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(findings(output, "L1"), [], output)
+
+    def test_the_same_forms_inside_memory_are_still_rejected(self):
+        """Вторая половина пары: внутри памяти форма по-прежнему одна.
+
+        Иначе первый тест доказывал бы, что проверку формы просто выключили.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](<user.md>) - в угловых скобках\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertTrue(findings(output, "L1"), output)
+
+
 class OneRowForm(MemoryFixture):
     """У строки индекса ровно одна форма: `- [Заголовок](файл.md) - крючок`.
 
@@ -597,6 +672,43 @@ class OneRowForm(MemoryFixture):
 
 class IndexParsing(MemoryFixture):
     """Строки разбираются только там, где это действительно строки индекса."""
+
+    def test_a_wrapped_row_does_not_end_the_list(self):
+        """Перенос внутри пункта не заканчивает пункт.
+
+        Признак «мы внутри списка» сбрасывался ЛЮБОЙ строкой без буллета -
+        в том числе продолжением самого пункта. Следующий за ним вложенный
+        пункт с отступом в четыре пробела уходил в «блок кода», файл
+        объявлялся сиротой, а совет велел дописать в индекс строку, которая
+        там уже есть. Гитхаб рисует эту разметку обычным вложенным списком.
+        """
+        self.write({
+            "MEMORY.md": "- [Правило](a.md) - коммиты по Conventional Commits,\n"
+                         "  подробности внутри\n"
+                         "    - [Вложенное](b.md) - крючок\n",
+            "a.md": "факт\n",
+            "b.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_an_indented_block_after_plain_text_is_still_code(self):
+        """Вторая половина пары: после обычного текста отступ - это блок кода.
+
+        Иначе правило превратилось бы в «считать строкой индекса всё, что
+        похоже», и примеры в документации памяти стали бы строками.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "Формат строки такой:\n"
+                         "\n"
+                         "    - [Заголовок](primer.md) - крючок\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(findings(output, "L1"), [], output)
 
     def test_rows_inside_fenced_code_block_are_ignored(self):
         self.write({
@@ -1407,6 +1519,26 @@ class CiGuards(unittest.TestCase):
         self.assertIn("PYTHONIOENCODING", env_block.group(1),
                       "переменная не выставлена ни для одного шага")
 
+    def test_ci_pins_the_hook_prerequisite_and_both_systems(self):
+        """Без MEMCHECK_REQUIRE_SH тесты хука тихо пропускаются в CI.
+
+        Весь класс HookPrerequisite держится на этой переменной, а держал её
+        только сам workflow: убери строку из yml - и десятки тестов хука
+        снова skip'аются на раннере без `sh`, галочка при этом зелёная. Тот
+        же класс отказа, ради которого переменная и заведена.
+
+        Матрица из двух систем - вторая половина того же: бит исполняемости
+        и регистровые двойники видны только на Linux, и на одной Windows CI
+        зеленел бы на памяти, которая там красная.
+        """
+        text = self.workflow()
+        env_block = re.search(r"\n    env:\n((?:      .*\n|\n)+)", text)
+        self.assertIsNotNone(env_block, "в workflow не найден блок env")
+        self.assertIn("MEMCHECK_REQUIRE_SH", env_block.group(1),
+                      "без неё тесты хука в CI пропускаются молча")
+        self.assertIn("ubuntu", text)
+        self.assertIn("windows", text)
+
 
     def test_ci_checks_that_tests_were_actually_collected(self):
         """На Python 3.9 сломанный discover даёт зелёную галочку при нуле тестов.
@@ -1852,6 +1984,45 @@ class FrontmatterDiagnostics(MemoryFixture):
     надо объяснить, почему оно не засчиталось.
     """
 
+    def test_a_nested_key_is_not_a_format_key(self):
+        """Ключи формата живут на нулевом отступе, вложенные - чужие.
+
+        Обе регулярки начинались с `^\\s*`, то есть отступ не различали. Из
+        этого выходили два ложных чтения сразу, и в разные стороны.
+
+        `metadata.orphan: true` - обычное поле пользовательской структуры -
+        засчитывалось как метка «файл вне индекса намеренно», и файл
+        пропадал из проверки молча. А `metadata.name` давало блокирующий L5
+        с советом затереть чужое поле слагом имени файла.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "---\nname: user\nmetadata:\n  type: user\n"
+                       "  name: Иван Петров\n---\nфакт\n",
+            "zabytyi.md": "---\ndescription: черновик\nmetadata:\n"
+                          "  orphan: true\n---\nменя забыли внести\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        # Вложенный name не должен порождать L5.
+        self.assertEqual(findings(output, "L5"), [], output)
+        # Вложенный orphan не должен прятать файл от L2.
+        self.assertTrue([line for line in findings(output, "L2")
+                         if "zabytyi.md" in line], output)
+
+    def test_a_top_level_key_still_works(self):
+        """Вторая половина пары: на нулевом отступе оба ключа действуют."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "---\nname: sovsem_drugoe\n---\nфакт\n",
+            "shablon.md": "---\norphan: true\n---\nзаготовка\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertTrue(findings(output, "L5"), output)
+        self.assertEqual([line for line in findings(output, "L2")
+                          if "shablon.md" in line], [], output)
+
     def test_unclosed_frontmatter_explains_why_the_marker_did_not_work(self):
         """Метка внутри незакрытой шапки не читается - об этом надо сказать.
 
@@ -2123,21 +2294,40 @@ class FilenameTokenScan(unittest.TestCase):
         for text, expected in cases:
             self.assertEqual(linter.filename_tokens(text), expected, text)
 
-    def test_a_long_run_of_name_characters_does_not_blow_up(self):
-        """Вторая половина: 40 000 символов без «.md» - это не десятки секунд.
+    def test_many_anchors_inside_one_run_do_not_blow_up(self):
+        """Вторая половина пары: цена.
 
-        Потолок тут честный, а не двукратный: прежняя редакция считала этот
-        вход 18.8 с, нынешняя - сотые доли. Между ними три порядка, и от
-        загрузки машины такой разрыв не зависит.
+        Прежний тест этой ветки не касался: он подавал «a» * 40000, где нет
+        ни одного «.md», - поиск якоря не находил ничего, и скан назад не
+        выполнялся ни разу. Вход, на котором старая и новая реализации
+        неразличимы, гарантировать не может ничего.
+
+        Взрыв живёт там, где якорей МНОГО ВНУТРИ ОДНОГО прогона: пока точка
+        считалась частью имени, «a.md/b.md/c.md...» был одним слитным
+        прогоном, и каждый якорь заново шёл назад по всему предыдущему.
+        Замер на этом входе: 40 КБ - 45.8 с. После правила «точка не часть
+        имени» - 17 мс, и разрыв тут в три порядка, а не в проценты.
         """
-        blob = "a" * 40000
+        blob = "a.md/" * 8000
         started = time.perf_counter()
         found = linter.filename_tokens(blob)
         spent = time.perf_counter() - started
-        self.assertEqual(found, [])
-        self.assertLess(spent, 5.0,
-                        "40 000 символов заняли %.1f с - похоже на возврат "
-                        "отката в поиске имени файла" % spent)
+        self.assertEqual(len(found), 8000, "границы разъехались")
+        self.assertLess(spent, 2.0,
+                        "40 КБ слитных путей заняли %.1f с - точка снова "
+                        "попала в класс имени, и скан назад стал "
+                        "квадратичным" % spent)
+
+    def test_a_dot_is_not_part_of_a_memory_name(self):
+        """Правило, которым закрыта квадратичность, - оно же граница смысла.
+
+        L6 разрешает в имени строчную латиницу, цифры, дефис и подчёркивание.
+        Точки там нет: единственная точка в имени файла памяти - расширение.
+        Значит и в тексте имя обрывается на точке, а «a.md/b.md» - это два
+        имени подряд, а не одно длинное.
+        """
+        self.assertEqual(linter.filename_tokens("a.md/b.md"),
+                         ["a.md", "b.md"])
 
 
 class MemoryFolderBoundary(MemoryFixture):
@@ -2322,6 +2512,49 @@ class AddressesAreClickable(MemoryFixture):
 
 class LinkedSubtrees(MemoryFixture):
     """Связанные каталоги внутри памяти: junction на Windows, симлинк на POSIX."""
+
+    def test_the_summary_does_not_claim_what_was_not_opened(self):
+        """Итог обязан отличаться, если часть дерева пропущена.
+
+        Связанный каталог пропускается намеренно - это граница
+        ответственности, а не сбой, и код остаётся нулевым. Но строка
+        «Память согласована» утверждала полную согласованность памяти,
+        часть которой инструмент не открывал. Агент через junction файлы
+        читает, то есть `mklink /J` внутри memory/ молча выключал проверку
+        целого поддерева, и по выводу это было неотличимо от
+        «проверено и чисто».
+
+        Связь подделываем на уровне обхода: настоящий junction требует
+        привилегий, и тест иначе пропускался бы ровно на той системе, где
+        его чаще всего гоняют.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        real = linter.build_file_map
+
+        def with_a_linked_dir(*args, **kwargs):
+            exact, folded, unreadable, linked = real(*args, **kwargs)
+            return exact, folded, unreadable, list(linked) + ["chuzhaya_pamyat"]
+
+        with unittest.mock.patch.object(linter, "build_file_map",
+                                        with_a_linked_dir):
+            code, output = self.run_linter()
+
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("Память согласована:", output)
+        self.assertIn("Связанных каталогов пропущено", output)
+
+    def test_a_clean_run_without_links_says_so_plainly(self):
+        """Вторая половина пары: без пропусков итог прежний."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertIn("Память согласована:", output)
 
     def link_dir(self, target, link):
         """Пробует связать каталоги; пропускает тест, если система не даёт."""
@@ -2637,6 +2870,62 @@ class ExitCodeContract(MemoryFixture):
 class UnreadableEntries(MemoryFixture):
     """Один нечитаемый файл не должен отменять весь прогон."""
 
+    def unreadable(self, name):
+        """Делает один файл нечитаемым, не трогая права.
+
+        Права на Windows работают иначе, а симлинки требуют привилегий -
+        оба пути делают тест либо пропускаемым, либо неверным. Подменяем
+        само чтение: проверяется ветка, а не устройство файловой системы.
+        """
+        original = linter.read_text
+
+        def refusing(path):
+            if os.path.basename(path) == name:
+                raise IOError("файл занят другим процессом")
+            return original(path)
+
+        patcher = unittest.mock.patch.object(linter, "read_text", refusing)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_an_unreadable_fact_is_said_out_loud(self):
+        """Нечитаемый ФАКТ - такая же невыполненная проверка, как каталог.
+
+        Все четыре читателя глотали OSError и подставляли пустой текст. Для
+        файла, который есть в индексе, это значило: L4 не проверен, L5 не
+        проверен, и ни одной заметки - прогон отвечал «Память согласована» с
+        кодом 0. Асимметрия была прямо в коде: нечитаемый КАТАЛОГ и
+        нечитаемый ИНДЕКС давали заметку и код 2, а факт - ничего.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Занятый](zanyatyi.md) - его держит редактор\n",
+            "user.md": "факт\n",
+            "zanyatyi.md": "---\nname: sovsem_drugoe\n---\nсм. [[nikuda_ne_vedet]]\n",
+        })
+        self.unreadable("zanyatyi.md")
+        code, output = self.run_linter()
+        self.assertEqual(code, 2, output)
+        self.assertIn("zanyatyi.md", output)
+        self.assertNotIn("Память согласована", output)
+
+    def test_the_same_file_readable_is_audited_as_usual(self):
+        """Вторая половина пары: читается - проверяется как все.
+
+        Иначе первый тест доказывал бы только, что проверка умеет молчать по
+        новой причине.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Занятый](zanyatyi.md) - обычный файл\n",
+            "user.md": "факт\n",
+            "zanyatyi.md": "---\nname: sovsem_drugoe\n---\nсм. [[nikuda_ne_vedet]]\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertTrue(findings(output, "L5"), output)
+        self.assertTrue(findings(output, "L4"), output)
+
     def test_dangling_symlink_does_not_abort_the_run(self):
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n",
@@ -2688,6 +2977,48 @@ class WikiLinksBetweenFacts(MemoryFixture):
     """
 
     INDEX = "- [Профиль](user.md) - кто\n- [Правило](feedback_rule.md) - как\n"
+
+    def test_the_form_is_one_and_the_code_reads_what_is_inside(self):
+        """Первая половина пары: смысл формы не изменился.
+
+        Разбор хвостов «#якорь» и «|подпись» переехал из регулярки в код.
+        Внешне не изменилось ничего - и вот весь список того, что обязано
+        остаться прежним, включая прозу в двойных скобках, которая ссылкой
+        не считается.
+        """
+        cases = [
+            ("см. [[nekotoryi_fakt]] рядом", ["nekotoryi_fakt"]),
+            ("с якорем [[fakt#razdel]] тут", ["fakt"]),
+            ("с подписью [[fakt|читай так]] тут", ["fakt"]),
+            ("и то и то [[fakt#razdel|подпись]]", ["fakt"]),
+            ("проза [[владелец проекта]] не связь", []),
+            ("[[a]] короче двух символов", []),
+            ("две подряд [[odin]] и [[dva]]", ["odin", "dva"]),
+            ("[[#tolko_yakor]] имени нет", []),
+            ("незакрытая [[skobka и всё", []),
+        ]
+        for line, expected in cases:
+            self.assertEqual(linter.wiki_targets(line), expected, line)
+
+    def test_unclosed_brackets_in_a_long_line_are_cheap(self):
+        """Вторая половина пары: цена.
+
+        Хвосты были необязательными группами: они съедали строку до конца и
+        откатывались посимвольно, если «]]» так и не нашлось. Каждая «[[»
+        платила длиной строки - строка выходила квадратичной сама по себе.
+        Замер: 40 КБ - 14.3 с.
+
+        Это горячее сканера имён: L4 гоняется по КАЖДОМУ файлу при КАЖДОМ
+        коммите, и сироты для этого не нужны.
+        """
+        line = "[[aa#" * 8000
+        started = time.perf_counter()
+        found = linter.wiki_targets(line)
+        spent = time.perf_counter() - started
+        self.assertEqual(found, [])
+        self.assertLess(spent, 1.0,
+                        "40 КБ незакрытых скобок заняли %.1f с - разбор "
+                        "хвостов вернулся в регулярку" % spent)
 
     def test_dangling_wiki_link_is_reported(self):
         """Вход держит ссылку из ПОДПАПКИ: там путь и имя не совпадают."""
@@ -2767,8 +3098,15 @@ class WikiLinksBetweenFacts(MemoryFixture):
         «Не ведёт никуда» - диагноз: по нему нельзя починить, не поискав
         руками. Дефис вместо подчёркивания - причина подавляющего
         большинства битых связей в живых памятях (52 из 98), и в этом случае
-        файл называется однозначно. Тогда называем и его, и оба способа
-        починки: поправить ссылку либо объявить это имя в шапке файла.
+        файл называется однозначно. Тогда называем его.
+
+        Способ починки ОДИН - поправить ссылку. Прежде сообщение предлагало
+        второй, «объявить это имя в шапке файла», и он остался от времени,
+        когда имя памяти можно было задать полем `name`. После L5 имя у
+        памяти одно - имя файла, поэтому такой совет не чинит ссылку и
+        вдобавок заводит блокирующий L5: было `exit 0`, стало `exit 1`.
+        Тест на это и стоит: в выводе не должно быть предложения дописать
+        `name`.
         """
         self.write({
             "MEMORY.md": self.INDEX,
@@ -2779,7 +3117,26 @@ class WikiLinksBetweenFacts(MemoryFixture):
         self.assertEqual(code, 0, output)
         self.assertIn("Похоже, имелся в виду feedback_rule.md", output)
         self.assertIn("[[feedback_rule]]", output)
-        self.assertIn("name: feedback-rule", output)
+        self.assertNotIn("name: feedback-rule", output)
+
+    def test_advice_never_offers_to_declare_a_name_in_the_frontmatter(self):
+        """Вторая половина пары: и в ветке БЕЗ догадки того же совета нет.
+
+        Там он был ещё и ложью: «ни в одной шапке нет строки `name: X`» -
+        утверждение, которого проверка сделать не может, потому что по полю
+        `name` она имена больше не разрешает. Соседняя строка L5 в том же
+        выводе прямо его опровергала.
+        """
+        self.write({
+            "MEMORY.md": self.INDEX,
+            "user.md": "см. [[sovsem_nikuda]] рядом\n",
+            "feedback_rule.md": "правило\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertTrue(findings(output, "L4"), output)
+        self.assertNotIn("ни в одной шапке", output)
+        self.assertNotIn("name: sovsem_nikuda", output)
 
     def test_ambiguous_spelling_gets_no_guess(self):
         """Вторая половина пары: под одно написание попали двое - молчим.
@@ -3057,6 +3414,32 @@ class SummaryTellsWhatBlocks(MemoryFixture):
     идут и те и другие: шесть строк L4 при коммите человек читает как причину
     отказа, хотя они ничего не блокируют.
     """
+
+    def test_the_summary_explains_only_the_letters_it_printed(self):
+        """Расшифровка даётся под то, что напечатано, а не всегда одна и та же.
+
+        На новой пустой памяти единственное предупреждение - «индекс пуст», и
+        оно не L3 и не L4. Итог всё равно объяснял оба: «L3 (дубль заголовка)
+        и L4 (битая связь)». Итог, объясняющий не то, что выше, учит не
+        читать итог.
+        """
+        self.write({"MEMORY.md": "# Память\n\nПока пусто.\n"})
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertIn("Предупреждений: 1", output)
+        self.assertNotIn("дубль заголовка", output)
+
+    def test_the_summary_still_explains_the_letters_that_are_there(self):
+        """Вторая половина пары: L3 и L4 в выводе - расшифровка на месте."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - раз\n- [Профиль](user2.md) - два\n",
+            "user.md": "факт\n",
+            "user2.md": "см. [[net_takogo_fakta]] рядом\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertIn("дубль заголовка", output)
+        self.assertIn("битая связь", output)
 
     def test_warnings_only_end_with_a_verdict(self):
         """Память с одними предупреждениями обрывалась без единого слова.
@@ -3346,6 +3729,96 @@ class PreCommitHook(unittest.TestCase):
             cwd=self.repo, env=env or os.environ.copy(),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
+
+    def draft(self, *parts):
+        """Кладёт неотслеживаемый черновик в папку памяти."""
+        path = os.path.join(self.repo, "memory", *parts)
+        folder = os.path.dirname(path)
+        if not os.path.isdir(folder):
+            os.makedirs(folder)
+        with io.open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("ещё не дописано\n")
+
+    def test_a_draft_whose_name_starts_with_a_dash_does_not_disable_the_hook(self):
+        """Один файл с неудачным именем выключал защиту насовсем.
+
+        Путь черновика уходил в командную строку ОТДЕЛЬНЫМ словом, и
+        argparse считал `-x.md` ключом, а не значением: разбор аргументов
+        падал, прогон отдавал код 2, а ветка кода 2 - «проверку выполнить
+        не удалось, коммит не блокирую» - выпускала наружу любую поломку
+        памяти. Спасательный повтор не срабатывал: он требует непустого
+        `memorycheck.args`, а тут настройки нет.
+
+        Черновик лежит неделями - значит и защита выключена неделями. Это
+        ровно тот тихий отказ, ради которого написан весь инструмент.
+        """
+        self.write_memory("- [Профиль](user.md) - кто\n",
+                          {"sirota.md": "меня забыли внести\n"})
+        self.draft("-x.md")
+        self.git("add", "memory/MEMORY.md", "memory/user.md", "memory/sirota.md")
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 1, result.stdout.decode("utf-8", "replace"))
+
+    def test_a_draft_named_like_a_draft_does_not_block(self):
+        """Вторая половина пары: исключение работает и для не-слага.
+
+        Черновики называют «Draft 2.md», «TODO.md», «черновик.md» - слагом
+        почти никогда. Пока ключ гасил только «файл вне индекса», обещание
+        README «неотслеживаемый черновик коммит не блокирует» не
+        выполнялось ровно в типичном случае: файл спотыкался об L6.
+        """
+        self.write_memory("- [Профиль](user.md) - кто\n")
+        self.draft("chernoviki", "Draft 2.md")
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
+
+    def test_a_gitignored_draft_does_not_block_either(self):
+        """Черновик, спрятанный через .gitignore, - тоже не часть коммита.
+
+        `--exclude-standard` их не перечисляет, поэтому хук их не исключал,
+        а линтер ходит по диску и видел. Прятать заготовки в .gitignore -
+        естественный способ, и он давал ложную тревогу на здоровом коммите.
+        """
+        self.write_memory("- [Профиль](user.md) - кто\n")
+        with io.open(os.path.join(self.repo, ".gitignore"), "w",
+                     encoding="utf-8", newline="\n") as fh:
+            fh.write("memory/chernoviki/\n")
+        self.draft("chernoviki", "zagotovka.md")
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
+
+    def test_a_cyrillic_draft_name_does_not_block(self):
+        """Русскоязычный проект - и черновик называют по-русски.
+
+        `core.quotePath` включён по умолчанию, поэтому git отдавал такое имя
+        в кавычках и с экранированием, хук его не исключал, и коммит
+        блокировался. Для этого репозитория это имя черновика по умолчанию.
+        """
+        self.write_memory("- [Профиль](user.md) - кто\n")
+        self.draft("chernoviki", "черновик.md")
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8", "replace"))
+
+    def test_deleting_the_whole_memory_folder_is_not_silent(self):
+        """Самый разрушительный коммит проходил без единой строки.
+
+        Хук выходит молча, если папки памяти нет, - и `git rm -r memory`
+        попадал ровно в эту ветку. Индекс исчез, строка импорта в конфиге
+        агента повисла, а вывод пуст. Блокировать не обязательно, но
+        молчать нельзя: это тот же перевёрнутый градиент громкости, ради
+        которого чинили сам линтер.
+        """
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        self.git("-c", "user.email=t@t", "-c", "user.name=t",
+                 "commit", "-q", "-m", "memory", "--no-verify")
+        self.git("rm", "-r", "-q", "memory")
+        result = self.run_hook()
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertIn("memory", printed)
+        self.assertNotEqual(printed.strip(), "", "вывод пуст")
 
     def test_untracked_draft_does_not_block_a_healthy_commit(self):
         """Черновик, которого в коммите нет, блокировал коммит, в котором всё цело.
@@ -3798,6 +4271,25 @@ class PreCommitHook(unittest.TestCase):
         text = result.stdout.decode("utf-8", "replace")
         self.assertEqual(result.returncode, 1, text)
         self.assertIn("memorycheck.args", text)
+
+    def test_the_retry_keeps_the_draft_exclusions(self):
+        """Повтор «без ключей» выбрасывал и исключения черновиков.
+
+        Ключи пользователя и поправка на черновики лежали вперемешку в одном
+        списке, и повтор терял и то и другое. Итог: при опечатке в настройке
+        хук блокировал ЗДОРОВЫЙ коммит из-за черновика, которого в коммите
+        нет, и объяснял это настройкой - человек шёл чинить не туда.
+
+        Комментарий в хуке при этом уверял, что «запереть человека это не
+        может». Вход держит обе половины сразу: и опечатку, и черновик.
+        """
+        self.write_memory("- [Профиль](user.md) - кто\n")
+        self.draft("chernoviki", "draft.md")
+        self.git("config", "memorycheck.args", "--alow-orphan opechatka")
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        result = self.run_hook()
+        text = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, text)
 
     def test_genuine_usage_error_does_not_blame_the_config(self):
         """Вторая половина пары: ключи ни при чём - не блокируем и не обвиняем их.

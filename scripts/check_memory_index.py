@@ -109,7 +109,10 @@ def closes_fence(mark, opened):
 # бэктиков, потому что заметка ПРО метку освобождала себя. Правило вместо
 # обработчика: шапка обязательна у каждого файла памяти, и в примере кода
 # шапки не бывает.
-FRONTMATTER_ORPHAN = re.compile(r"^\s*orphan\s*:\s*true\s*$", re.I)
+# Нулевой отступ обязателен: ключи формата - верхнего уровня. Пока стояло
+# `^\s*`, поле `metadata.orphan: true` из пользовательской структуры
+# засчитывалось как метка, и файл пропадал из проверки МОЛЧА.
+FRONTMATTER_ORPHAN = re.compile(r"^orphan\s*:\s*true\s*$", re.I)
 # Признак, отличающий незакрытую YAML-шапку от горизонтальной линейки.
 YAML_PAIR = re.compile(r"^\s*[\w.\-]+\s*:\s*\S")
 
@@ -152,6 +155,24 @@ def is_external(target):
 # индексе бессмысленный: описание несёт крючок после дефиса, а читает индекс
 # агент, которому наводить нечем.
 QUOTED_TITLE = re.compile(r"^\S+\s+[\"'].*[\"']$")
+
+
+def address_core(target):
+    """Адрес без markdown-обёртки: угловых скобок и подсказки в кавычках.
+
+    Нужен ровно для одного вопроса - «этот адрес вообще наш?». Правила
+    формата действуют только внутри памяти, а понять, что перед нами
+    внешняя ссылка, нужно ДО того, как придираться к её записи: снаружи
+    `<https://...>` и `https://... "подсказка"` - обычный markdown, и
+    требовать от них «голый путь» значит советовать заменить чужой URL
+    именем файла памяти.
+    """
+    core = target.strip()
+    if core.startswith("<") and core.endswith(">"):
+        core = core[1:-1].strip()
+    elif QUOTED_TITLE.match(core):
+        core = core.split(None, 1)[0]
+    return core
 
 
 def extra_address_form(target):
@@ -209,12 +230,21 @@ def parse_index(path):
     чинили чеклист, сломали законную метку `[-]`. Не станет формы - не
     станет и от чего отличать.
     """
+    return parse_index_text(read_text(path))
+
+
+def parse_index_text(text):
+    """Тот же разбор, но по уже прочитанному тексту.
+
+    Нужен там, где текст лежит в общем кэше: перечитывать файл с диска ради
+    разбора значило бы платить за него дважды.
+    """
     rows = []
     lost_rows = 0
     opened_fence = ""
     in_comment = False
     after_list_item = False
-    for lineno, line in enumerate(read_text(path).splitlines(), 1):
+    for lineno, line in enumerate(text.splitlines(), 1):
         if opened_fence:
             mark, tail = fence_delimiter(line)
             if mark and closes_fence(mark, opened_fence) and not tail.strip():
@@ -270,7 +300,16 @@ def parse_index(path):
             after_list_item = False
             continue
 
-        after_list_item = bool(BULLET.match(body))
+        # Строка индекса - одна строка, но пункт списка может переноситься.
+        # Признак «мы внутри списка» сбрасывался ЛЮБОЙ строкой без буллета, в
+        # том числе продолжением самого пункта, - и следующий за ним вложенный
+        # пункт уходил в «блок кода». Файл объявлялся сиротой, а совет велел
+        # дописать строку, которая в индексе уже есть.
+        #
+        # Отступ и решает: строка с отступом продолжает то, что начато выше,
+        # а список кончается там, где начинается текст от левого края.
+        after_list_item = bool(BULLET.match(body)) or (indent > 0
+                                                       and after_list_item)
         match = ROW.match(body)
         if match:
             rows.append((match.group(1).strip(), match.group(2).strip(), lineno, "inline"))
@@ -448,16 +487,17 @@ def frontmatter_lines(text):
     return [], looks_like_yaml
 
 
-def has_unclosed_frontmatter(path):
-    """Шапка открыта и не закрыта - метка внутри неё не читается."""
-    try:
-        text = read_text(path)
-    except OSError:
-        return False
-    return frontmatter_lines(text)[1]
+def has_unclosed_frontmatter(path, rel, cache):
+    """Шапка открыта и не закрыта - метка внутри неё не читается.
+
+    Через общий кэш: файл-сирота читался с диска трижды - здесь, в проверке
+    метки и в карте упоминаний. На факте в 200 КБ это два лишних полных
+    чтения на каждого сироту.
+    """
+    return frontmatter_lines(cached_text(path, rel, cache))[1]
 
 
-def is_orphan_ok(path):
+def is_orphan_ok(path, rel, cache):
     """Файл сам объявил, что лежит вне индекса намеренно.
 
     Способ ровно один - `orphan: true` в шапке. Второй, комментарием
@@ -475,9 +515,8 @@ def is_orphan_ok(path):
     Нечитаемый файл (битый симлинк, отобранные права) - это не «намеренно»,
     но и не повод отменять весь прогон: считаем его обычной находкой.
     """
-    try:
-        text = read_text(path)
-    except OSError:
+    text = cached_text(path, rel, cache)
+    if rel in cache.get(UNREADABLE_KEY, ()):
         return False
     head, unclosed_head = frontmatter_lines(text)
     return any(FRONTMATTER_ORPHAN.match(line) for line in head)
@@ -488,7 +527,7 @@ def is_orphan_ok(path):
 # нет, указана не та папка» от «память есть, а индекс из неё пропал». Без
 # такого различения README.md в корне репозитория сошёл бы за память, и совет
 # «вы указали не ту папку» пропал бы там, где он верен.
-MEMORY_FIELD = re.compile(r"^\s*(name|description)\s*:\s*\S", re.I)
+MEMORY_FIELD = re.compile(r"^(name|description)\s*:\s*\S", re.I)
 
 
 def looks_like_memory_file(path):
@@ -535,7 +574,7 @@ def find_indexes(exact, index_name):
             if os.path.basename(rel) == index_name]
 
 
-def looks_like_a_stray_index(root, index_name, exact):
+def looks_like_a_stray_index(root, index_name, exact, cache):
     """Файлы в КОРНЕ, названные под старую плоскую раскладку.
 
     `MEMORY_infra.md` рядом с `MEMORY.md` - это прежняя схема, где под-индексы
@@ -558,10 +597,7 @@ def looks_like_a_stray_index(root, index_name, exact):
             continue
         if not os.path.splitext(rel)[0].casefold().startswith(base):
             continue
-        try:
-            rows, _unclosed, _lost = parse_index(path)
-        except OSError:
-            continue
+        rows, _unclosed, _lost = parse_index_text(cached_text(path, rel, cache))
         if rows:
             stray.append(rel)
     return stray
@@ -570,25 +606,64 @@ def looks_like_a_stray_index(root, index_name, exact):
 # Ссылка между фактами: "[[имя]]", "[[имя|подпись]]". Ровно та форма, которую
 # предписывает формат памяти («Связанные памяти линкуем через [[их-name]]»).
 #
-# Внутри скобок требуем токен без пробелов: в живых памятях в двойных скобках
-# регулярно оказывается проза («[[в /ideas]]», «[[memory не существует]]»), и
-# без этого условия каждая такая строка давала бы предупреждение на пустом
-# месте. Имя памяти - слаг, пробелов в нём не бывает.
-# Якорь и подпись отбрасываем, имя берём до них: «[[правило#раздел]]» ведёт к
-# той же памяти, что «[[правило]]», и молча пропускать такую ссылку значило бы
-# не проверять законную форму.
-WIKI_LINK = re.compile(r"\[\[([^\s\[\]|#]{2,})(?:#[^\]|\n]*)?(?:\|[^\]\n]*)?\]\]")
-NAME_FIELD = re.compile(r"^\s*name\s*:\s*(.+?)\s*$", re.I)
+# Регулярка ловит ТОЛЬКО сами скобки, а что внутри - разбирает код. Прежде
+# якорь и подпись разбирала она сама, необязательными группами `[^\]|\n]*`:
+# каждая такая группа съедала строку до конца и откатывалась посимвольно,
+# если «]]» так и не находилось. Одна «[[» платила длиной строки, а строка с
+# тысячей «[[» выходила квадратичной. Замер: 40 КБ - 14.3 с, и это горячее
+# сканера имён - L4 идёт по каждому файлу при каждом коммите, сироты для
+# этого не нужны. Тот же вход после правила - меньше миллисекунды.
+WIKI_LINK = re.compile(r"\[\[([^\[\]\n]{2,})\]\]")
+# Тот же нулевой отступ: вложенный `metadata.name` - чужое поле, а не имя
+# памяти. Пока отступ не различался, он давал блокирующий L5 с советом
+# затереть это поле слагом имени файла.
+NAME_FIELD = re.compile(r"^name\s*:\s*(.+?)\s*$", re.I)
+
+
+def wiki_targets(line):
+    """Имена памятей, на которые ссылается строка. Форма одна: [[имя]].
+
+    Якорь и подпись отбрасываем, имя берём до них: «[[правило#раздел]]» ведёт
+    к той же памяти, что «[[правило]]», и молча пропускать такую ссылку
+    значило бы не проверять законную форму.
+
+    Имя памяти - слаг: без пробелов и не короче двух символов. В живых
+    памятях в двойных скобках регулярно оказывается проза («[[в /ideas]]»,
+    «[[memory не существует]]»), и без этого условия каждая такая строка
+    давала бы предупреждение на пустом месте.
+    """
+    found = []
+    for inner in WIKI_LINK.findall(line):
+        target = inner.split("#", 1)[0].split("|", 1)[0].strip()
+        if len(target) >= 2 and not any(char.isspace() for char in target):
+            found.append(target)
+    return found
+
+
+# Служебный ключ кэша: файлы, которые не открылись. Имя с нулевым байтом -
+# путём такое не бывает, поэтому с настоящими записями кэша не столкнётся.
+UNREADABLE_KEY = "\0unreadable"
 
 
 def cached_text(path, rel, cache):
-    """Текст файла из общего кэша: каждый файл читается один раз за прогон."""
+    """Текст файла из общего кэша: каждый файл читается один раз за прогон.
+
+    Нечитаемый файл возвращается пустой строкой, но НЕ молча: путь
+    запоминается, и выше по стеку он превращается в заметку и код 2.
+
+    Прежде отказ просто глотался. Для файла, который есть в индексе, это
+    значило, что L4 и L5 по нему не проверены, - а прогон отвечал «Память
+    согласована» с кодом 0. При этом нечитаемый каталог и нечитаемый индекс
+    давали и заметку, и код 2: правило «о невыполненной работе говорим
+    вслух» соблюдалось везде, кроме самого частого случая.
+    """
     text = cache.get(rel)
     if text is None:
         try:
             text = read_text(path)
         except OSError:
             text = ""
+            cache.setdefault(UNREADABLE_KEY, set()).add(rel)
         cache[rel] = text
     return text
 
@@ -654,7 +729,22 @@ def known_memory_names(exact, cache):
 MEMORY_FILE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 
-def badly_named_files(exact, index_name):
+def is_excluded(rel, allow_globs):
+    """Путь, который проверка не аудирует вовсе.
+
+    У ключа `--allow-orphan` ОДНО значение: «сюда проверка не смотрит».
+    Прежде он гасил только «файл вне индекса», и оба обещания README
+    оказывались невыполнимыми. Чужой или сгенерированный каталог закрыть
+    было нечем: имя у него почти наверняка не слаг, а переименовать чужое
+    нельзя. Неотслеживаемый черновик, который хук исключает этим же ключом,
+    всё равно блокировал коммит - черновики называют «Draft 2.md», а не
+    слагом. Оставался один выход - `--no-verify`, то есть выключение всей
+    проверки разом.
+    """
+    return any(fnmatch.fnmatchcase(rel, pattern) for pattern in allow_globs)
+
+
+def badly_named_files(exact, index_name, allow_globs=()):
     """Имена, не подчиняющиеся правилу: и файлов, и каталогов на пути к ним.
 
     Каталог входит в адрес наравне с именем файла: `- [Сервер](Моя Папка/prod.md)`
@@ -670,6 +760,8 @@ def badly_named_files(exact, index_name):
     seen_dirs = set()
     for rel in sorted(exact):
         if not rel.lower().endswith(".md"):
+            continue
+        if is_excluded(rel, allow_globs):
             continue
         parts = rel.split("/")
         for depth, folder in enumerate(parts[:-1]):
@@ -688,7 +780,7 @@ def badly_named_files(exact, index_name):
     return found
 
 
-def name_field_mismatches(exact, index_name, cache):
+def name_field_mismatches(exact, index_name, cache, allow_globs=()):
     """Файлы, у которых поле `name` в шапке не равно имени файла.
 
     У памяти одно имя, и это имя её файла. Поле `name` - объявление того же
@@ -705,6 +797,8 @@ def name_field_mismatches(exact, index_name, cache):
         if not rel.lower().endswith(".md"):
             continue
         if os.path.basename(rel) == index_name:
+            continue
+        if is_excluded(rel, allow_globs):
             continue
         head, _unclosed = frontmatter_lines(cached_text(exact[rel], rel, cache))
         for line in head:
@@ -756,8 +850,7 @@ def dangling_wiki_links(exact, cache):
             if mark:
                 opened_fence = mark
                 continue
-            for target in WIKI_LINK.findall(line):
-                target = target.strip()
+            for target in wiki_targets(line):
                 if target in names:
                     continue
                 # Догадка только когда она однозначна. Двое под одним
@@ -785,11 +878,24 @@ def dangling_wiki_links(exact, cache):
 # хоть одна сирота, - то есть в pre-commit хуке, ровно в тот момент, когда
 # человек чинит память и коммитит снова. Достаточно одному факту содержать
 # длинный слитный токен - base64-блоб, дамп хешей, склеенный список путей, -
-# и хук задумывается на десятки секунд. Посимвольный проход линеен и даёт ту
-# же границу: в «superuser.md» находится именно «superuser.md».
+# и хук задумывается на десятки секунд.
+#
+# ТОЧКИ В КЛАССЕ ИМЕНИ НЕТ - и это не оптимизация, а правило. L6 разрешает в
+# имени строчную латиницу, цифры, дефис и подчёркивание; единственная точка в
+# имени файла памяти - расширение. Пока точка считалась частью имени,
+# «a.md/b.md/c.md...» был ОДНИМ слитным прогоном, и каждый якорь заново шёл
+# назад по всему предыдущему: посимвольный проход оказался квадратичным ровно
+# там же, где до него была квадратичной регулярка. Замер на 40 КБ таких
+# путей - 45.8 с. Стоит убрать точку, и каждый якорь сам обрывает прогон
+# предыдущего: те же 40 КБ считаются 17 мс, а взрыв становится невозможным по
+# построению - без потолка на длину и без второго прохода.
+#
+# Границы от этого не поехали: в «superuser.md» по-прежнему находится
+# «superuser.md», в «vendor/user.md» - весь путь, а «user.md.txt» именем не
+# считается (за это отвечает хвост якоря, а не класс имени).
 MD_ANCHOR = re.compile(r"\.md(?![\w\-])(?!\.\w)", re.I)
 # «_» отдельно: str.isalnum() его не считает буквой, а \w - считает.
-NAME_PUNCTUATION = "_.-/\\"
+NAME_PUNCTUATION = "_-/\\"
 
 
 def is_name_char(char):
@@ -798,12 +904,25 @@ def is_name_char(char):
 
 
 def filename_tokens(text):
-    """Имена файлов памяти, встреченные в тексте. Линейно по его длине."""
+    """Имена файлов памяти, встреченные в тексте. Линейно по его длине.
+
+    Линейность держится на том, что точки нет в NAME_PUNCTUATION: якорь «.md»
+    обрывает прогон имени, поэтому скан назад ограничен расстоянием до
+    предыдущего якоря, а не длиной всего текста.
+    """
     found = []
+    # Имя не может начаться раньше, чем кончилось расширение предыдущего
+    # файла: в «a.md/b.md» второе имя это «b.md», а не «md/b.md».
+    floor = 0
     for match in MD_ANCHOR.finditer(text):
         start = match.start()
-        while start > 0 and is_name_char(text[start - 1]):
+        while start > floor and is_name_char(text[start - 1]):
             start -= 1
+        # Разделитель именем не открывается: «/b.md» это «b.md». Внутри пути
+        # разделитель остаётся - «vendor/user.md» находится целиком.
+        while start < match.start() and text[start] in "/\\":
+            start += 1
+        floor = match.end()
         if start == match.start():
             continue  # голое «.md» без имени файлом не является
         found.append(text[start:match.end()])
@@ -901,6 +1020,10 @@ def check(root, index_paths, allow_globs, index_name, file_map):
     # упомянутыми можно только после того, как известно, достижим ли сам
     # индекс. Иначе под-индекс, до которого неоткуда дойти, «отмывает» свои
     # файлы - и пометка orphan на нём давала зелёный свет невидимой ветке.
+    # Кэш текстов заводим в самом начале: им пользуются и ранние проверки
+    # (похожий на индекс файл в корне), и поздние (метка orphan, шапка,
+    # карта упоминаний). Каждый файл памяти читается за прогон один раз.
+    cache = {}
     per_index = defaultdict(list)
     titles = defaultdict(set)
     seen_rows = set()
@@ -945,7 +1068,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
     # Файлы в корне, названные под старую плоскую раскладку: их строки не
     # разбираются, и всё перечисленное в них станет сиротами. Причину надо
     # назвать, иначе вывод читается как поломка проверки.
-    for stray in looks_like_a_stray_index(root, index_name, exact):
+    for stray in looks_like_a_stray_index(root, index_name, exact, cache):
         notices.append(
             "%s: лежит в корне и похож на индекс, но индексом не считается - "
             "корневой индекс один (%s), а под-индекс живёт в подпапке под тем "
@@ -996,6 +1119,25 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                 )
                 continue
             target = raw_target.strip()
+            if not target:
+                # Прежде такая строка отбрасывалась вместе с якорями: человек
+                # видит строку в индексе и считает файл упомянутым, а адреса нет.
+                errors.append(
+                    "L1 %s:%d строка без адреса: «%s». Допишите путь к файлу в "
+                    "круглых скобках: `- [%s](имя-файла.md) - крючок`"
+                    % (where, lineno, title, title))
+                continue
+            # Сначала выясняем, наш ли это адрес вообще, и только потом
+            # придираемся к его записи. Порядок был обратным, и обычная
+            # ссылка наружу - `(<https://...>)` или `(https://... "текст")` -
+            # становилась блокирующей ошибкой с советом заменить чужой URL
+            # именем файла памяти. Правила формата действуют внутри памяти.
+            core = address_core(target)
+            if core.startswith("#"):
+                continue  # якорь внутри того же документа - не ссылка на файл
+            if is_external(core):
+                continue
+
             # У адреса, как и у самой строки, одна форма: голый путь. Markdown
             # знает ещё две - в угловых скобках (нужны для пробела в пути) и с
             # подсказкой в кавычках. После L6 пробелов в путях памяти не
@@ -1009,18 +1151,6 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                     "L1 %s:%d адрес записан %s: `%s`. В индексе одна форма - "
                     "голый путь: `- [%s](имя-файла.md) - крючок`"
                     % (where, lineno, wrong, target, title))
-                continue
-            if not target:
-                # Прежде такая строка отбрасывалась вместе с якорями: человек
-                # видит строку в индексе и считает файл упомянутым, а адреса нет.
-                errors.append(
-                    "L1 %s:%d строка без адреса: «%s». Допишите путь к файлу в "
-                    "круглых скобках: `- [%s](имя-файла.md) - крючок`"
-                    % (where, lineno, title, title))
-                continue
-            if target.startswith("#"):
-                continue  # якорь внутри того же документа - не ссылка на файл
-            if is_external(target):
                 continue
 
             # Без unquote: `%20` в адресе нужен был для пробела в пути, а L6
@@ -1149,7 +1279,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
     for rel in sorted(exact):
         if not rel.lower().endswith(".md"):
             continue
-        if any(fnmatch.fnmatchcase(rel, pattern) for pattern in allow_globs):
+        if is_excluded(rel, allow_globs):
             continue
         if rel in index_rels:
             if rel in reachable:
@@ -1159,7 +1289,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             # Без придаточного: «1 файл, которые станут» не согласуется, а
             # число тут любое.
             tail = ". За ним скрыто %s" % files_count(behind) if behind else ""
-            if is_orphan_ok(exact[rel]):
+            if is_orphan_ok(exact[rel], rel, cache):
                 # Метка снимает вопрос с самого файла - но не делает достижимым
                 # то, что он перечисляет. Молчать об этом нельзя: человек ставит
                 # метку, чтобы заглушить предупреждение, и получает зелёный свет
@@ -1181,14 +1311,13 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                 % (rel, index_name, tail, index_name, rel)
             )
             continue
-        if rel in referenced or is_orphan_ok(exact[rel]):
+        if rel in referenced or is_orphan_ok(exact[rel], rel, cache):
             continue
         orphans.append(rel)
 
     # Подсказки считаем отдельным проходом: тексты соседних файлов читаются
     # один раз на всех сирот, а не заново на каждую. Индексы - тем же приёмом:
     # прежде они перечитывались с диска на КАЖДОГО сироту.
-    cache = {}
     index_texts = read_all(index_paths)
     # Сколько файлов носит каждое короткое имя - считаем ОДИН раз. Прежде эта
     # сумма бралась перебором всех файлов внутри цикла по сиротам, то есть
@@ -1221,7 +1350,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
         # ортогональны: один объясняет, откуда взялась догадка про источник,
         # другой - почему не сработала метка orphan.
         head_note = ""
-        if has_unclosed_frontmatter(exact[rel]):
+        if has_unclosed_frontmatter(exact[rel], rel, cache):
             head_note = (" (шапка `---` открыта, но не закрыта - метка "
                          "`orphan: true` внутри неё не читается)")
         hint = ""
@@ -1354,7 +1483,8 @@ def check(root, index_paths, allow_globs, index_name, file_map):
     # L5: поле `name` в шапке равно имени файла. Ошибка, а не предупреждение:
     # два имени у одной памяти - это два прочтения одного и того же, и любая
     # ссылка [[...]] становится игрой в угадайку. Правило вместо обработчика.
-    for rel, declared, expected in name_field_mismatches(exact, index_name, cache):
+    for rel, declared, expected in name_field_mismatches(
+            exact, index_name, cache, allow_globs):
         errors.append(
             "L5 %s: в шапке `name: %s`, а файл называется `%s`. Имя у памяти "
             "одно - имя её файла; приведите поле к нему: `name: %s`"
@@ -1364,7 +1494,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
     # идентификатор, по которому на память ссылаются из индекса и из
     # [[связей]]. Пока оно могло быть любым, каждая вольность оборачивалась
     # обработчиком - и на пробел, и на процент, и на регистр.
-    for rel, stem, what in badly_named_files(exact, index_name):
+    for rel, stem, what in badly_named_files(exact, index_name, allow_globs):
         errors.append(
             "L6 %s: имя %s `%s` не по правилу. Имя в памяти - строчная "
             "латиница, цифры, дефис и подчёркивание, первый символ буква или "
@@ -1381,31 +1511,50 @@ def check(root, index_paths, allow_globs, index_name, file_map):
     #
     # Сообщение обязано быть выполнимым: его читает и человек, и агент,
     # которому эту память чинить. Поэтому в строке есть адрес (файл и номер
-    # строки), что именно не сходится и что с этим делать. Когда написание
-    # выдаёт опечатку однозначно - называем файл и оба способа починки:
-    # поправить ссылку либо объявить это имя в шапке файла.
+    # строки), что именно не сходится и что с этим делать.
+    #
+    # Способов починки ДВА, и оба про имя файла: поправить ссылку или
+    # переименовать файл. Прежде предлагался третий - «объявить это имя в
+    # шапке», - и он остался от времени, когда имя памяти можно было задать
+    # полем `name`. После L5 имя у памяти одно, имя её файла: такой совет
+    # ссылку не чинит и вдобавок заводит блокирующий L5, то есть превращает
+    # `exit 0` в `exit 1`. Ветка без догадки говорила ещё и неправду - «ни в
+    # одной шапке нет строки `name: X`», - утверждение, которого проверка
+    # сделать не может и которое опровергалось строкой L5 в том же выводе.
     dangling = dangling_wiki_links(exact, cache)
     for rel, lineno, target, guess in dangling:
         if guess:
             warnings.append(
                 "L4 %s:%d ссылка [[%s]] никуда не ведёт. Похоже, имелся в виду "
-                "%s: исправьте ссылку на [[%s]] либо добавьте в шапку того "
-                "файла строку `name: %s`"
-                % (rel, lineno, target, guess, os.path.splitext(guess)[0], target))
+                "%s: исправьте ссылку на [[%s]] либо переименуйте тот файл в "
+                "`%s.md`"
+                % (rel, lineno, target, guess, os.path.splitext(guess)[0],
+                   target))
         else:
             warnings.append(
-                "L4 %s:%d ссылка [[%s]] никуда не ведёт: файла с таким именем "
-                "нет, и ни в одной шапке нет строки `name: %s`. Поправьте имя "
-                "в ссылке или заведите такой файл"
+                "L4 %s:%d ссылка [[%s]] никуда не ведёт: файла `%s.md` в памяти "
+                "нет. Поправьте имя в ссылке или заведите такой файл"
                 % (rel, lineno, target, target))
 
-    return errors, notices, warnings, row_count, bool(incomplete or unreadable_dirs)
+    # Файлы, которые не открылись за весь прогон. По ним не проверены ни L4,
+    # ни L5, ни намеренность сиротства - значит проверка выполнена не до
+    # конца, и это код 2, а не «согласована».
+    unreadable_files = sorted(cache.get(UNREADABLE_KEY, ()))
+    for rel in unreadable_files:
+        notices.append(
+            "%s: файл не читается - ни связи [[...]], ни поле `name` в нём не "
+            "проверены. Закройте редактор или снимите блокировку и повторите"
+            % rel)
+
+    return (errors, notices, warnings, row_count,
+            bool(incomplete or unreadable_dirs or unreadable_files))
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Проверяет, что индекс памяти и файлы памяти не разошлись.",
-        epilog="Коды возврата: 0 - порядок, 1 - нарушения L1/L2, 2 - проверку выполнить не удалось.",
+        epilog="Коды возврата: 0 - порядок, 1 - нарушения L1/L2/L5/L6, "
+               "2 - проверку выполнить не удалось.",
     )
     parser.add_argument("memory_dir", nargs="?", default="memory",
                         help="папка памяти (по умолчанию: memory)")
@@ -1567,7 +1716,19 @@ def main(argv=None):
     # Список известных путей берём из карты файлов: приписка ставится только
     # там, где ведущий токен и правда путь, а не начало фразы.
     folder = display_folder(args.memory_dir)
+    # Каталоги тоже адреса. Прежде список знал только файлы, и обе каталожные
+    # заметки («связанный каталог пропущен», «каталог не читается») выходили
+    # без приписки - с путём, по которому из корня репозитория ничего нет.
+    # Ровно та беда, ради которой приписка и написана.
     known = set(file_map[0])
+    for rel in list(known):
+        parts = rel.split("/")
+        for depth in range(1, len(parts)):
+            known.add("/".join(parts[:depth]))
+    for where in list(file_map[2]) + list(file_map[3]):
+        rel = relative_to_root(root, where)
+        if rel:
+            known.add(rel)
     notices = [with_memory_folder(line, folder, known) for line in notices]
     warnings = [with_memory_folder(line, folder, known) for line in warnings]
     errors = [with_memory_folder(line, folder, known) for line in errors]
@@ -1602,13 +1763,34 @@ def main(argv=None):
               "правилу); L3 и L4 - предупреждения.")
         return EXIT_VIOLATION
     if warnings:
-        print("\nНарушений нет. Предупреждений: %d - L3 (дубль заголовка) и "
-              "L4 (битая связь [[имя]]) коммит не блокируют." % len(warnings))
+        # Расшифровку букв даём, только если эти буквы в выводе есть. Прежде
+        # строка объясняла L3 и L4 всегда - в том числе на новой пустой
+        # памяти, где единственное предупреждение «индекс пуст» не является
+        # ни тем, ни другим. Итог, объясняющий не то, что напечатано, учит
+        # не читать итог.
+        seen = sorted({line.split(" ", 1)[0] for line in warnings
+                       if line.split(" ", 1)[0] in ("L3", "L4")})
+        names = {"L3": "L3 (дубль заголовка)", "L4": "L4 (битая связь [[имя]])"}
+        what = " - %s" % " и ".join(names[code] for code in seen) if seen else ""
+        print("\nНарушений нет. Предупреждений: %d%s - коммит они не блокируют."
+              % (len(warnings), what))
         return EXIT_OK
     if not args.quiet:
         note = ", заметок: %d" % len(notices) if notices else ""
-        print("Память согласована: строк в индексе %d, индексов %d%s"
-              % (row_count, len(index_paths), note))
+        # Связанный каталог пропущен намеренно - это граница ответственности,
+        # а не сбой, и код остаётся нулевым. Но говорить при этом «память
+        # согласована» нельзя: часть дерева не открывали, а агент через
+        # junction файлы читает. Итог обязан отличаться от полного успеха,
+        # иначе `mklink /J` внутри memory/ молча выключает проверку целого
+        # поддерева, и по выводу это неотличимо от «проверено и чисто».
+        if file_map[3]:
+            print("Проверенная часть памяти согласована: строк в индексе %d, "
+                  "индексов %d%s. Связанных каталогов пропущено: %d - что "
+                  "внутри них, проверка не знает"
+                  % (row_count, len(index_paths), note, len(file_map[3])))
+        else:
+            print("Память согласована: строк в индексе %d, индексов %d%s"
+                  % (row_count, len(index_paths), note))
     return EXIT_OK
 
 

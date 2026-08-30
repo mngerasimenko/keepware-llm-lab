@@ -38,12 +38,16 @@
 Правило простое: поменяли ветку - поправьте её мутацию здесь же.
 """
 
+import argparse
+import hashlib
 import io
 import os
+import re
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 LINTER = os.path.join("scripts", "check_memory_index.py")
 HOOK = os.path.join(".githooks", "pre-commit")
@@ -54,6 +58,9 @@ HOOK = os.path.join(".githooks", "pre-commit")
 # ищет тихие отказы, производит тихий отказ в самой защите. Проверено: убил
 # прогон, `TASK_MARKS = set()` осталось в дереве, прогон по памяти - код 0.
 BACKUP = ".mutation-backup"
+# Потолок на один прогон набора. Набор идёт около минуты; две мутации
+# намеренно возвращают квадратичность и растягивают его до двух.
+SUITE_TIMEOUT = 900
 
 # (что ломаем, файл, точный фрагмент, чем заменить)
 MUTATIONS = [
@@ -92,8 +99,18 @@ MUTATIONS = [
      r'MD_ANCHOR = re.compile(r"\.md(?![\w\-])(?!\.\w)", re.I)',
      r'MD_ANCHOR = re.compile(r"\.md", re.I)'),
     ("граница имени файла слева снята", LINTER,
-     "        while start > 0 and is_name_char(text[start - 1]):\n"
+     "        while start > floor and is_name_char(text[start - 1]):\n"
      "            start -= 1",
+     "        pass"),
+    ("точка снова считается частью имени памяти", LINTER,
+     'NAME_PUNCTUATION = "_-/\\\\"',
+     'NAME_PUNCTUATION = "_.-/\\\\"'),
+    ("имя начинается прямо после чужого расширения", LINTER,
+     "        floor = match.end()",
+     "        floor = 0"),
+    ("имя открывается разделителем", LINTER,
+     '        while start < match.start() and text[start] in "/\\\\":\n'
+     "            start += 1",
      "        pass"),
 
     # --- три инварианта ---
@@ -110,14 +127,10 @@ MUTATIONS = [
     ("строки недостижимых индексов засчитываются", LINTER,
      "        if where not in reachable:\n            continue", "        pass"),
     ("метка orphan на под-индексе отмывает ветку за ним", LINTER,
-     "            if is_orphan_ok(exact[rel]):", "            if True:"),
-    # Та же конструкция стоит в has_unclosed_frontmatter, поэтому якорь
-    # дотянут до следующей строки кода - она у двух функций разная.
+     "            if is_orphan_ok(exact[rel], rel, cache):", "            if True:"),
     ("нечитаемый файл сходит за намеренную сироту", LINTER,
-     "    except OSError:\n        return False\n"
-     "    head, unclosed_head = frontmatter_lines(text)",
-     "    except OSError:\n        return True\n"
-     "    head, unclosed_head = frontmatter_lines(text)"),
+     "    if rel in cache.get(UNREADABLE_KEY, ()):\n        return False",
+     "    if False:\n        return False"),
     ("обход скрытого перестал помнить посещённые узлы", LINTER,
      "            if (actual_rel in seen or actual_rel == start\n"
      "                    or actual_rel in reachable or actual_rel in referenced):",
@@ -167,7 +180,7 @@ MUTATIONS = [
      "            if False:"),
     ("плохой каталог называется на каждом файле внутри", LINTER,
      "            if where in seen_dirs:\n                continue",
-     "            if False:"),
+     "            pass"),
     ("имя файла памяти может быть любым", LINTER,
      "        if not MEMORY_FILE_NAME.match(stem):",
      "        if False:"),
@@ -177,15 +190,23 @@ MUTATIONS = [
      "        stem = os.path.splitext(base)[0]"),
     ("расхождение имени файла и поля name не ошибка", LINTER,
      "                if declared != expected:", "                if False:"),
+    # Прежде эта мутация подменяла `expected` на `declared`, и сравнение
+    # `declared != expected` становилось всегда ложным - то есть побайтово
+    # тем же поведением, что у соседней мутации «расхождение не ошибка».
+    # Две мутации, один смысл, и ветка, которую эта называет, не проверялась
+    # ничем. Теперь она и правда про регистр.
     ("L5 сравнивает имена без учёта регистра", LINTER,
-     "                expected = os.path.splitext(os.path.basename(rel))[0]",
-     "                expected = declared"),
+     "                if declared != expected:",
+     "                if declared.casefold() != expected.casefold():"),
     ("проза в двойных скобках считается ссылкой", LINTER,
-     r'WIKI_LINK = re.compile(r"\[\[([^\s\[\]|#]{2,})(?:#[^\]|\n]*)?(?:\|[^\]\n]*)?\]\]")',
-     r'WIKI_LINK = re.compile(r"\[\[([^\[\]|#]{2,})(?:#[^\]|\n]*)?(?:\|[^\]\n]*)?\]\]")'),
+     "        if len(target) >= 2 and not any(char.isspace() for char in target):",
+     "        if len(target) >= 2:"),
     ("якорь в ссылке [[имя#раздел]] обрывает разбор", LINTER,
-     r'WIKI_LINK = re.compile(r"\[\[([^\s\[\]|#]{2,})(?:#[^\]|\n]*)?(?:\|[^\]\n]*)?\]\]")',
-     r'WIKI_LINK = re.compile(r"\[\[([^\s\[\]|#]{2,})(?:\|[^\]\n]*)?\]\]")'),
+     '        target = inner.split("#", 1)[0].split("|", 1)[0].strip()',
+     '        target = inner.split("|", 1)[0].strip()'),
+    ("разбор хвостов связи вернулся в регулярку", LINTER,
+     r'WIKI_LINK = re.compile(r"\[\[([^\[\]\n]{2,})\]\]")',
+     r'WIKI_LINK = re.compile(r"\[\[([^\s\[\]|#]{2,})(?:#[^\]|\n]*)?(?:\|[^\]\n]*)?\]\]")'),
     ("подсказка про формат берёт голое имя при однофамильцах", LINTER,
      "        unique_name = basename if namesake_counts[basename] == 1 else None",
      "        unique_name = basename"),
@@ -212,12 +233,22 @@ MUTATIONS = [
      '                    "поправьте путь в строке индекса; если файл больше не нужен "\n'
      '                    "- уберите строку" % (where, lineno, target))',
      '                    "L1 %s:%d ссылка в никуда: %s" % (where, lineno, target))'),
+    # Обе мутации прежде вклеивали `pass or errors.append(...)`. `pass` -
+    # оператор, а не выражение, поэтому мутант не компилировался: тестовый
+    # файл импортирует линтер на уровне модуля, загрузка падала, unittest
+    # отдавал ненулевой код, и инструмент печатал «поймана», не запустив ни
+    # одного теста. Три года такой отчётности стоят ровно ничего.
     ("расхождение регистра в ссылке не ошибка", LINTER,
-     '                errors.append(\n                    "L1 %s:%d регистр не совпадает:',
-     '                pass or errors.append(\n                    "L1 %s:%d регистр не совпадает:'),
+     "            if twin is not None:\n                errors.append(",
+     "            if False:\n                errors.append("),
     ("ссылка за пределы папки памяти не ошибка", LINTER,
-     '                errors.append(\n                    "L1 %s:%d ссылка выходит за папку памяти: %s "',
-     '                pass or errors.append(\n                    "L1 %s:%d ссылка выходит за папку памяти: %s "'),
+     '                errors.append(\n'
+     '                    "L1 %s:%d ссылка выходит за папку памяти: %s "\n'
+     '                    "(такой путь разрешается по-разному в зависимости от того, "\n'
+     '                    "откуда открыли файл). Перенесите файл внутрь папки памяти "\n'
+     '                    "и сошлитесь на него оттуда" % (where, lineno, target)\n'
+     "                )",
+     "                pass"),
     ("файл объявляется источником самого себя", LINTER,
      "            if source == rel:\n                source = None", "            pass"),
     ("самоотсев в карте упоминаний убран", LINTER,
@@ -226,7 +257,7 @@ MUTATIONS = [
     ("ссылка на каталог диагностируется как ссылка в никуда", LINTER,
      "            elif os.path.isdir(absolute):", "            elif False:"),
     ("незакрытая шапка не объясняет, почему метка не сработала", LINTER,
-     "        if has_unclosed_frontmatter(exact[rel]):",
+     "        if has_unclosed_frontmatter(exact[rel], rel, cache):",
      "        if False:"),
     ("горизонтальная линейка выдаётся за незакрытую шапку", LINTER,
      "    looks_like_yaml = any(YAML_PAIR.match(line) for line in head)\n"
@@ -270,13 +301,19 @@ MUTATIONS = [
      "    return any(MEMORY_FIELD.match(line) for line in head)",
      "    return True"),
     ("незакрытый забор не делает прогон непроверяемым", LINTER,
-     "    return errors, notices, warnings, row_count, bool(incomplete or unreadable_dirs)",
+     "    return (errors, notices, warnings, row_count,\n"
+     "            bool(incomplete or unreadable_dirs or unreadable_files))",
      "    return errors, notices, warnings, row_count, False"),
+    ("нечитаемый файл-факт снова глотается молча", LINTER,
+     "            cache.setdefault(UNREADABLE_KEY, set()).add(rel)",
+     "            pass"),
+    ("итог молчит про пропущенные связанные каталоги", LINTER,
+     "        if file_map[3]:", "        if False:"),
     ("непроверяемый прогон отдаёт успех", LINTER,
      "    if unverifiable and not errors:\n        return EXIT_USAGE",
      "    if unverifiable and not errors:\n        return EXIT_OK"),
     ("подсказка про плоскую раскладку исчезла", LINTER,
-     "    for stray in looks_like_a_stray_index(root, index_name, exact):",
+     "    for stray in looks_like_a_stray_index(root, index_name, exact, cache):",
      "    for stray in []:"),
 
     # --- хук ---
@@ -306,14 +343,39 @@ MUTATIONS = [
      "for config in CLAUDE.md AGENTS.md .claude/CLAUDE.md .claude/AGENTS.md; do",
      "for config in CLAUDE.md; do"),
     ("имя индекса в проверке импорта зашито намертво", HOOK,
-     '        [ -n "$IMPORT_CANDIDATE" ] && IMPORT_INDEX=$IMPORT_CANDIDATE',
-     "        :"),
+     '    *"--index "*)\n'
+     "        IMPORT_CANDIDATE=${IMPORT_ARGS#*--index }",
+     '    *"--index "*)\n'
+     "        IMPORT_CANDIDATE=",
+     ),
+    ("форма --index=ИМЯ снова не распознаётся", HOOK,
+     '    *"--index="*)', '    *"--index-nikogda-ne-sovpadet="*)'),
+    ("имя индекса уходит в grep как регулярка", HOOK,
+     '    if grep -q "@[^[:space:]]*$IMPORT_PATTERN" "$config" 2>/dev/null; then',
+     '    if grep -q "@[^[:space:]]*$IMPORT_INDEX" "$config" 2>/dev/null; then'),
     ("неотслеживаемые черновики снова блокируют коммит", HOOK,
-     'DRAFTS=$(git ls-files --others --exclude-standard -- "$MEMORY_DIR" 2>/dev/null || true)',
+     "DRAFTS=$(git -c core.quotePath=false ls-files --others --exclude-standard \\\n"
+     '             -- "$MEMORY_DIR" 2>/dev/null || true)',
      'DRAFTS=""'),
+    ("черновики из .gitignore снова блокируют коммит", HOOK,
+     'IGNORED=$(git -c core.quotePath=false ls-files --others --ignored \\\n'
+     '              --exclude-standard -- "$MEMORY_DIR" 2>/dev/null || true)',
+     'IGNORED=""'),
+    ("имя черновика с кириллицей снова приезжает в кавычках", HOOK,
+     "DRAFTS=$(git -c core.quotePath=false ls-files --others --exclude-standard \\\n",
+     "DRAFTS=$(git ls-files --others --exclude-standard \\\n"),
     ("путь черновика не срезается до папки памяти", HOOK,
-     '        set -- "$@" --allow-orphan "${draft#"$MEMORY_DIR"/}"',
-     '        set -- "$@" --allow-orphan "$draft"'),
+     '        RELATIVE=${draft#"$MEMORY_DIR"/}',
+     "        RELATIVE=$draft"),
+    ("значение ключа снова передаётся отдельным словом", HOOK,
+     'DRAFT_ARGS="${DRAFT_ARGS}--allow-orphan=${RELATIVE}',
+     'DRAFT_ARGS="${DRAFT_ARGS}--allow-orphan ${RELATIVE}'),
+    ("повтор без ключей теряет исключения черновиков", HOOK,
+     '    "$PYTHON" "$CHECKER" "$MEMORY_DIR" --quiet "$@"\n    RETRY=$?',
+     '    "$PYTHON" "$CHECKER" "$MEMORY_DIR" --quiet\n    RETRY=$?'),
+    ("удаление всей папки памяти снова проходит молча", HOOK,
+     '    if git diff --cached --name-only -- "$MEMORY_DIR" 2>/dev/null | grep -q .; then',
+     "    if false; then"),
     # `set +f` стоит теперь не сразу за разбором: между ними сбор черновиков,
     # которому раскрытие шаблонов тоже противопоказано. Мутация снимает
     # именно `set -f`, а парный `set +f` ниже безвреден и без него.
@@ -371,7 +433,33 @@ def write_atomically(path, text, newline="\n"):
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        # На Windows антивирус или индексатор держат файл открытым доли
+        # секунды и дают транзиентный PermissionError. Без пары попыток такая
+        # случайность роняет прогон с мутацией в дереве - то есть производит
+        # ровно ту аварию, от которой этот код и написан.
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
+        # Синхронизируем и КАТАЛОГ: без этого на POSIX при пропаже питания
+        # может потеряться сама подмена имени, и обещание «либо отработал
+        # целиком, либо не тронул оригинал» окажется неполным. На Windows
+        # каталог как файл не открывается - там этой заботы нет.
+        try:
+            folder_handle = os.open(folder, os.O_RDONLY)
+        except OSError:
+            folder_handle = None
+        if folder_handle is not None:
+            try:
+                os.fsync(folder_handle)
+            except OSError:
+                pass
+            finally:
+                os.close(folder_handle)
     except BaseException:
         try:
             os.unlink(temporary)
@@ -384,14 +472,30 @@ NEWLINE_NAMES = {"\n": "lf", "\r\n": "crlf", "\r": "cr"}
 NEWLINE_BY_NAME = {name: value for value, name in NEWLINE_NAMES.items()}
 
 
-def save_backup(path, text, newline="\n"):
+def fingerprint(text):
+    """Отпечаток содержимого - по нему узнаём свою же мутацию на диске."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def save_backup(path, text, newline="\n", mutated=None):
     """Кладёт оригинал рядом на время, пока файл мутирован.
 
-    В шапке слепка не только путь, но и вид переводов строк: восстановление
-    иначе вернуло бы содержимое в LF - то есть починило бы одно и молча
-    переписало другое.
+    В шапке слепка три поля: путь, вид переводов строк и отпечаток того, что
+    инструмент оставил на диске.
+
+    Переводы строк - чтобы восстановление не вернуло содержимое в LF, то
+    есть не починило одно, молча переписав другое.
+
+    Отпечаток - чтобы восстановление не затёрло чужую работу. Без него
+    механизм, поставленный охранять целостность дерева, был единственным в
+    репозитории, кто способен уничтожить незакоммиченную правку: прогон
+    оборвали, человек сам сделал `git checkout`, час правил линтер - а
+    следующий запуск молча вернул содержимое месячной давности и удалил
+    единственную копию. Слепок лежит в .gitignore, поэтому в `git status`
+    его не видно.
     """
-    header = "%s\t%s" % (path, NEWLINE_NAMES.get(newline, "lf"))
+    left = fingerprint(mutated) if mutated is not None else ""
+    header = "%s\t%s\t%s" % (path, NEWLINE_NAMES.get(newline, "lf"), left)
     write_atomically(BACKUP, header + "\n" + text)
 
 
@@ -403,15 +507,36 @@ def drop_backup():
 
 
 def restore_interrupted():
-    """Возвращает файл, если прошлый прогон оборвали. True, если пришлось."""
+    """Возвращает файл, если прошлый прогон оборвали. True, если пришлось.
+
+    Возвращает ТОЛЬКО свою же мутацию: если на диске лежит не то, что
+    инструмент там оставил, значит файл уже кто-то поправил, и переписывать
+    его - уничтожать чужую работу. В таком случае слепок остаётся лежать, а
+    человеку говорится, где он.
+    """
     if not os.path.isfile(BACKUP):
         return False
     with io.open(BACKUP, encoding="utf-8") as stream:
         saved = stream.read()
     header, _split, text = saved.partition("\n")
-    path, _tab, kind = header.partition("\t")
-    if not path:
+    parts = header.split("\t")
+    path = parts[0] if parts else ""
+    kind = parts[1] if len(parts) > 1 else "lf"
+    left = parts[2] if len(parts) > 2 else ""
+    # Инструмент правит ровно два файла - значит и восстанавливать должен
+    # только их. Путь берётся из файла на диске, а файл может быть чей угодно.
+    if not path or os.path.normpath(path) not in (os.path.normpath(LINTER),
+                                                  os.path.normpath(HOOK)):
         drop_backup()
+        return False
+    try:
+        current, _newline = read_source(path)
+    except OSError:
+        current = None
+    if left and current is not None and fingerprint(current) != left:
+        print("В дереве лежит НЕ та мутация, которую я оставил: %s кто-то "
+              "уже поправил. Ничего не трогаю, слепок оригинала - в %s."
+              % (path, BACKUP))
         return False
     write_atomically(path, text, NEWLINE_BY_NAME.get(kind, "\n"))
     drop_backup()
@@ -421,17 +546,38 @@ def restore_interrupted():
 
 
 def missing_anchors():
-    """Мутации, чей фрагмент больше не находится ровно один раз."""
+    """Мутации, которые нельзя применить осмысленно.
+
+    Две причины, и обе - жёсткая ошибка, а не пропуск.
+
+    Первая: фрагмент не находится ровно один раз. Протухший якорь превращает
+    мутацию в тихо не работающую.
+
+    Вторая: мутант не компилируется. Это выяснилось ревью и стоило дорого:
+    три мутации вклеивали `pass or errors.append(...)`, а `pass` - оператор,
+    не выражение. Тестовый файл импортирует линтер на уровне модуля, поэтому
+    загрузка падала, `unittest` отдавал ненулевой код, и инструмент печатал
+    «поймана», не запустив НИ ОДНОГО теста. Отчёт «все пойманы» на этих
+    ветках означал синтаксическую ошибку, а не работу тестов.
+    """
     stale = []
-    for name, path, old, _new in MUTATIONS:
+    for name, path, old, new in MUTATIONS:
         try:
-            text = io.open(path, encoding="utf-8").read()
+            with io.open(path, encoding="utf-8") as stream:
+                text = stream.read()
         except OSError as exc:
             stale.append((name, "файл не читается: %s" % exc))
             continue
         found = text.count(old)
         if found != 1:
             stale.append((name, "фрагмент найден %d раз вместо одного" % found))
+            continue
+        if path.endswith(".py"):
+            try:
+                compile(text.replace(old, new), path, "exec")
+            except SyntaxError as exc:
+                stale.append((name, "мутант не компилируется: %s (строка %s)"
+                              % (exc.msg, exc.lineno)))
     return stale
 
 
@@ -449,11 +595,18 @@ def suite_fails():
     Фильтровать по имени класса нельзя: у `unittest` ключ `-k` не понимает
     отрицания (это синтаксис pytest), и `-k "not X"` молча отбирает ноль
     тестов. Поэтому разделение файлами, а не фильтром.
+
+    Таймаут обязателен: мутация может увести набор в бесконечный цикл или в
+    катастрофический откат регулярки - в этом проекте такое уже было, 8
+    минут на одном входе. Зависший прогон человек убивает, а убитый прогон
+    оставляет мутированное дерево, то есть ровно ту аварию, ради которой
+    написан слепок. Потолок щедрый (набор идёт около минуты, а две мутации
+    намеренно замедляют его до двух), но конечный.
     """
     result = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", "scripts",
          "-p", "test_check_memory_index.py", "-f"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=SUITE_TIMEOUT,
         # MEMCHECK_REQUIRE_SH здесь по той же причине, что и в CI. Без sh
         # тесты хука пропускаются, и три мутации по .githooks/pre-commit
         # печатались бы как ВЫЖИВШИЕ - то есть «ветку не держит ни один
@@ -463,15 +616,49 @@ def suite_fails():
         # прогоне «зелёный ли он без них», и причина названа вслух.
         env=dict(os.environ, PYTHONIOENCODING="utf-8",
                  MEMCHECK_REQUIRE_SH="1"))
+    output = (result.stdout or b"").decode("utf-8", "replace")
+    # Ненулевой код сам по себе ничего не значит: его даёт и упавший тест, и
+    # несобравшийся набор, и упавший загрузчик. Считать это «поймана» - тот
+    # же класс лжи, который инструмент ищет, и в CI он уже закрыт отдельным
+    # шагом «тестов собралось не меньше 150». Здесь спрашиваем то же самое:
+    # тесты обязаны быть запущены, и загрузчик обязан быть цел.
+    ran = re.search(r"^Ran (\d+) tests?", output, re.M)
+    if not ran or int(ran.group(1)) == 0 or "_FailedTest" in output:
+        raise SystemExit(
+            "Набор не запустился под мутацией - это не «поймана», а поломка "
+            "прогона. Вот его вывод:\n%s" % output)
     return result.returncode != 0
 
 
-def main():
+def build_parser():
+    """Разбор аргументов. Нужен прежде всего ради `--help`.
+
+    Без него `python scripts/mutation_check.py --help` запускал часовой
+    прогон, переписывающий рабочее дерево: аргументы просто не читались.
+    Для инструмента, который правит чужие файлы, это неприемлемая цена за
+    любопытство.
+    """
+    parser = argparse.ArgumentParser(
+        description="Мутационная проверка: врут ли тесты. Правит файлы в "
+                    "рабочем дереве и возвращает их обратно - запускать "
+                    "только на чистом дереве.",
+        epilog="Коды возврата: 0 - все мутации пойманы, 1 - есть выжившие "
+               "или прогон не состоялся.")
+    parser.add_argument(
+        "--anchors-only", action="store_true",
+        help="только проверить, что все мутации применимы (якорь на месте и "
+             "мутант компилируется), ничего не запуская")
+    return parser
+
+
+def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8")
         except Exception:
             pass
+
+    args = build_parser().parse_args(argv)
 
     if not os.path.isfile(LINTER):
         print("Запускать из корня репозитория: %s не найден" % LINTER, file=sys.stderr)
@@ -492,6 +679,11 @@ def main():
             print("   %s: %s" % (name, why), file=sys.stderr)
         return 1
 
+    if args.anchors_only:
+        print("Все %d мутаций применимы: якорь на месте, мутант "
+              "компилируется." % len(MUTATIONS))
+        return 0
+
     # Без этого прогона всё дальнейшее бессмысленно: если набор красный по
     # своей причине - недостающий sh, чужая правка в дереве, сломанный тест, -
     # то краснеть он будет и на каждой мутации, и отчёт «все пойманы» окажется
@@ -507,13 +699,23 @@ def main():
     survived = []
     for number, (name, path, old, new) in enumerate(MUTATIONS, 1):
         original, newline = read_source(path)
-        save_backup(path, original, newline)
+        mutated = original.replace(old, new)
+        save_backup(path, original, newline, mutated)
         try:
-            write_atomically(path, original.replace(old, new), newline)
-            caught = suite_fails()
+            write_atomically(path, mutated, newline)
+            try:
+                caught = suite_fails()
+            except subprocess.TimeoutExpired:
+                # Не «поймана»: набор не ответил. Обычно это значит, что
+                # мутация увела его в бесконечный цикл или в откат регулярки.
+                caught = None
         finally:
             write_atomically(path, original, newline)
             drop_backup()
+        if caught is None:
+            print("[%2d/%d] %-8s %s" % (number, len(MUTATIONS), "ЗАВИСЛА", name))
+            survived.append(name + " (набор не ответил за %d с)" % SUITE_TIMEOUT)
+            continue
         print("[%2d/%d] %-8s %s" % (number, len(MUTATIONS),
                                     "поймана" if caught else "ВЫЖИЛА", name))
         if not caught:
