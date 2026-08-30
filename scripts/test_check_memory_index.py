@@ -507,6 +507,35 @@ class MemoryFileNameIsASlug(MemoryFixture):
         self.assertEqual(code, 0, output)
         self.assertEqual(findings(output, "L4"), [], output)
 
+    def test_an_excluded_index_like_file_is_not_discussed(self):
+        """Исключение действует и на поиск похожего на индекс файла в корне.
+
+        Тот обход читал все корневые `MEMORY*` подряд, не спрашивая ключ. Из
+        этого выходило требование починить файл, который велено не трогать, -
+        а если он ещё и не читается, прогон объявлял себя невыполненным.
+        Мутация, снимающая проверку ключа, выжила на полном прогоне: починка
+        была, теста не было.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "MEMORY_staroe.md": "- [Старое](user.md) - прежняя раскладка\n",
+        })
+        code, output = self.run_linter("--allow-orphan", "MEMORY_*.md")
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("похож на индекс", output)
+
+    def test_without_the_key_the_same_file_is_discussed(self):
+        """Вторая половина пары: без ключа проверка про него говорит."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "MEMORY_staroe.md": "- [Старое](user.md) - прежняя раскладка\n",
+        })
+        code, output = self.run_linter()
+        self.assertIn("похож на индекс", output)
+        self.assertEqual(code, 1, output)
+
     def test_without_the_key_the_same_files_are_audited(self):
         """Вторая половина пары: без ключа те же файлы проверяются как все.
 
@@ -791,15 +820,23 @@ class IndexParsing(MemoryFixture):
         уже блок кода внутри пункта. Первая половина («не всегда два»)
         закреплена соседним тестом, вторая не держалась ничем - потолок
         можно было снять или поставить сорок, и набор оставался зелёным.
+
+        Первая редакция этого теста помечала файл `orphan: true`, и оба
+        исхода становились одинаковыми: строка разобралась - код 0, не
+        разобралась - тоже 0, потому что метка снимает L2. Полный
+        мутационный прогон это и показал: мутация выжила при зелёном тесте.
+        Метки тут нет намеренно: строка НЕ должна разобраться, значит файл
+        обязан всплыть сиротой.
         """
         self.write({
             "MEMORY.md": "-      Инфраструктура\n"
                          "       - [Сервер](server.md) - прод\n",
-            "server.md": "---\norphan: true\n---\nфакт\n",
+            "server.md": "факт\n",
         })
         code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-        self.assertEqual(findings(output, "L1"), [], output)
+        self.assertEqual(code, 1, output)
+        self.assertTrue([line for line in findings(output, "L2")
+                         if "server.md" in line], output)
 
     def test_an_indented_block_after_plain_text_is_still_code(self):
         """Вторая половина пары: после обычного текста отступ - это блок кода.
@@ -3220,6 +3257,40 @@ class UnreadableEntries(MemoryFixture):
         code, output = self.run_linter("--allow-orphan", "vendor/*.md")
         self.assertEqual(code, 1, output)
         self.assertNotIn("chuzhoe.md", output)
+
+    def test_a_path_that_cannot_be_relativised_is_named_not_fatal(self):
+        """Негодное имя - названная находка, а не падение всего прогона.
+
+        Имя устройства DOS (`con.md`, `nul.md`) система разрешает не в файл,
+        а в устройство, и относительный путь для него построить нельзя.
+        Без перехвата `ValueError` один такой файл ронял ВЕСЬ обход: верхний
+        перехват превращал это в код 2, а на коде 2 хук коммит пропускает -
+        то есть один файл молча выключал проверку всей памяти.
+
+        Отказ подделываем на уровне `relpath`, и имя в фикстуре обычное:
+        настоящий `con.md` на Windows не создаётся вовсе - запись уходит в
+        консольное устройство, файла на диске не появляется, и фикстура
+        проверяла бы пустоту. Проверяем ветку, а не устройство файловой
+        системы.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "strannoe.md": "факт\n",
+        })
+        original = linter.os.path.relpath
+
+        def refusing(path, start):
+            if os.path.basename(path) == "strannoe.md":
+                raise ValueError("path is on mount '\\\\.\\con'")
+            return original(path, start)
+
+        with unittest.mock.patch.object(linter.os.path, "relpath", refusing):
+            code, output = self.run_linter()
+
+        self.assertEqual(code, 2, output)
+        self.assertIn("strannoe.md", output)
+        self.assertIn("в проверку не попало", output)
 
     def test_an_unreadable_index_still_names_the_unreadable_file(self):
         """Заметка о нечитаемом файле не должна теряться вместе с индексом.
