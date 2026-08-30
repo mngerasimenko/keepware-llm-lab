@@ -1320,6 +1320,77 @@ class FilesAppearInIndex(MemoryFixture):
         self.assertIn("infra/MEMORY.md", output)
 
 
+class NamesakeCountIsUsedHonestly(MemoryFixture):
+    """Число однофамильцев в подсказке - настоящее, а не «больше одного».
+
+    Полный мутационный прогон показал эту ветку выжившей: любой тест ловил
+    её целиком или никак, а само ЧИСЛО не проверял никто. Пока так,
+    подсказка могла бы утверждать «файлов с таким именем несколько (2)»
+    там, где он один, - и человек шёл бы искать двойника, которого нет.
+    """
+
+    def test_the_hint_names_the_real_count(self):
+        """Трое под одним голым именем - в подсказке должна стоять тройка."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "см. dublikat.md рядом\n",
+            "a/dublikat.md": "факт\n",
+            "b/dublikat.md": "факт\n",
+            "c/dublikat.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        hint = [line for line in findings(output, "L2") if "несколько" in line]
+        self.assertTrue(hint, output)
+        self.assertIn("(3)", " ".join(hint),
+                      "в подсказке не настоящее число однофамильцев")
+
+    def test_a_unique_name_gets_no_ambiguity_hint(self):
+        """Вторая половина пары: однофамилец один - про «несколько» ни слова.
+
+        Без неё первая доказывала бы только, что подсказка умеет печатать
+        число, но не что она печатает ПРАВИЛЬНОЕ: мутация, жёстко ставящая
+        двойку, прошла бы незамеченной.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "см. odinokii.md рядом\n",
+            "a/odinokii.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("несколько", output)
+
+
+class NameFieldCaseCounts(MemoryFixture):
+    """L5 сравнивает имена посимвольно, а не с точностью до регистра.
+
+    Тоже выжившая мутация: единственный тест на L5 брал расхождение целым
+    словом, и подмена сравнения на `casefold` проходила незамеченной. Поле
+    `name` - свободный текст, L6 его не касается, поэтому `Feedback_Rule`
+    при файле `feedback_rule.md` прошло бы молча, а ссылка `[[…]]` по нему
+    не разрешилась бы: ровно та двоякость, ради которой L5 и заведён.
+    """
+
+    def test_a_case_only_mismatch_is_still_a_mismatch(self):
+        self.write({
+            "MEMORY.md": "- [Правило](feedback_rule.md) - как\n",
+            "feedback_rule.md": "---\nname: Feedback_Rule\n---\nправило\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertTrue(findings(output, "L5"), output)
+
+    def test_an_exact_match_passes(self):
+        """Вторая половина пары: совпало посимвольно - молчим."""
+        self.write({
+            "MEMORY.md": "- [Правило](feedback_rule.md) - как\n",
+            "feedback_rule.md": "---\nname: feedback_rule\n---\nправило\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+
 class StrictRootIndexModel(MemoryFixture):
     """Строгая модель корневого индекса (решение owner'а 26.08).
 
@@ -3890,21 +3961,68 @@ class PreCommitHook(unittest.TestCase):
         исключать их файлы незачем - а они съедали бюджет и заставляли хук
         отказаться от исключений целиком. Итог: блокировка здорового
         коммита ровно той починкой, которая снимала ложную тревогу.
+
+        Имена в поддереве длинные намеренно: бюджет считается в БАЙТАХ, и на
+        коротких именах вход не различал бы реализацию с фильтром и без.
+        Полный мутационный прогон показал ровно это - мутация выжила.
         """
         with io.open(os.path.join(self.repo, ".gitignore"), "w",
                      encoding="utf-8", newline="\n") as fh:
             fh.write("memory/.cache/\n")
         cache = os.path.join(self.repo, "memory", ".cache")
         os.makedirs(cache)
-        for number in range(250):
-            with io.open(os.path.join(cache, "f%d.md" % number), "w",
-                         encoding="utf-8", newline="\n") as fh:
+        long_name = "x" * 60
+        for number in range(400):
+            with io.open(os.path.join(cache, "%s%03d.md" % (long_name, number)),
+                         "w", encoding="utf-8", newline="\n") as fh:
                 fh.write("мусор\n")
         self.draft("chernoviki", "draft.md")
         self.git("add", ".gitignore", "memory/MEMORY.md", "memory/user.md")
         result = self.run_hook()
         printed = result.stdout.decode("utf-8", "replace")
         self.assertEqual(result.returncode, 0, printed)
+        self.assertNotIn("слишком много", printed,
+                         "файлы скрытого каталога съели бюджет исключений")
+
+    def test_the_budget_is_counted_in_bytes_not_in_files(self):
+        """Упираемся мы в длину командной строки, а не в число файлов.
+
+        Двести коротких имён проходят, а сто сорок длинных - нет: замер
+        показал код 126 на 199 черновиках со стосорокасимвольными именами.
+        Здесь черновиков заведомо больше двухсот, но все с короткими
+        именами - при счёте по файлам хук отказался бы от исключений и
+        заблокировал здоровый коммит, при счёте по байтам проходит.
+        """
+        for number in range(230):
+            self.draft("c", "d%03d.md" % number)
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        result = self.run_hook()
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, printed)
+        self.assertNotIn("слишком много", printed)
+
+    def test_the_glued_index_form_is_recognised(self):
+        """Форма `--index=ИМЯ` - такая же законная, как через пробел.
+
+        Пока ветка знала только форму через пробел, тот, кто написал вторую,
+        получал на КАЖДОМ коммите шесть строк «агент не увидит НИ ОДНОГО
+        факта» и совет вписать неверную строку импорта - с чужим именем
+        индекса. Мутационный прогон показал, что эту починку не сторожил
+        никто.
+        """
+        os.rename(os.path.join(self.repo, "memory", "MEMORY.md"),
+                  os.path.join(self.repo, "memory", "INDEX.md"))
+        self.git("config", "memorycheck.args", "--index=INDEX.md")
+        with io.open(os.path.join(self.repo, "CLAUDE.md"), "w",
+                     encoding="utf-8", newline="\n") as fh:
+            fh.write("@memory/INDEX.md\n")
+        self.git("add", "-A")
+        result = self.run_hook()
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, printed)
+        self.assertNotIn("НИ ОДНОГО факта", printed,
+                         "форма --index=ИМЯ не распознана, и хук сверялся "
+                         "с чужим именем индекса")
 
     def test_config_set_twice_does_not_lose_the_first_value(self):
         """`git config --get` молча отдаёт последнее из нескольких значений.
