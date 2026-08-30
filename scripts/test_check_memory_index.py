@@ -356,6 +356,74 @@ class IndexLinksToFiles(MemoryFixture):
         self.assertEqual(code, 0, output)
 
 
+class OneRowForm(MemoryFixture):
+    """У строки индекса ровно одна форма: `- [Заголовок](файл.md) - крючок`.
+
+    Markdown знает ещё две - через метку (`- [Текст][prof]` плюс
+    `[prof]: файл.md`) и сокращённую (`- [prof]`). Обе поддерживались, и
+    поддержка стоила дороже всего в разборе: словарь определений, правило
+    CommonMark «при повторе побеждает первое», второй проход (определение
+    законно стоит НИЖЕ ссылки на него), угловые скобки для путей с пробелом,
+    свёрнутая форма `[prof][]` и отдельный список TASK_MARKS - потому что
+    `- [ ]` неотличимо от сокращённой формы. Один круг ревью на этом сгорел:
+    чинили чеклист, сломали законную метку `[-]`.
+
+    Двенадцать тестов, закреплявших эти формы, удалены вместе с ними. Здесь
+    вместо них - стандарт целиком, с обеих сторон.
+    """
+
+    def test_reference_row_is_rejected_with_the_right_form_named(self):
+        """Отвергать надо ГРОМКО.
+
+        Если просто перестать разбирать чужую форму, строки не станут
+        строками, файлы всплывут сиротами, и человек будет видеть свои строки
+        глазами, не понимая претензии. Это ровно тот дефект, который чинили в
+        сообщении про недочитанный индекс.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - обычная форма\n"
+                         "- [Правило][prof] - форма через метку\n"
+                         "\n[prof]: feedback.md\n",
+            "user.md": "факт\n",
+            "feedback.md": "правило\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        rows = [line for line in findings(output, "L1")
+                if "записана через метку" in line]
+        self.assertEqual(len(rows), 2, output)
+        self.assertIn("`- [Заголовок](имя-файла.md) - крючок`", rows[0])
+
+    def test_normal_form_still_works(self):
+        """Вторая половина пары: единственная оставшаяся форма разбирается."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - крючок\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_bracketed_words_in_prose_are_not_rows(self):
+        """Сокращённая форма ушла - и вместе с ней повод разбирать чеклисты.
+
+        `- [ ]`, `- [x]` и любое `[слово]` в списке теперь просто проза. Пока
+        сокращённая форма считалась строкой индекса, их приходилось отличать
+        отдельным списком TASK_MARKS, и на этом уже ломались: `[-]` не
+        чекбокс ни в одном спек-совместимом рендерере, а из проверки его
+        исключили и сломали законную ссылку.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - крючок\n"
+                         "- [ ] не сделано\n"
+                         "- [x] сделано\n"
+                         "- [-] тоже не строка индекса\n"
+                         "- [prof] и это не строка\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+
 class IndexParsing(MemoryFixture):
     """Строки разбираются только там, где это действительно строки индекса."""
 
@@ -955,54 +1023,6 @@ class StrictRootIndexModel(MemoryFixture):
 class SmallerFindings(MemoryFixture):
     """Мелкое из шестого круга: ложная сирота, молчаливый пропуск, ключ вхолостую."""
 
-    def test_reference_style_row_is_a_real_row(self):
-        """`- [Профиль][prof]` с определением ниже - законный markdown.
-
-        Агент по такой ссылке дойдёт, а L2 объявлял файл забытым: строка не
-        подходила под шаблон `](`. Ложная тревога на честно оформленном индексе.
-        """
-        self.write({
-            "MEMORY.md": "- [Профиль][prof] - кто пользователь\n"
-                         "\n"
-                         "[prof]: user.md\n",
-            "user.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-
-    def test_collapsed_reference_row_is_a_real_row(self):
-        """Свёрнутая форма `- [user][]` - тот же случай, метка берётся из текста."""
-        self.write({
-            "MEMORY.md": "- [user][] - кто пользователь\n"
-                         "\n"
-                         "[user]: user.md\n",
-            "user.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-
-    def test_reference_style_row_with_broken_target_is_caught(self):
-        """Обратная сторона: разбирать - значит и ловить битое, а не просто молчать."""
-        self.write({
-            "MEMORY.md": "- [Профиль][prof] - кто\n"
-                         "\n"
-                         "[prof]: net-takogo.md\n",
-            "user.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        self.assertIn("net-takogo.md", output)
-
-    def test_reference_style_row_without_definition_is_caught(self):
-        """Метка без определения - строка никуда не ведёт, и это надо назвать."""
-        self.write({
-            "MEMORY.md": "- [Профиль][prof] - кто\n",
-            "user.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        self.assertIn("prof", output)
-
     def test_empty_destination_is_not_silently_skipped(self):
         """`- [Заголовок]()` - строка есть, адреса нет: молчать об этом нельзя.
 
@@ -1270,23 +1290,6 @@ class PanelReviewFindings(MemoryFixture):
         self.assertIn("скрыто 1 файл", output)
         self.assertNotIn("1 файлов", output)
 
-    def test_duplicate_definition_resolves_to_the_first_one(self):
-        """CommonMark: при повторе метки побеждает ПЕРВОЕ определение.
-
-        Код брал последнее - и это тихий пропуск: ссылка, которую увидит
-        агент и любой markdown-рендерер, ведёт в никуда, а проверка молчит.
-        """
-        self.write({
-            "MEMORY.md": "- [Профиль][prof] - кто\n"
-                         "\n"
-                         "[prof]: net-takogo.md\n"
-                         "[prof]: user.md\n",
-            "user.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        self.assertIn("net-takogo.md", output)
-
     def test_marker_works_anywhere_in_a_long_frontmatter(self):
         """Метка не зависит от того, какой строкой шапки записана.
 
@@ -1311,33 +1314,6 @@ class PanelReviewFindings(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
 
-    def test_shortcut_reference_row_is_a_real_row(self):
-        """Третья законная форма CommonMark: `- [prof]` без вторых скобок.
-
-        Под --quiet, которым зовёт хук, битая цель такой строки не давала
-        вообще ничего: пустой вывод и код 0.
-        """
-        self.write({
-            "MEMORY.md": "- [prof] - кто пользователь\n"
-                         "\n"
-                         "[prof]: user.md\n",
-            "user.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-
-    def test_shortcut_reference_with_broken_target_is_caught(self):
-        """Раз разбираем - значит и ловим битое."""
-        self.write({
-            "MEMORY.md": "- [prof] - кто\n"
-                         "\n"
-                         "[prof]: net-takogo.md\n",
-            "user.md": "факт\n",
-        })
-        code, output = self.run_linter("--quiet")
-        self.assertEqual(code, 1, output)
-        self.assertIn("net-takogo.md", output)
-
     def test_bracketed_text_without_a_definition_is_not_a_row(self):
         """Без определения `[что-то]` - обычный текст, а не ссылка.
 
@@ -1356,23 +1332,6 @@ class PanelReviewFindings(MemoryFixture):
 
 class MinorPanelFindings(MemoryFixture):
     """Мелкое из панельного ревью. Каждое дёшево чинится и незачем тащить в свет."""
-
-    def test_definition_target_in_angle_brackets_with_a_space(self):
-        """`[prof]: <моя папка/user.md>` - законный CommonMark.
-
-        В строке-ссылке пробел в адресе уже обрабатывался (угловые скобки
-        снимает clean_target), а в определении метки регулярка обрывалась на
-        первом пробеле: получался адрес «<моя», ложная битая ссылка И ложная
-        сирота на реально существующий файл.
-        """
-        self.write({
-            "MEMORY.md": "- [Профиль][prof] - кто\n"
-                         "\n"
-                         "[prof]: <moya papka/user.md>\n",
-            "moya papka/user.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
 
     def test_unclosed_fence_notice_says_how_many_rows_were_lost(self):
         """«Строки ниже в разбор не попали» - а сколько их было?
@@ -1450,39 +1409,6 @@ class MinorPanelFindings(MemoryFixture):
 
 class SecondRoundFindings(MemoryFixture):
     """Второй круг ревью: регрессии, внесённые правками первого круга."""
-
-    def test_task_list_checkbox_is_not_a_shortcut_reference(self):
-        """`- [x] сделано` - чеклист, а не ссылка, даже если метка `[x]` определена.
-
-        Сокращённая форма ссылки-метки, добавленная первым кругом, матчила
-        любую строку `- [текст]`. Стоило в том же файле оказаться определению
-        `[x]: файл.md` - и обычный список задач начинал резолвиться как строки
-        индекса, блокируя честный коммит. Чеклисты и определения меток
-        сосуществуют в реальных файлах постоянно.
-        """
-        self.write({
-            "MEMORY.md": "- [Один факт](real.md) - обычная строка\n"
-                         "\n"
-                         "[x]: nowhere.md\n"
-                         "\n"
-                         "- [x] почистить бэклог\n"
-                         "- [ ] следующая задача\n",
-            "real.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-
-    def test_shortcut_reference_still_works_next_to_checkboxes(self):
-        """Обратная сторона: настоящая сокращённая ссылка не должна пострадать."""
-        self.write({
-            "MEMORY.md": "- [prof] - кто пользователь\n"
-                         "- [ ] это чеклист\n"
-                         "\n"
-                         "[prof]: user.md\n",
-            "user.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
 
     def test_mention_hint_respects_the_path_boundary(self):
         """`vendor/user.md` в чужом тексте - не упоминание нашего `user.md`.
@@ -1710,40 +1636,6 @@ class ThirdRoundFindings(MemoryFixture):
         about = [line for line in output.splitlines() if line.startswith("L2 user.md")]
         self.assertEqual(len(about), 1, output)
         self.assertNotIn("spisok.md", about[0])
-
-    def test_dash_label_is_a_reference_not_a_checkbox(self):
-        """`[-]` чекбоксом не является ни в одном спек-совместимом рендерере.
-
-        Исключая его вместе с `[ ]` и `[x]`, мы ломали законную ссылку-метку -
-        то есть создавали ровно тот вред, который правка про чеклисты
-        закрывала, просто на более редком входе.
-        """
-        self.write({
-            "MEMORY.md": "- [-] - метка, названная дефисом\n"
-                         "\n"
-                         "[-]: real.md\n",
-            "real.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-
-    def test_checkbox_marks_are_still_not_references(self):
-        """Обратная сторона: `[ ]` и `[x]` остаются чеклистом.
-
-        Здесь компромисс осознанный: GitHub тоже отдаёт приоритет чекбоксу.
-        """
-        self.write({
-            "MEMORY.md": "- [Один факт](real.md) - обычная строка\n"
-                         "\n"
-                         "[x]: nowhere.md\n"
-                         "\n"
-                         "- [x] почистить бэклог\n"
-                         "- [X] и заглавной тоже\n"
-                         "- [ ] следующая задача\n",
-            "real.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
 
     def test_same_basename_elsewhere_is_a_real_source(self):
         """Упоминание в файле с тем же именем, но в другой папке - не самоупоминание.

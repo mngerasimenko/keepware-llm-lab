@@ -61,12 +61,16 @@ MUTATIONS = [
     ("забор кода закрывается чем угодно", LINTER,
      "    return mark[0] == opened[0] and len(mark) >= len(opened)",
      "    return True"),
-    ("чеклисты разбираются как ссылки-метки", LINTER,
-     'TASK_MARKS = {"", "x"}', "TASK_MARKS = set()"),
-    ("при повторе метки побеждает последнее определение", LINTER,
-     "            definitions.setdefault(definition.group(1).strip().casefold(),\n"
-     "                                   definition.group(2).strip())",
-     "            definitions[definition.group(1).strip().casefold()] = definition.group(2).strip()"),
+    # Три мутации - про чеклисты, про приоритет первого определения и про
+    # угловые скобки в адресе метки - удалены вместе с формами, которые они
+    # охраняли. Осталась одна: чужая форма обязана отвергаться ГРОМКО, иначе
+    # строки не разберутся молча и файлы всплывут сиротами.
+    ("чужая форма строки индекса пропускается молча", LINTER,
+     '            rows.append((reference.group(1).strip(), "", lineno, "wrong-form"))',
+     "            pass"),
+    ("определение метки пропускается молча", LINTER,
+     '            rows.append((definition.group(1).strip(), "", lineno, "wrong-form"))',
+     "            pass"),
     ("счётчик потерянных строк не сбрасывается забором", LINTER,
      '                opened_fence = ""\n                lost_rows = 0',
      '                opened_fence = ""'),
@@ -77,9 +81,6 @@ MUTATIONS = [
     ("счётчик потерянных строк не сбрасывается комментарием", LINTER,
      "            lost_rows = 0\n        line = COMPLETE_COMMENT",
      "        line = COMPLETE_COMMENT"),
-    ("адрес метки не понимает угловые скобки", LINTER,
-     r'DEFINITION = re.compile(r"^\[([^\]]+)\]:\s*(<[^>]*>|\S+)")',
-     r'DEFINITION = re.compile(r"^\[([^\]]+)\]:\s*(\S+)")'),
     # Две мутации про метку-комментарий («действует изнутри блока кода» и
     # «действует из инлайнового кода») удалены вместе с самой меткой: способ
     # пометить файл теперь один, и держится он шапкой, а не обходом заборов.
