@@ -1053,7 +1053,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             if actual is not None:
                 actual_rel = relative_to_root(root, actual)
                 per_index[where].append((title, actual_rel))
-                if actual_rel in index_rels and actual_rel != where:
+                if actual_rel in index_rels:
                     index_links[where].add(actual_rel)
                 row_key = (where, title, actual_rel)
                 if row_key in seen_rows:
