@@ -24,7 +24,7 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(SCRIPTS_DIR)
@@ -525,7 +525,8 @@ class InterruptedRunCleansUpAfterItself(unittest.TestCase):
         backup = os.path.join(folder, ".mutation-backup")
         with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
                 unittest.mock.patch.object(mutation_check, "LINTER", target):
-            mutation_check.save_backup(stranger, "ПОДМЕНА\n")
+            mutation_check.save_backup(stranger, "ПОДМЕНА\n", "\n",
+                                       "МУТАЦИЯ\n")
             with redirect_stdout(io.StringIO()) as printed:
                 restored = mutation_check.restore_interrupted()
 
@@ -584,6 +585,193 @@ class InterruptedRunCleansUpAfterItself(unittest.TestCase):
             # Вторая половина пары: посторонний файл своим не становится.
             self.assertIsNone(mutation_check.resolve_ours(
                 os.path.join(folder, "postoronnii.py")))
+
+    def test_the_file_is_addressed_by_our_name_not_by_the_backup_string(self):
+        """Опознание возвращает своё имя - и восстановление им ПОЛЬЗУЕТСЯ.
+
+        Сосед проверяет возвращаемое значение, а это - обращения к диску, и
+        разница между ними не педантизм: убери из `restore_interrupted`
+        строку `path = ours` - то есть ровно ту починку, ради которой всё и
+        писалось, - и на Windows набор остаётся ЗЕЛЁНЫМ. Ловил её только
+        тест про windows-стиль и только на POSIX, то есть половина матрицы
+        CI не проверяла половину починки. Здесь смотрим на адрес, а адрес
+        от системы не зависит.
+        """
+        folder, target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        odd_form = os.path.join(folder, ".", os.path.basename(target))
+        addressed = []
+
+        real_read = mutation_check.read_source
+        real_write = mutation_check.write_atomically
+
+        def spy_read(path):
+            addressed.append(path)
+            return real_read(path)
+
+        def spy_write(path, text, newline="\n"):
+            addressed.append(path)
+            return real_write(path, text, newline)
+
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
+                unittest.mock.patch.object(mutation_check, "LINTER", target):
+            mutation_check.save_backup(odd_form, "ОРИГИНАЛ\n", "\n",
+                                       "МУТАЦИЯ\n")
+            with io.open(target, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("МУТАЦИЯ\n")
+            with unittest.mock.patch.object(
+                    mutation_check, "read_source", spy_read), \
+                    unittest.mock.patch.object(
+                        mutation_check, "write_atomically", spy_write), \
+                    redirect_stdout(io.StringIO()):
+                mutation_check.restore_interrupted()
+
+        # Слепок пишется до всего этого, поэтому в списке только цель.
+        self.assertEqual(addressed, [target, target],
+                         "файл адресован строкой из слепка, а не своим именем")
+
+    def test_the_hook_is_restored_too_not_only_the_linter(self):
+        """Инструмент правит ДВА файла - восстанавливать обязан оба.
+
+        Все соседние тесты подменяют только LINTER, поэтому вторая половина
+        перебора в `resolve_ours` не держалась ничем: сузь его до одного
+        файла - и набор останется зелёным, а оборванный прогон по хуку
+        оставит мутацию в дереве навсегда.
+        """
+        folder, target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
+                unittest.mock.patch.object(mutation_check, "LINTER",
+                                           os.path.join(folder, "drugoi.py")), \
+                unittest.mock.patch.object(mutation_check, "HOOK", target):
+            mutation_check.save_backup(target, "ОРИГИНАЛ\n", "\n",
+                                       "МУТАЦИЯ\n")
+            with io.open(target, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("МУТАЦИЯ\n")
+            with redirect_stdout(io.StringIO()):
+                restored = mutation_check.restore_interrupted()
+
+        self.assertTrue(restored, "слепок хука признан посторонним")
+        with io.open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "ОРИГИНАЛ\n")
+
+    def test_a_file_that_vanished_is_restored_not_blamed(self):
+        """Файла нет - это ровно тот случай, ради которого слепок и лежит.
+
+        Ветка `current is None` единственная проходит МИМО обоих сторожей
+        («совпало с оригиналом» и «не моя мутация») и пишет вслепую, а
+        держалась ничем: замени отдельный перехват `FileNotFoundError` на
+        общий отказ - и набор остаётся зелёным, а пропавший файл больше
+        никогда не восстанавливается.
+        """
+        folder, target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
+                unittest.mock.patch.object(mutation_check, "LINTER", target):
+            mutation_check.save_backup(target, "ОРИГИНАЛ\n", "\n",
+                                       "МУТАЦИЯ\n")
+            os.remove(target)          # прогон убили между записью и правкой
+            with redirect_stdout(io.StringIO()) as printed:
+                restored = mutation_check.restore_interrupted()
+
+        self.assertTrue(restored, "пропавший файл не восстановлен")
+        with io.open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "ОРИГИНАЛ\n")
+        self.assertNotIn("не знаю, что там лежит", printed.getvalue())
+
+    def test_an_empty_name_in_the_backup_is_refused(self):
+        """Пустое имя - не «наш файл по умолчанию».
+
+        Отсечка пустого имени стоит перед опознанием, и без неё пустая
+        строка уходит в `resolve_ours`, где `abspath("")` даёт текущий
+        каталог. Ни один тест этого не держал.
+        """
+        folder, _target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        with io.open(backup, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\tlf\totpechatok\nОРИГИНАЛ\n")
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup):
+            with redirect_stdout(io.StringIO()) as printed:
+                restored = mutation_check.restore_interrupted()
+
+        self.assertFalse(restored)
+        self.assertTrue(os.path.exists(backup))
+        self.assertIn("имя пустое", printed.getvalue())
+
+    def test_a_backup_without_a_fingerprint_is_refused(self):
+        """Старый формат слепка - отказ, а не «сторож пропускается».
+
+        В репозитории было два прежних формата шапки, и сегодняшний разбор
+        оба читает как «отпечатка нет». Пока условие сторожа начиналось с
+        `left and`, такой слепок ОТКЛЮЧАЛ проверку «в дереве не моя
+        мутация» - и час чужой работы затирался содержимым месячной
+        давности, с сообщением об успехе.
+        """
+        folder, target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        with io.open(backup, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("%s\tlf\nОРИГИНАЛ\n" % target)
+        with io.open(target, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("ЧАС РАБОТЫ\n")
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
+                unittest.mock.patch.object(mutation_check, "LINTER", target):
+            with redirect_stdout(io.StringIO()) as printed:
+                restored = mutation_check.restore_interrupted()
+
+        self.assertFalse(restored)
+        with io.open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "ЧАС РАБОТЫ\n", "чужую работу затёрли")
+        self.assertTrue(os.path.exists(backup))
+        self.assertIn("нет отпечатка", printed.getvalue())
+
+    def test_an_unknown_line_ending_in_the_backup_is_refused(self):
+        """Незнакомое слово в поле переводов строк - отказ, а не молчаливый LF.
+
+        `NEWLINE_BY_NAME.get(kind, "\n")` чинил бы одно, переписав другое:
+        файл с CRLF вернулся бы в дерево целиком в LF - ровно тот ущерб,
+        ради которого поле и заведено.
+        """
+        folder, target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        with io.open(backup, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("%s\tнечто\totpechatok\nОРИГИНАЛ\n" % target)
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
+                unittest.mock.patch.object(mutation_check, "LINTER", target):
+            with redirect_stdout(io.StringIO()) as printed:
+                restored = mutation_check.restore_interrupted()
+
+        self.assertFalse(restored)
+        self.assertTrue(os.path.exists(backup))
+        self.assertIn("незнакомый вид переводов строк", printed.getvalue())
+
+    def test_a_backup_left_behind_stops_the_run(self):
+        """Слепок остался - прогон не начинается.
+
+        Возврат `restore_interrupted()` в `main()` отбрасывался, и «не
+        трогаю, разберитесь руками» ничего не останавливало: прогон шёл
+        дальше, первая же мутация перезаписывала слепок, `finally` его
+        удалял, и инструмент выходил с нулём, отрапортовав полный успех.
+        Обещание сохранить единственную копию оригинала жило полторы
+        секунды.
+        """
+        folder, _target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        with io.open(backup, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("postoronnii.txt\tlf\totpechatok\nЧУЖОЕ\n")
+        # LINTER - путь ОТНОСИТЕЛЬНО корня, и main первым делом проверяет,
+        # что файл на месте. Без этого тест уходит в ветку «запускать из
+        # корня репозитория» и проверяет не то, что написано в имени.
+        here = os.getcwd()
+        os.chdir(REPO_DIR)
+        self.addCleanup(os.chdir, here)
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup):
+            with redirect_stdout(io.StringIO()), \
+                    redirect_stderr(io.StringIO()) as complained:
+                code = mutation_check.main([])
+
+        self.assertEqual(code, 1, "прогон пошёл поверх чужого слепка")
+        self.assertTrue(os.path.exists(backup), "слепок затёрт прогоном")
+        self.assertIn("запускать нельзя", complained.getvalue())
 
     def test_an_interruption_before_the_mutation_landed_is_quiet(self):
         """Обрыв ДО применения мутации - не «кто-то уже поправил».
@@ -758,7 +946,7 @@ class LineEndingsSurviveTheRewrite(unittest.TestCase):
         with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
                 unittest.mock.patch.object(mutation_check, "LINTER", path):
             text, seen = mutation_check.read_source(path)
-            mutation_check.save_backup(path, text, seen)
+            mutation_check.save_backup(path, text, seen, "МУТАЦИЯ\n")
             with io.open(path, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write("МУТАЦИЯ\n")          # здесь прогон оборвали
             with redirect_stdout(io.StringIO()):

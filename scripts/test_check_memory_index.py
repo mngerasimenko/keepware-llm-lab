@@ -4162,6 +4162,43 @@ class PreCommitHook(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
 
+    def with_fake_tool(self, name, body):
+        """Кладёт заглушку утилиты и возвращает каталог для PATH."""
+        fake = os.path.join(self.repo, "fakebin")
+        if not os.path.isdir(fake):
+            os.makedirs(fake)
+        target = os.path.join(fake, name)
+        with io.open(target, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(body)
+        os.chmod(target, 0o755)
+        return fake
+
+    def run_hook_with_path(self, extra):
+        """Хук с добавленным каталогом в PATH - ИЗНУТРИ оболочки.
+
+        Через окружение процесса подмена доходит не до всякого sh: обёртка
+        `Git/bin/sh.exe` (а на windows-latest `find_sh` находит именно её)
+        ставит свой `/usr/bin` ПЕРЕД унаследованным PATH. Настоящая утилита
+        отрабатывала, хук молча выходил с нулём, и тест краснел, проверив
+        ровно ничего. Изнутри оболочки переставлять уже нечему.
+        """
+        return subprocess.run(
+            [self.sh, "-c", 'PATH="$1:$PATH"; export PATH; exec "$2"',
+             "_", extra, os.path.join(self.repo, ".githooks", "pre-commit")],
+            cwd=self.repo, env=os.environ.copy(),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+
+    def substitution_reaches_the_shell(self, extra, tool):
+        """Дошла ли подмена до оболочки. Пропускать можно только по ней."""
+        return subprocess.run(
+            [self.sh, "-c",
+             'PATH="$1:$PATH"; export PATH; "$2" --version >/dev/null 2>&1',
+             "_", extra, tool],
+            cwd=self.repo, env=os.environ.copy(),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        ).returncode != 0
+
     def draft(self, *parts):
         """Кладёт неотслеживаемый черновик в папку памяти."""
         path = os.path.join(self.repo, "memory", *parts)
@@ -4346,38 +4383,95 @@ class PreCommitHook(unittest.TestCase):
         отказа, ради которого `say` написан с «|| :». Подменяем `sed`
         заглушкой, выходящей с ненулевым кодом.
         """
-        fake = os.path.join(self.repo, "fakebin")
-        os.makedirs(fake)
-        with io.open(os.path.join(fake, "sed"), "w", encoding="utf-8",
-                     newline="\n") as fh:
-            fh.write("#!/bin/sh\nexit 3\n")
-        os.chmod(os.path.join(fake, "sed"), 0o755)
+        # Заглушка ПЕЧАТАЕТ половину списка и падает. Молчаливый `exit 3`
+        # реализации не различал: при пустом выводе ветку держит `-z`, и
+        # мутация «убрать явную проверку статуса» оставалась зелёной - то
+        # есть тест охранял только `set +e`, а не то, ради чего написан.
+        # Оборвавшийся на середине потока sed (ошибка записи, битый
+        # multibyte) отдаёт ровно такую половину.
+        fake = self.with_fake_tool(
+            "sed", "#!/bin/sh\necho --allow-orphan=drugoi.md\nexit 3\n")
         self.draft("chernoviki", "draft.md")
         self.git("add", "memory/MEMORY.md", "memory/user.md")
-        env = os.environ.copy()
-        env["PATH"] = fake + os.pathsep + env.get("PATH", "")
-        # Подмена через PATH доходит не до всякого sh. Обёртка
-        # `Git\bin\sh.exe` ставит свой `/usr/bin` ПЕРЕД унаследованным
-        # PATH, до заглушки очередь не доходит, настоящий sed отрабатывает,
-        # и хук молча выходит с нулём - тест краснел на windows-latest,
-        # проверив ровно ничего. Спрашиваем прямо: подменился ли sed. Само
-        # проверяемое свойство - что `|| :` не даёт `set -e` оборвать
-        # скрипт - принадлежит тексту хука, а не системе, и на POSIX,
-        # где подмена действует, оно проверяется по-настоящему.
-        probe = subprocess.run(
-            [self.sh, "-c", "sed --version >/dev/null 2>&1"],
-            cwd=self.repo, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        if probe.returncode != 3:
-            self.skipTest("подмена sed через PATH не доходит до этого sh: "
-                          "код %d вместо 3" % probe.returncode)
-        result = self.run_hook(env=env)
+        # Пропускаем ТОЛЬКО если подмена не дошла до оболочки. Прежняя
+        # редакция сравнивала код с тройкой из тела заглушки - два
+        # независимых литерала: поправь заглушку на `exit 4`, и тест начнёт
+        # молча пропускаться ВЕЗДЕ, включая Linux, где он единственный
+        # сторож обоих `set +e`. Заодно 126 (каталог смонтирован noexec) и
+        # 127 больше не считаются «подмены нет»: хук в этих случаях получает
+        # от sed ненулевой код, то есть ровно то, что проверяется.
+        if not self.substitution_reaches_the_shell(fake, "sed"):
+            self.skipTest("подмена sed не доходит до этого sh")
+        result = self.run_hook_with_path(fake)
         printed = result.stdout.decode("utf-8", "replace")
         # Непустоты вывода мало: оборванный хук успевает напечатать
         # предыдущие строки, и тест проходит на обеих реализациях. Требуем,
         # чтобы он ДОШЁЛ до вердикта - своя жалоба и код 1.
         self.assertEqual(result.returncode, 1, printed)
         self.assertIn("не смог подготовить исключения", printed)
+
+    def test_drafts_named_in_quotes_do_not_fake_a_failure(self):
+        """Все черновики в кавычках - не повод жаловаться на сбой.
+
+        Имена с кавычкой git отдаёт закавыченными, и такие хук исключать не
+        берётся - разбирать это в sh отдельная задача. Но счётчик набирался
+        ДО отсева: если закавычены были ВСЕ черновики, дальше блок
+        исключений уходил работать по пустому списку и печатал «не смог
+        подготовить исключения» - жалобу на сбой, которого не было.
+
+        Различающую способность этого теста я не проверял: имя с кавычкой
+        создаётся только на POSIX, а откат починки на Linux мне тут негде
+        прогнать. На Windows тест пропускается.
+        """
+        if os.name == "nt":
+            self.skipTest("имя с кавычкой на Windows не создать")
+        self.draft('stranno"e.md')
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        printed = self.run_hook().stdout.decode("utf-8", "replace")
+        self.assertIn("имена в кавычках", printed)
+        self.assertNotIn("не смог подготовить исключения", printed)
+
+    def test_a_failing_tr_does_not_abort_the_hook(self):
+        """Замер длины был единственным местом без `set +e`.
+
+        Под `set -e` код упавшего `tr` обрывал весь скрипт на присваивании -
+        и человек получал отклонённый коммит с ПУСТЫМ выводом, тот самый
+        режим отказа, ради которого соседний блок обёрнут двадцатью
+        строками выше. Второе, что здесь проверяется, - что статус смотрят
+        ОТДЕЛЬНО от результата: замер, вернувший годное на вид число вместе
+        с ошибкой, иначе уходит в бюджет как настоящий.
+        """
+        # Заглушка ПЕЧАТАЕТ правдоподобное число и падает. Молчаливый
+        # `exit 3` не различал двух сторожей: пустой вывод ловится проверкой
+        # «а число ли это», и откат проверки статуса оставался зелёным.
+        # Числом сторожа разводятся: результат выглядит годным, и поймать
+        # подлог может только статус.
+        fake = self.with_fake_tool("tr", "#!/bin/sh\necho 42\nexit 3\n")
+        self.draft("chernoviki", "draft.md")
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        if not self.substitution_reaches_the_shell(fake, "tr"):
+            self.skipTest("подмена tr не доходит до этого sh")
+        result = self.run_hook_with_path(fake)
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertIn("не смог измерить длину аргументов", printed)
+
+    def test_a_failing_wc_does_not_switch_the_budget_off_silently(self):
+        """Упавший `wc` не виден по статусу - его прячет следующий `tr`.
+
+        Статус конвейера берётся у последней команды, поэтому проверки
+        статуса тут мало: `DRAFT_BYTES` выходил ПУСТЫМ, а `[ "" -gt 30000 ]`
+        внутри `if` от `set -e` освобождён - бюджет молча выключался ровно
+        там, где должен был сработать, и argv переполнялся кодом 126 без
+        единой строки объяснения.
+        """
+        fake = self.with_fake_tool("wc", "#!/bin/sh\nexit 3\n")
+        self.draft("chernoviki", "draft.md")
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        if not self.substitution_reaches_the_shell(fake, "wc"):
+            self.skipTest("подмена wc не доходит до этого sh")
+        result = self.run_hook_with_path(fake)
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertIn("не смог измерить длину аргументов", printed)
 
     def test_ignored_files_do_not_eat_the_exclusion_budget(self):
         """Игнорируемое поддерево вытесняло настоящий черновик.
