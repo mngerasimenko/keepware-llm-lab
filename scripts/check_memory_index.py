@@ -48,9 +48,8 @@ import os
 import re
 import stat
 import sys
-import unicodedata
 from collections import Counter, defaultdict
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
 # Строка индекса: "- [Заголовок](файл.md) - крючок".
 # Внутри заголовка допускаем один уровень скобок: "[VPScan [beta]](vps.md)".
@@ -128,23 +127,6 @@ def force_utf8_output():
             pass  # поток без reconfigure или уже отсоединённый - не повод падать
 
 
-def nfc(text):
-    """Одна форма записи имени.
-
-    Одно и то же имя файла существует в нескольких формах Юникода: «é» одной
-    кодовой точкой и «e» плюс комбинирующий акут выглядят одинаково везде -
-    в редакторе, в проводнике, в выводе. Сравнение по кодовым точкам считает
-    их разными, и человек получает сразу две ошибки на исправной памяти:
-    «ссылка в никуда» и «файл не упомянут». Подсказка про регистр тут не
-    помогает - это не регистр.
-
-    macOS создаёт имена в разложенной форме, Windows и Linux хранят как дали;
-    файл, приехавший из архива или облака, может отличаться формой от того,
-    что человек набрал в индексе.
-    """
-    return unicodedata.normalize("NFC", text)
-
-
 def read_text(path):
     """Читаем как UTF-8, молча съедая BOM (файлы могли создаваться на Windows)."""
     with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
@@ -166,19 +148,28 @@ def is_external(target):
     return len(scheme) > 1
 
 
-def clean_target(raw):
-    """Убираем то, что по markdown частью адреса не является."""
-    target = raw.strip()
+# Подсказка в кавычках: `[X](file.md "подсказка")` - законный markdown, в
+# индексе бессмысленный: описание несёт крючок после дефиса, а читает индекс
+# агент, которому наводить нечем.
+QUOTED_TITLE = re.compile(r"^\S+\s+[\"'].*[\"']$")
+
+
+def extra_address_form(target):
+    """Как записан адрес, если не голым путём. Иначе None.
+
+    Форм у адреса, как и у строки, было три. Угловые скобки в markdown нужны
+    ровно для пробела или круглой скобки в пути - после L6 ни того, ни
+    другого в именах памяти не бывает, и форма осталась без задачи.
+
+    Отвергаем громко и здесь: молча не разобрав адрес, мы превратили бы
+    «<user.md>» в «ссылку в никуда», и человек пошёл бы искать пропавший
+    файл вместо того, чтобы убрать скобки.
+    """
     if target.startswith("<"):
-        end = target.find(">")
-        if end != -1:
-            return target[1:end].strip()
-        return target[1:].strip()
-    # Подсказка в кавычках: [X](file.md "подсказка") - легальный markdown.
-    match = re.match(r"^(\S+)\s+[\"'].*[\"']$", target)
-    if match:
-        return match.group(1)
-    return target
+        return "в угловых скобках"
+    if QUOTED_TITLE.match(target):
+        return "с подсказкой в кавычках"
+    return None
 
 
 def parse_index(path):
@@ -371,7 +362,7 @@ def build_file_map(root):
         prune_non_memory_dirs(folder, dirs, linked_dirs)
         for name in sorted(names):
             path = os.path.normpath(os.path.join(folder, name))
-            rel = nfc(os.path.relpath(path, root).replace(os.sep, "/"))
+            rel = os.path.relpath(path, root).replace(os.sep, "/")
             exact[rel] = path
             folded.setdefault(rel.casefold(), path)
     return exact, folded, unreadable_dirs, linked_dirs
@@ -429,7 +420,7 @@ def relative_to_root(root, path):
         return None
     if os.path.isabs(rel) or rel == os.pardir or rel.startswith(os.pardir + os.sep):
         return None
-    return nfc(rel.replace(os.sep, "/"))
+    return rel.replace(os.sep, "/")
 
 
 def frontmatter_lines(text):
@@ -1004,7 +995,21 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                     % (where, lineno, title)
                 )
                 continue
-            target = clean_target(raw_target)
+            target = raw_target.strip()
+            # У адреса, как и у самой строки, одна форма: голый путь. Markdown
+            # знает ещё две - в угловых скобках (нужны для пробела в пути) и с
+            # подсказкой в кавычках. После L6 пробелов в путях памяти не
+            # бывает, а подсказка в индексе бессмысленна: описание несёт
+            # крючок после дефиса. Отвергаем явно - иначе адрес «<user.md>»
+            # или «user.md "текст"» превратился бы в «ссылку в никуда», и
+            # человек чинил бы не то.
+            wrong = extra_address_form(target)
+            if wrong:
+                errors.append(
+                    "L1 %s:%d адрес записан %s: `%s`. В индексе одна форма - "
+                    "голый путь: `- [%s](имя-файла.md) - крючок`"
+                    % (where, lineno, wrong, target, title))
+                continue
             if not target:
                 # Прежде такая строка отбрасывалась вместе с якорями: человек
                 # видит строку в индексе и считает файл упомянутым, а адреса нет.
@@ -1018,8 +1023,12 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             if is_external(target):
                 continue
 
+            # Без unquote: `%20` в адресе нужен был для пробела в пути, а L6
+            # его запрещает. Разворачивать проценты теперь значило бы
+            # обслуживать случай, которого правило не допускает, - и заодно
+            # ломать файл, в имени которого процент стоит буквально.
             absolute = os.path.normpath(
-                os.path.join(os.path.dirname(index_path), unquote(target.split("#", 1)[0]))
+                os.path.join(os.path.dirname(index_path), target.split("#", 1)[0])
             )
             rel = relative_to_root(root, absolute)
             if rel is None:

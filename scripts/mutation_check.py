@@ -232,8 +232,15 @@ MUTATIONS = [
      "    looks_like_yaml = any(YAML_PAIR.match(line) for line in head)\n"
      "    return [], looks_like_yaml",
      "    return [], True"),
-    ("разные формы записи имени считаются разными файлами", LINTER,
-     '    return unicodedata.normalize("NFC", text)', "    return text"),
+    # Мутация про нормализацию юникода ушла вместе с самой нормализацией:
+    # разные формы записи «é» возможны только в не-латинском имени, а L6 такие
+    # имена запрещает. Обработчик того, чего правило не допускает.
+    ("лишняя форма адреса пропускается молча", LINTER,
+     "            wrong = extra_address_form(target)\n            if wrong:",
+     "            wrong = extra_address_form(target)\n            if False:"),
+    ("угловые скобки в адресе снова принимаются", LINTER,
+     '    if target.startswith("<"):\n        return "в угловых скобках"',
+     '    if False:\n        return "в угловых скобках"'),
     ("однофамильцы считаются неверно", LINTER,
      "                namesakes = namesake_counts[os.path.basename(rel)]",
      "                namesakes = 1"),

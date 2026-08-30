@@ -269,11 +269,36 @@ class IndexLinksToFiles(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
 
-    def test_link_title_in_quotes_is_stripped(self):
-        """[X](file.md \"подсказка\") - легальный markdown, не битая ссылка."""
+    def test_address_has_one_form_too(self):
+        """У адреса, как и у строки, одна форма - голый путь.
+
+        Markdown знает ещё две: в угловых скобках (нужны ровно для пробела в
+        пути - после L6 их в памяти не бывает) и с подсказкой в кавычках
+        (в индексе бессмысленна: описание несёт крючок после дефиса, а
+        читает индекс агент, которому наводить нечем).
+
+        Отвергаем громко: молча не разобрав адрес, проверка превратила бы
+        `<user.md>` в «ссылку в никуда», и человек пошёл бы искать пропавший
+        файл вместо того, чтобы убрать скобки.
+        """
         self.write({
-            "MEMORY.md": '- [Профиль](user.md "Профиль пользователя") - кто\n',
+            "MEMORY.md": '- [Раз](user.md "Профиль пользователя") - подсказка\n'
+                         '- [Два](<user.md>) - угловые скобки\n',
             "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        wrong = [line for line in findings(output, "L1") if "адрес записан" in line]
+        self.assertEqual(len(wrong), 2, output)
+        self.assertIn("с подсказкой в кавычках", wrong[0])
+        self.assertIn("в угловых скобках", wrong[1])
+
+    def test_bare_path_is_accepted(self):
+        """Вторая половина пары: единственная форма разбирается как прежде."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Сервер](infra/prod.md) - прод\n",
+            "user.md": "факт\n",
+            "infra/prod.md": "факт\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
