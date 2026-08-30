@@ -18,6 +18,7 @@ import io
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -109,6 +110,7 @@ class MutationCheckIsAlive(unittest.TestCase):
             seen["command"] = list(command)
             seen["env"] = kwargs.get("env") or {}
             seen["apart"] = apart
+            seen["kwargs"] = kwargs
             return FakeResult()
 
         with unittest.mock.patch.object(mutation_check, "run_apart", fake_run):
@@ -128,6 +130,14 @@ class MutationCheckIsAlive(unittest.TestCase):
             seen["env"].get("MEMCHECK_REQUIRE_SH"), "1",
             "без этой переменной тесты хука пропускаются, и три мутации по "
             "хуку печатаются как ВЫЖИВШИЕ - хотя их просто не проверяли")
+        # Вывод обязан перехватываться. Подмена запуска делает это невидимым:
+        # первая редакция этой обёртки потеряла `stdout=PIPE` при правке,
+        # вывод набора ушёл в терминал, инструменту досталась пустота - и он
+        # отказался работать на базовом прогоне. Тест был зелёный.
+        self.assertIs(seen["kwargs"].get("stdout"), subprocess.PIPE,
+                      "вывод набора не перехватывается - судить будет не по чему")
+        self.assertIs(seen["kwargs"].get("stderr"), subprocess.STDOUT,
+                      "поток ошибок теряется мимо вывода")
 
     def test_a_red_suite_is_reported_as_red(self):
         """Вторая половина пары: покрасневший набор возвращается как True.

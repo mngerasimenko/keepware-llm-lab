@@ -741,6 +741,7 @@ def suite_fails():
         [sys.executable, "-m", "unittest", "discover", "-s", "scripts",
          "-p", "test_check_memory_index.py", "-f"],
         apart,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         # MEMCHECK_REQUIRE_SH здесь по той же причине, что и в CI. Без sh
         # тесты хука пропускаются, и три мутации по .githooks/pre-commit
         # печатались бы как ВЫЖИВШИЕ - то есть «ветку не держит ни один
