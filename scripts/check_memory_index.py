@@ -425,7 +425,17 @@ def build_file_map(root):
         prune_non_memory_dirs(folder, dirs, linked_dirs)
         for name in sorted(names):
             path = os.path.normpath(os.path.join(folder, name))
-            rel = os.path.relpath(path, root).replace(os.sep, "/")
+            # relpath умеет бросать ValueError: имя устройства DOS (`con.md`,
+            # `nul.md`) система резолвит не в файл, а в устройство, и путь
+            # оказывается «на другом томе». Без перехвата один такой файл
+            # ронял ВЕСЬ прогон - верхний перехват превращал это в код 2, а
+            # на коде 2 хук коммит пропускает. То есть один файл молча
+            # выключал проверку всей памяти.
+            try:
+                rel = os.path.relpath(path, root).replace(os.sep, "/")
+            except ValueError:
+                unreadable_dirs.append(path)
+                continue
             exact[rel] = path
             folded.setdefault(rel.casefold(), path)
     return exact, folded, unreadable_dirs, linked_dirs
@@ -599,7 +609,7 @@ def find_indexes(exact, index_name):
             if os.path.basename(rel) == index_name]
 
 
-def looks_like_a_stray_index(root, index_name, exact, cache):
+def looks_like_a_stray_index(root, index_name, exact, cache, allow_globs=()):
     """Файлы в КОРНЕ, названные под старую плоскую раскладку.
 
     `MEMORY_infra.md` рядом с `MEMORY.md` - это прежняя схема, где под-индексы
@@ -621,6 +631,11 @@ def looks_like_a_stray_index(root, index_name, exact, cache):
         if not rel.lower().endswith(".md"):
             continue
         if not os.path.splitext(rel)[0].casefold().startswith(base):
+            continue
+        # Исключённый путь не читаем и здесь: ключ обещает «сюда проверка не
+        # смотрит», а нечитаемый файл под шаблоном давал заметку и код 2 -
+        # требование починить то, что велено не трогать.
+        if is_excluded(rel, allow_globs):
             continue
         rows, _unclosed, _lost = parse_index_text(cached_text(path, rel, cache))
         if rows:
@@ -951,11 +966,16 @@ def filename_tokens(text):
         while start > floor and is_name_char(text[start - 1]):
             start -= 1
         # Разделитель именем не открывается: «/b.md» это «b.md». Внутри пути
-        # разделитель остаётся - «vendor/user.md» находится целиком. Ведущее
-        # «./» отсекаем тем же правилом: «(./zabytyi.md)» в индексе - это
-        # упоминание «zabytyi.md», и без этого подсказка про источник
-        # молчала ровно на той форме адреса, которую пишут чаще всего.
-        while start < match.start() and text[start] in "./\\":
+        # разделитель остаётся - «vendor/user.md» находится целиком.
+        #
+        # Точки тут НЕТ, и это решение, а не упущение. Одно время её сюда
+        # добавили, чтобы «(./zabytyi.md)» считалось упоминанием, но класс
+        # съедал любой ведущий пробег точек: «.hidden.md» превращался в
+        # «hidden.md», и невиновный файл получал подсказку «на него ссылается
+        # X» с советом перенести его в подпапку. Вредный совет на здоровых
+        # данных - и при этом правка не делала заявленного: индексы этот код
+        # не читает вовсе, их разбирает mentioned_in_raw_text.
+        while start < match.start() and text[start] in "/\\":
             start += 1
         floor = match.end()
         if start == match.start():
@@ -1049,7 +1069,7 @@ def mentioned_in_raw_text(index_texts, *names):
 
 
 def check_files_alone(exact, index_name, cache, allow_globs,
-                      errors, warnings):
+                      errors, warnings, notices):
     """L4, L5 и L6: всё, что проверяется по файлам, без участия индекса.
 
     Вынесено отдельно не для красоты. Пока эти три проверки стояли ниже
@@ -1115,9 +1135,21 @@ def check_files_alone(exact, index_name, cache, allow_globs,
                 "нет. Поправьте имя в ссылке или заведите такой файл"
                 % (rel, lineno, target, target))
 
-    # Файлы, которые не открылись за весь прогон. По ним не проверены ни L4,
-    # ни L5, ни намеренность сиротства - значит проверка выполнена не до
-    # конца, и это код 2, а не «согласована».
+    # Файлы, которые не открылись. По ним не проверены ни L4, ни L5, ни
+    # намеренность сиротства - значит проверка выполнена не до конца, и это
+    # код 2, а не «согласована».
+    #
+    # Заметка живёт ЗДЕСЬ, а не в вызывающем коде, потому что читает файлы эта
+    # функция. Пока она стояла снаружи, ветка «индекс не прочитан» проходила
+    # мимо неё: нечитаемый файл честно отмечался и молча выбрасывался, а рядом
+    # печаталось «L4, L5 и L6 от индекса не зависят и проверены» - утверждение,
+    # которое тот же прогон и опровергал.
+    for rel in sorted(cache.get(UNREADABLE_KEY, ())):
+        notices.append(
+            "%s: файл не читается - ни связи [[...]], ни поле `name` в нём не "
+            "проверены. Проверьте, что файл на месте и доступен: закройте "
+            "редактор, снимите блокировку или почините ссылку"
+            % rel)
 
 
 def check(root, index_paths, allow_globs, index_name, file_map):
@@ -1163,8 +1195,11 @@ def check(root, index_paths, allow_globs, index_name, file_map):
     # Каталог, который не открылся, уносит с собой факты: сказать про такую
     # память «согласована» нельзя, это невыполненная проверка (код 2).
     for where in unreadable_dirs:
-        notices.append("%s: каталог не читается - его содержимое в проверку не "
-                       "попало, о забытых в индексе файлах судить нельзя"
+        # Сюда же попадает путь, имя которого система не даёт превратить в
+        # относительный (имя устройства DOS). Формулировка общая: и то и
+        # другое - кусок памяти, которого проверка не видела.
+        notices.append("%s: в проверку не попало - содержимое отсюда не "
+                       "прочитано, о забытых в индексе файлах судить нельзя"
                        % (relative_to_root(root, where) or where))
 
     # Связанные каталоги пропускаются намеренно (чужая память), но человек по
@@ -1188,7 +1223,8 @@ def check(root, index_paths, allow_globs, index_name, file_map):
     # Файлы в корне, названные под старую плоскую раскладку: их строки не
     # разбираются, и всё перечисленное в них станет сиротами. Причину надо
     # назвать, иначе вывод читается как поломка проверки.
-    for stray in looks_like_a_stray_index(root, index_name, exact, cache):
+    for stray in looks_like_a_stray_index(root, index_name, exact, cache,
+                                          allow_globs):
         notices.append(
             "%s: лежит в корне и похож на индекс, но индексом не считается - "
             "корневой индекс один (%s), а под-индекс живёт в подпапке под тем "
@@ -1372,7 +1408,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             % len(unreadable)
         )
         check_files_alone(exact, index_name, cache, allow_globs,
-                          errors, warnings)
+                          errors, warnings, notices)
         return errors, notices, warnings, row_count, True
 
     # L2: каждый файл памяти упомянут хотя бы в одном индексе.
@@ -1610,18 +1646,11 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                             % (title, ", ".join(sorted(paths))))
 
     check_files_alone(exact, index_name, cache, allow_globs,
-                      errors, warnings)
-
-    unreadable_files = sorted(cache.get(UNREADABLE_KEY, ()))
-    for rel in unreadable_files:
-        notices.append(
-            "%s: файл не читается - ни связи [[...]], ни поле `name` в нём не "
-            "проверены. Проверьте, что файл на месте и доступен: закройте "
-            "редактор, снимите блокировку или почините ссылку"
-            % rel)
+                      errors, warnings, notices)
 
     return (errors, notices, warnings, row_count,
-            bool(incomplete or unreadable_dirs or unreadable_files))
+            bool(incomplete or unreadable_dirs
+                 or cache.get(UNREADABLE_KEY)))
 
 
 def build_parser():

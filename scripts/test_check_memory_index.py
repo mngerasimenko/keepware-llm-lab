@@ -783,6 +783,24 @@ class IndexParsing(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
 
+    def test_five_spaces_after_the_marker_are_already_a_code_block(self):
+        """Вторая половина правила про отступ: потолок в четыре пробела.
+
+        По CommonMark содержимое пункта начинается после маркера и пробелов
+        за ним, но пробелов считается не больше четырёх: пять и больше - это
+        уже блок кода внутри пункта. Первая половина («не всегда два»)
+        закреплена соседним тестом, вторая не держалась ничем - потолок
+        можно было снять или поставить сорок, и набор оставался зелёным.
+        """
+        self.write({
+            "MEMORY.md": "-      Инфраструктура\n"
+                         "       - [Сервер](server.md) - прод\n",
+            "server.md": "---\norphan: true\n---\nфакт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(findings(output, "L1"), [], output)
+
     def test_an_indented_block_after_plain_text_is_still_code(self):
         """Вторая половина пары: после обычного текста отступ - это блок кода.
 
@@ -1948,6 +1966,13 @@ class OrphansAndWhatHidesBehindThem(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
         self.assertNotIn("L2 obshiy.md", output)
+        # И в счёт «за ним скрыто N файлов» такой файл тоже не идёт: он виден
+        # из достижимого индекса. Пока проверялась только первая половина
+        # условия, вторая не держалась ничем - мутация, снимающая её, честно
+        # выживала на полном прогоне.
+        self.assertNotIn("скрыто", output,
+                         "файл, видный из достижимого индекса, посчитали "
+                         "спрятанным за недостижимым")
 
     def test_mutual_link_between_sub_indexes_where_one_is_reachable(self):
         """Взаимная ссылка не создаёт остров, если один из двух достижим."""
@@ -3196,6 +3221,28 @@ class UnreadableEntries(MemoryFixture):
         self.assertEqual(code, 1, output)
         self.assertNotIn("chuzhoe.md", output)
 
+    def test_an_unreadable_index_still_names_the_unreadable_file(self):
+        """Заметка о нечитаемом файле не должна теряться вместе с индексом.
+
+        Ранний возврат ветки «индекс не прочитан» стоял ПЕРЕД циклом, который
+        печатает нечитаемые файлы. До этого ветке нечего было терять - файлы
+        на ней не читались вовсе; после того как проверку файлов вынесли
+        отдельно, она честно отмечала нечитаемый файл, а возврат его
+        выбрасывал. Итог хуже прежнего: рядом печаталось «L4, L5 и L6 от
+        индекса не зависят и проверены», и тот же прогон это опровергал.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Занятый](zanyatyi.md) - х\n",
+            "user.md": "факт\n",
+            "zanyatyi.md": "---\nname: sovsem_drugoe\n---\nсм. [[nikuda]]\n",
+        })
+        self.unreadable("MEMORY.md")
+        self.unreadable("zanyatyi.md")
+        code, output = self.run_linter()
+        self.assertEqual(code, 2, output)
+        self.assertIn("zanyatyi.md: файл не читается", output)
+
     def test_an_unreadable_index_does_not_cancel_the_file_level_rules(self):
         """Нечитаемый индекс отменяет достижимость - и только её.
 
@@ -4168,6 +4215,57 @@ class PreCommitHook(unittest.TestCase):
         self.assertNotEqual(result.returncode, 126, printed)
         self.assertIn("слишком много", printed,
                       "бюджет не сработал, а значит argv доехал до предела ОС")
+
+    def test_a_draft_set_that_fits_is_not_thrown_away(self):
+        """Нижняя сторона бюджета: что влезает в argv - должно исключаться.
+
+        У бюджета ровно два исхода, и оба - отклонённый коммит: потолок выше
+        настоящего переполняет командную строку и даёт 126; потолок ниже
+        нужного выбрасывает исключения и заваливает человека ложными L2 на
+        файлы, которых в коммите нет. Первая редакция закрепляла только
+        верхнюю сторону, поэтому потолок можно было поставить куда угодно -
+        проверено: с значением 6000 весь набор оставался зелёным, а здоровые
+        коммиты отклонялись.
+
+        Двести черновиков со стосемидесятибайтными путями - это около 23 КБ
+        аргументов, три четверти настоящей границы argv. Влезает.
+        """
+        deep = "/".join(["podpapka"] * 8)
+        for number in range(200):
+            self.draft(deep, "chernovik-%03d.md" % number)
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        result = self.run_hook()
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, printed)
+        self.assertNotIn("слишком много", printed,
+                         "бюджет выбросил исключения, которые влезали")
+
+    def test_a_rename_does_not_unexclude_a_draft_on_the_freed_name(self):
+        """Переименование - не уход из репозитория.
+
+        Путь, ставший источником переименования, из репозитория не уходит:
+        уходит имя, содержимое переехало. Пока вычитание брало и такие пути,
+        `git mv` плюс новый черновик по освободившемуся имени давал
+        блокирующий L2 на файл, которого в коммите нет, - ровно та ложная
+        тревога, ради снятия которой исключение черновиков и написано. А в
+        памяти, где имя файла обязано совпадать с именем факта,
+        переименование - рядовая операция.
+        """
+        self.write_memory("- [Профиль](user.md) - кто\n"
+                          "- [Заметка](zametka.md) - крючок\n",
+                          {"zametka.md": "довольно длинный текст заметки\n"})
+        self.git("add", "-A")
+        self.git("-c", "user.email=t@t", "-c", "user.name=t",
+                 "commit", "-q", "-m", "base", "--no-verify")
+        self.git("mv", "memory/zametka.md", "memory/zapiska.md")
+        self.write_memory("- [Профиль](user.md) - кто\n"
+                          "- [Записка](zapiska.md) - крючок\n")
+        self.git("add", "memory/MEMORY.md")
+        # По освободившемуся имени человек начал новый черновик.
+        self.draft("zametka.md")
+        result = self.run_hook()
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, printed)
 
     def test_a_failing_sed_does_not_abort_the_hook(self):
         """Упавший `sed` не должен обрывать скрипт до первого слова.

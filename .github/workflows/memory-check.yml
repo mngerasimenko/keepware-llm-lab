@@ -50,7 +50,7 @@ jobs:
       # 3.12, а в матрице есть 3.9: там сломанный discover дал бы зелёную
       # галочку при невыполненных тестах. Тот же класс, что MEMCHECK_REQUIRE_SH.
       - name: Тесты вообще собрались
-        run: python -c "import unittest, sys; n = unittest.defaultTestLoader.discover('scripts', 'test_*.py').countTestCases(); print('собрано тестов:', n); sys.exit(0 if n >= 150 else 1)"
+        run: python -c "import unittest, sys; n = unittest.defaultTestLoader.discover('scripts', 'test_*.py').countTestCases(); print('собрано тестов:', n); sys.exit(0 if n >= 250 else 1)"
 
       # Шаблон тот же, что в гарде выше: у discover без ключа он «test*.py»,
       # без обязательного подчёркивания, и наборы могли бы разъехаться.

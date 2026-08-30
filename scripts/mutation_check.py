@@ -60,8 +60,11 @@ HOOK = os.path.join(".githooks", "pre-commit")
 # ищет тихие отказы, производит тихий отказ в самой защите. Проверено: убил
 # прогон, `TASK_MARKS = set()` осталось в дереве, прогон по памяти - код 0.
 BACKUP = ".mutation-backup"
-# Потолок на один прогон набора. Набор идёт около минуты; две мутации
-# намеренно возвращают квадратичность и растягивают его до двух.
+# Потолок на один прогон набора. Замер на Windows: базовый прогон от двух
+# до четырёх с половиной минут, а две мутации намеренно возвращают
+# квадратичность и растягивают его дальше. Запас тут примерно двукратный,
+# а не пятнадцатикратный, как читалось из прежней оценки «около минуты»:
+# сорвавшийся таймаут печатается как «ЗАВИСЛА» и идёт в выжившие.
 SUITE_TIMEOUT = 900
 
 # (что ломаем, файл, точный фрагмент, чем заменить)
@@ -115,7 +118,7 @@ MUTATIONS = [
      "        floor = match.end()",
      "        floor = 0"),
     ("имя открывается разделителем", LINTER,
-     '        while start < match.start() and text[start] in "./\\\\":\n'
+     '        while start < match.start() and text[start] in "/\\\\":\n'
      "            start += 1",
      "        pass"),
 
@@ -326,13 +329,16 @@ MUTATIONS = [
     # хватало, чтобы напечатать «поймана» про две другие, которых не сторожит
     # никто.
     ("незакрытый забор не делает прогон непроверяемым", LINTER,
-     "            bool(incomplete or unreadable_dirs or unreadable_files))",
-     "            bool(unreadable_dirs or unreadable_files))"),
+     "            bool(incomplete or unreadable_dirs\n"
+     "                 or cache.get(UNREADABLE_KEY)))",
+     "            bool(unreadable_dirs or cache.get(UNREADABLE_KEY)))"),
     ("нечитаемый каталог не делает прогон непроверяемым", LINTER,
-     "            bool(incomplete or unreadable_dirs or unreadable_files))",
-     "            bool(incomplete or unreadable_files))"),
+     "            bool(incomplete or unreadable_dirs\n"
+     "                 or cache.get(UNREADABLE_KEY)))",
+     "            bool(incomplete or cache.get(UNREADABLE_KEY)))"),
     ("нечитаемый файл не делает прогон непроверяемым", LINTER,
-     "            bool(incomplete or unreadable_dirs or unreadable_files))",
+     "            bool(incomplete or unreadable_dirs\n"
+     "                 or cache.get(UNREADABLE_KEY)))",
      "            bool(incomplete or unreadable_dirs))"),
     ("нечитаемый файл-факт снова глотается молча", LINTER,
      "            cache.setdefault(UNREADABLE_KEY, set()).add(rel)",
@@ -343,7 +349,8 @@ MUTATIONS = [
      "    if unverifiable and not errors:\n        return EXIT_USAGE",
      "    if unverifiable and not errors:\n        return EXIT_OK"),
     ("подсказка про плоскую раскладку исчезла", LINTER,
-     "    for stray in looks_like_a_stray_index(root, index_name, exact, cache):",
+     "    for stray in looks_like_a_stray_index(root, index_name, exact, cache,\n"
+     "                                          allow_globs):",
      "    for stray in []:"),
 
     # --- хук ---
@@ -401,10 +408,10 @@ MUTATIONS = [
      "              -e 's|^|--allow-orphan=|')",
      "              -e 's|^|--allow-orphan |')"),
     ("удаления из репозитория снова приезжают в кавычках", HOOK,
-     "REMOVED=$(git -c core.quotePath=false --no-pager diff --cached",
+     "GONE=$(git -c core.quotePath=false diff --cached",
      "REMOVED=$(git --no-pager diff --cached"),
     ("переименование снова прячет удаление", HOOK,
-     "              --name-only --no-renames --diff-filter=D",
+     "           --name-only --no-renames --diff-filter=D",
      "              --name-only --diff-filter=D"),
     ("повтор без ключей теряет исключения черновиков", HOOK,
      '    "$PYTHON" "$CHECKER" "$MEMORY_DIR" --quiet "$@"\n    RETRY=$?',
@@ -415,6 +422,27 @@ MUTATIONS = [
     # `set +f` стоит теперь не сразу за разбором: между ними сбор черновиков,
     # которому раскрытие шаблонов тоже противопоказано. Мутация снимает
     # именно `set -f`, а парный `set +f` ниже безвреден и без него.
+    ("исключение не действует на похожий на индекс файл в корне", LINTER,
+     "        if is_excluded(rel, allow_globs):\n            continue\n"
+     "        rows, _unclosed, _lost = parse_index_text",
+     "        rows, _unclosed, _lost = parse_index_text"),
+    ("негодное имя снова роняет весь обход", LINTER,
+     "            except ValueError:\n"
+     "                unreadable_dirs.append(path)\n"
+     "                continue",
+     "            except ValueError:\n"
+     "                raise"),
+    ("заметка о нечитаемых файлах теряется при нечитаемом индексе", LINTER,
+     "    for rel in sorted(cache.get(UNREADABLE_KEY, ())):\n"
+     "        notices.append(",
+     "    for rel in sorted(()):\n"
+     "        notices.append("),
+    ("потолок отступа пункта снят", LINTER,
+     "            item_indent = indent + 1 + (gap if gap <= 4 else 1)",
+     "            item_indent = indent + 1 + gap"),
+    ("вычитание снова берёт переименования", HOOK,
+     "              --name-only --diff-filter=D -- ",
+     "              --name-only --no-renames --diff-filter=D -- "),
     ("аргументы из настройки раскрываются шаблоном", HOOK,
      "set -f\n", ""),
 
@@ -629,13 +657,29 @@ def restore_interrupted():
     # проваливался прямо в перезапись: механизм, поставленный охранять
     # целостность дерева, затирал чужую работу, удалял единственную копию и
     # рапортовал «восстановлен из слепка».
-    try:
-        current, _newline = read_source(path)
-    except FileNotFoundError:
-        current = None
-    except OSError as exc:
+    # Лестница попыток та же, что в write_atomically, и по той же причине:
+    # на Windows антивирус или индексатор держат файл доли секунды. Отказаться
+    # на такой случайности значило бы оставить мутацию в дереве - худший исход
+    # по мерке самого инструмента, и достаётся он за пустяк.
+    current = None
+    failure = None
+    for attempt in range(5):
+        try:
+            current, _newline = read_source(path)
+            failure = None
+            break
+        except FileNotFoundError:
+            current = None
+            failure = None
+            break
+        except (OSError, UnicodeDecodeError) as exc:
+            failure = exc
+            if attempt < 4:
+                time.sleep(0.2)
+    if failure is not None:
         print("Не могу прочитать %s (%s), поэтому не знаю, что там лежит. "
-              "Ничего не трогаю, слепок оригинала - в %s." % (path, exc, BACKUP))
+              "Ничего не трогаю, слепок оригинала - в %s."
+              % (path, failure, BACKUP))
         return False
     # Совпало с ОРИГИНАЛОМ - значит восстанавливать нечего: прогон оборвали до
     # того, как мутация легла на диск, либо уже после того, как её убрали.
@@ -682,7 +726,7 @@ def missing_anchors():
         try:
             with io.open(path, encoding="utf-8") as stream:
                 text = stream.read()
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             stale.append((name, "файл не читается: %s" % exc))
             continue
         found = text.count(old)
@@ -822,7 +866,11 @@ def run_apart(command, apart, **kwargs):
     убивает теперь только инструмент - а осиротевший набор продолжает
     крутиться на дереве, которое под ним переписывает `finally`.
     """
-    with subprocess.Popen(command, **dict(kwargs, **apart)) as process:
+    # Popen СНАРУЖИ with: `with EXPR as VAR` не вызывает __exit__, если
+    # исключение пришло на входе в блок, и в это окно утекают и потомок, и
+    # трубы - оба отказа, которые эта обёртка объявляет закрытыми.
+    process = subprocess.Popen(command, **dict(kwargs, **apart))
+    with process:
         try:
             out, _err = process.communicate(timeout=SUITE_TIMEOUT)
         except BaseException:

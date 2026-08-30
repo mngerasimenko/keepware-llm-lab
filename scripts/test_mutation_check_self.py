@@ -19,6 +19,7 @@ import os
 import shutil
 import stat
 import subprocess
+import time
 import sys
 import tempfile
 import unittest
@@ -63,7 +64,7 @@ class MutationCheckIsAlive(unittest.TestCase):
         Тот же приём, что у гарда «тестов собралось не меньше 150» в CI, -
         и держать его в синхроне приходится руками, других способов нет.
         """
-        self.assertGreater(len(mutation_check.MUTATIONS), 85,
+        self.assertGreater(len(mutation_check.MUTATIONS), 95,
                            "набор мутаций подозрительно мал")
 
     def test_anchors_do_not_lean_on_comment_text(self):
@@ -143,56 +144,10 @@ class MutationCheckIsAlive(unittest.TestCase):
         # вызова - то есть отмени изоляцию целиком, - и набор остался бы
         # зелёным. Тот же урок, что с потерянным stdout, строкой ниже.
         key = "creationflags" if os.name == "nt" else "start_new_session"
-        self.assertIn(key, seen["apart"],
+        self.assertTrue(seen["apart"].get(key),
                       "набор запускается в группе процессов терминала - по "
                       "таймауту переживут внуки")
 
-
-class TheSuiteRunsApartFromUs(unittest.TestCase):
-    """`run_apart` должна исполняться хоть одним тестом, а не только подменяться.
-
-    Шесть тестов выше подменяют её целиком. Подмена скрывает всё, о чём её не
-    спросили: сама функция вместе с `kill_tree` не выполнялась ни разу, хотя
-    обе добавлены ради того, чтобы по таймауту не выживали внуки.
-    """
-
-    def test_a_hung_grandchild_dies_with_the_timeout(self):
-        """Дерево «потомок → внук»: по таймауту гибнет всё."""
-        if os.name == "nt":
-            apart = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        else:
-            apart = {"start_new_session": True}
-        marker = os.path.join(tempfile.mkdtemp(prefix="apart-"), "alive.txt")
-        self.addCleanup(shutil.rmtree, os.path.dirname(marker), True)
-        # Внук пишет метку и живёт долго; если он переживёт таймаут, метка
-        # продолжит обновляться после того, как родителя убили.
-        grandchild = (
-            "import sys,time;"
-            "open(%r,'w').close();"
-            "time.sleep(60)" % marker)
-        child = ("import subprocess,sys;"
-                 "subprocess.run([sys.executable,'-c',%r])" % grandchild)
-        with unittest.mock.patch.object(mutation_check, "SUITE_TIMEOUT", 3):
-            with self.assertRaises(subprocess.TimeoutExpired):
-                mutation_check.run_apart(
-                    [sys.executable, "-c", child], apart,
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        self.assertTrue(os.path.exists(marker), "внук вообще не стартовал")
-
-    def test_a_quick_command_comes_back_with_its_output(self):
-        """Вторая половина пары: обычный запуск возвращает вывод и код.
-
-        Иначе первая доказывала бы только, что функция умеет падать.
-        """
-        if os.name == "nt":
-            apart = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        else:
-            apart = {"start_new_session": True}
-        done = mutation_check.run_apart(
-            [sys.executable, "-c", "print('privet')"], apart,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        self.assertEqual(done.returncode, 0)
-        self.assertIn(b"privet", done.stdout)
 
     def test_a_red_suite_is_reported_as_red(self):
         """Вторая половина пары: покрасневший набор возвращается как True.
@@ -302,6 +257,57 @@ class TheSuiteRunsApartFromUs(unittest.TestCase):
         self.assertEqual(len(stale), 1, stale)
         self.assertIn("не разбирается как sh", stale[0][1])
 
+    def test_without_sh_the_requirement_is_not_silently_skipped(self):
+        """`MEMCHECK_REQUIRE_SH` читается, а не только передаётся дальше.
+
+        Докстрока обещала, что в CI пропуск невозможен, а переменная только
+        клалась в окружение потомка и здесь не смотрелась - то есть
+        `--anchors-only` рапортовал «мутант разбирается» про два десятка
+        непроверенных. Починку третьего круга не держал ни один тест.
+        """
+        broken = [("выдуманная мутация", mutation_check.HOOK,
+                   'CHECKER="scripts/check_memory_index.py"',
+                   "if then fi )(")]
+        previous = os.getcwd()
+        os.chdir(REPO_DIR)
+        try:
+            with unittest.mock.patch.object(mutation_check, "find_shell",
+                                            lambda: None), \
+                    unittest.mock.patch.dict(os.environ,
+                                             {"MEMCHECK_REQUIRE_SH": "1"}), \
+                    unittest.mock.patch.object(mutation_check, "MUTATIONS",
+                                               broken):
+                stale = mutation_check.missing_anchors()
+        finally:
+            os.chdir(previous)
+        self.assertEqual(len(stale), 1, stale)
+        self.assertIn("sh не найден", stale[0][1])
+
+    def test_without_sh_and_without_the_variable_we_stay_quiet(self):
+        """Вторая половина пары: без требования - молчим.
+
+        На машине без `sh` тесты хука и так пропускаются; требовать большего
+        от мутационной проверки не за что.
+        """
+        broken = [("выдуманная мутация", mutation_check.HOOK,
+                   'CHECKER="scripts/check_memory_index.py"',
+                   "if then fi )(")]
+        previous = os.getcwd()
+        os.chdir(REPO_DIR)
+        try:
+            environment = dict(os.environ)
+            environment.pop("MEMCHECK_REQUIRE_SH", None)
+            with unittest.mock.patch.object(mutation_check, "find_shell",
+                                            lambda: None), \
+                    unittest.mock.patch.dict(os.environ, environment,
+                                             clear=True), \
+                    unittest.mock.patch.object(mutation_check, "MUTATIONS",
+                                               broken):
+                stale = mutation_check.missing_anchors()
+        finally:
+            os.chdir(previous)
+        self.assertEqual(stale, [], stale)
+
     def test_a_mutant_that_does_not_compile_is_a_hard_error(self):
         """Правило: негодный мутант - ошибка, как и протухший якорь.
 
@@ -323,6 +329,113 @@ class TheSuiteRunsApartFromUs(unittest.TestCase):
         self.assertEqual(len(stale), 1, stale)
         self.assertIn("не компилируется", stale[0][1])
 
+
+class TheSuiteRunsApartFromUs(unittest.TestCase):
+    """`run_apart` исполняется по-настоящему, а не только подменяется.
+
+    Тесты в классе выше подменяют её целиком. Подмена скрывает всё, о чём
+    её не спросили: сама функция вместе с `kill_tree` не выполнялась ни
+    разу, хотя обе добавлены ради того, чтобы по таймауту не выживали
+    внуки. Здесь запускаются настоящие процессы.
+    """
+
+    def test_a_hung_grandchild_dies_with_the_timeout(self):
+        """Дерево «потомок → внук»: по таймауту гибнет всё.
+
+        Метку внук ДОПИСЫВАЕТ, а не создаёт один раз. Первая редакция этого
+        теста только проверяла, что метка появилась, - и проходила одинаково
+        с работающим `kill_tree` и с заглушкой вместо него: единственным
+        различием было время, а времени тест не спрашивал. Тест из
+        «пустышки по подмене» стал «пустышкой по исполнению», на уровень
+        глубже. Теперь спрашиваем оба наблюдаемых признака: сколько заняло и
+        растёт ли метка ПОСЛЕ таймаута.
+        """
+        if os.name == "nt":
+            apart = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        else:
+            apart = {"start_new_session": True}
+        marker = os.path.join(tempfile.mkdtemp(prefix="apart-"), "alive.txt")
+        self.addCleanup(shutil.rmtree, os.path.dirname(marker), True)
+        grandchild = (
+            "import time\n"
+            "for _ in range(600):\n"
+            "    open(%r,'a').write('x')\n"
+            "    time.sleep(0.1)\n" % marker)
+        child = ("import subprocess,sys;"
+                 "subprocess.run([sys.executable,'-c',%r])" % grandchild)
+        started = time.time()
+        with unittest.mock.patch.object(mutation_check, "SUITE_TIMEOUT", 3):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                mutation_check.run_apart(
+                    [sys.executable, "-c", child], apart,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        spent = time.time() - started
+        self.assertTrue(os.path.exists(marker), "внук вообще не стартовал")
+        self.assertLess(spent, 20,
+                        "прогон занял %.1f с - внук пережил таймаут" % spent)
+        was = os.path.getsize(marker)
+        time.sleep(1.5)
+        self.assertEqual(os.path.getsize(marker), was,
+                         "метка растёт после таймаута - внук жив")
+
+    def test_an_interrupt_kills_the_child_too(self):
+        """Не только таймаут: любое исключение уносит потомка с собой.
+
+        `subprocess.run`, который эта обёртка заменила, убивает потомка на
+        ЛЮБОМ исключении. Первая редакция ловила только таймаут - и на Ctrl+C
+        оставляла живой набор и открытый дескриптор. Складывается это
+        скверно: своя группа процессов выводит набор из-под Ctrl+C терминала,
+        поэтому прерывание убивает только инструмент, а осиротевший набор
+        продолжает крутиться на дереве, которое под ним переписывает
+        `finally`.
+        """
+        if os.name == "nt":
+            apart = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        else:
+            apart = {"start_new_session": True}
+        seen = {}
+        real = subprocess.Popen
+
+        def remember(*args, **kwargs):
+            process = real(*args, **kwargs)
+            seen["process"] = process
+            first = process.communicate
+
+            def interrupted(*a, **k):
+                # Прерывание прилетает ровно один раз - на первом ожидании.
+                # Уборка внутри обёртки должна успеть довести дело до конца.
+                process.communicate = first
+                raise KeyboardInterrupt()
+
+            process.communicate = interrupted
+            return process
+
+        with unittest.mock.patch.object(mutation_check.subprocess, "Popen",
+                                        remember):
+            with self.assertRaises(KeyboardInterrupt):
+                mutation_check.run_apart(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    apart, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+        process = seen.get("process")
+        self.assertIsNotNone(process, "потомок не запускался")
+        process.wait(timeout=10)
+        self.assertIsNotNone(process.returncode, "потомок пережил прерывание")
+
+    def test_a_quick_command_comes_back_with_its_output(self):
+        """Вторая половина пары: обычный запуск возвращает вывод и код.
+
+        Иначе первая доказывала бы только, что функция умеет падать.
+        """
+        if os.name == "nt":
+            apart = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        else:
+            apart = {"start_new_session": True}
+        done = mutation_check.run_apart(
+            [sys.executable, "-c", "print('privet')"], apart,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(done.returncode, 0)
+        self.assertIn(b"privet", done.stdout)
 
 class InterruptedRunCleansUpAfterItself(unittest.TestCase):
     """Оборванный прогон не должен оставить линтер молча сломанным.
@@ -468,6 +581,59 @@ class InterruptedRunCleansUpAfterItself(unittest.TestCase):
         self.assertFalse(os.path.exists(backup), "слепок остался висеть")
         with io.open(target, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "ОРИГИНАЛ\n")
+
+    def test_an_unreadable_target_is_left_alone(self):
+        """Не знаем, что на диске - не трогаем.
+
+        Оба сторожа были написаны как «current is not None», поэтому отказ
+        чтения проваливался прямо в перезапись: механизм, охраняющий
+        целостность дерева, затирал чужую работу, удалял единственную копию
+        и рапортовал «восстановлен из слепка». Починку третьего круга не
+        держал ни один тест - её можно было молча откатить.
+        """
+        folder, target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        original = mutation_check.read_source
+
+        def refusing(path):
+            if os.path.normcase(path) == os.path.normcase(target):
+                raise PermissionError(13, "file busy")
+            return original(path)
+
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
+                unittest.mock.patch.object(mutation_check, "LINTER", target), \
+                unittest.mock.patch.object(mutation_check, "read_source",
+                                           refusing):
+            mutation_check.save_backup(target, "ОРИГИНАЛ\n", "\n", "МУТАЦИЯ\n")
+            with io.open(target, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("ЧАС РАБОТЫ\n")
+            with redirect_stdout(io.StringIO()) as printed:
+                restored = mutation_check.restore_interrupted()
+
+        self.assertFalse(restored)
+        self.assertIn("не знаю, что там лежит", printed.getvalue())
+        self.assertTrue(os.path.exists(backup), "слепок удалён")
+        with io.open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "ЧАС РАБОТЫ\n", "чужую работу затёрли")
+
+    def test_a_corrupt_backup_does_not_crash_the_tool(self):
+        """Битый слепок - сообщение, а не трейсбек до первого слова.
+
+        Инструмент читает слепок как UTF-8, а файл на диске может быть каким
+        угодно. Прежде `UnicodeDecodeError` вылетал наружу раньше, чем
+        инструмент успевал что-либо сказать.
+        """
+        folder, target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        with open(backup, "wb") as fh:
+            fh.write(b"\xff\xfe\x00\x01 not utf-8 at all")
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
+                unittest.mock.patch.object(mutation_check, "LINTER", target):
+            with redirect_stdout(io.StringIO()) as printed:
+                restored = mutation_check.restore_interrupted()
+        self.assertFalse(restored)
+        self.assertIn("не читается", printed.getvalue())
+        self.assertTrue(os.path.exists(backup), "битый слепок молча удалён")
 
     def test_without_a_backup_nothing_is_touched(self):
         """Вторая половина пары: на чистом дереве восстановление молчит.
