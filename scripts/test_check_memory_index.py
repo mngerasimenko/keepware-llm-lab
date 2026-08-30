@@ -10,32 +10,32 @@
 Карта: где искать проверки инварианта
 -------------------------------------
 
-Часть классов названа по кругам ревью (`PanelReviewFindings`,
-`SecondRoundFindings` и далее). Для автора это ценно - по ним виден маятник
-правок, - но постороннему такое имя говорит, КОГДА находку заметили, а не ЧТО
-она держит. Пока набор не переименован, вот карта:
-
-  L1, разбор строк индекса  IndexLinksToFiles, IndexParsing, PanelReviewFindings,
-                            SecondRoundFindings, ThirdRoundFindings
+  L1, ссылки и адреса       IndexLinksToFiles, FilenameTokenBoundaries
+  форма строки и разбор     OneRowForm, IndexParsing
   L2, достижимость          FilesAppearInIndex, StrictRootIndexModel, RootIndexLost,
-                            FifthRoundFindings, SixthRoundFindings
+                            OrphansAndWhatHidesBehindThem
   L3, дубли заголовков      DuplicateTitles
   L4, связи [[имя]]         WikiLinksBetweenFacts
+  L5 и L6, имена            MemoryFileNameIsASlug
+  шапка файла               FrontmatterDiagnostics
   коды возврата 0/1/2       ExitCodes, ExitCodeContract, SilentFailures
-  качество сообщений        HintsDoNotOverclaim, SmallerFindings, MinorPanelFindings
+  качество сообщений        HintsDoNotOverclaim, SourceHintPointsAtTheRightFile,
+                            SummaryTellsWhatBlocks, AddressesAreClickable
   обход файловой системы    MemoryFolderBoundary, LinkedSubtrees, UnreadableEntries
   цена прогона              HotPathStaysLinear, FilenameTokenScan
   хук и CI                  PreCommitHook, HookPrerequisite, CiGuards,
-                            DocumentationMatchesReality
+                            DocumentationMatchesReality, OwnMemoryIsConsistent
 
-Два теста тут дублируют друг друга байт в байт: пары
-`test_sub_indexes_count_by_default_without_flags` /
-`test_sub_index_in_subfolder_is_reachable` и
-`test_unreferenced_sub_index_is_error` /
-`test_sub_index_in_subfolder_without_a_link_is_error`. Это прямое следствие
-деления по кругам: шестой круг завёл свой класс, не заглянув, что тот же
-случай уже стоит в старом. Оставлены намеренно - докстринги у них разные, и
-каждый фиксирует свою причину.
+Прежде часть классов называлась по кругам ревью, в которых находки всплыли:
+`PanelReviewFindings`, `SecondRoundFindings`, `ThirdRoundFindings` и далее.
+Такое имя говорит, КОГДА находку заметили, а не ЧТО она держит, и ответить по
+нему на вопрос «какие тесты покрывают L2» было нельзя, не прочитав все двести.
+Своя цена у этого тоже была: шестой круг завёл класс, не заглянув, что тот же
+случай уже стоит в старом, - отсюда две пары тестов, совпадающих байт в байт
+(`test_sub_indexes_count_by_default_without_flags` /
+`test_sub_index_in_subfolder_is_reachable` и `test_unreferenced_sub_index_is_error` /
+`test_sub_index_in_subfolder_without_a_link_is_error`). Дубли оставлены:
+докстринги у них разные, и каждый фиксирует свою причину.
 """
 
 import hashlib
@@ -370,6 +370,47 @@ class IndexLinksToFiles(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
 
+    def test_empty_destination_is_not_silently_skipped(self):
+        """`- [Заголовок]()` - строка есть, адреса нет: молчать об этом нельзя.
+
+        Прежде такая строка распознавалась и тут же отбрасывалась вместе с
+        якорями. Человек видит строку в индексе и считает файл упомянутым.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль]() - крючок есть, адреса нет\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("адрес", output.lower())
+
+    def test_anchor_only_destination_stays_allowed(self):
+        """Якорь внутри того же документа - законная строка, её не трогаем."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [К разделу](#razdel) - якорь внутри индекса\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_link_to_a_directory_says_so(self):
+        """`[Инфра](infra)` вместо `infra/MEMORY.md` - частая опечатка.
+
+        Ветка сообщения существовала, но ни один из тестов на неё не попадал:
+        мутация «отключить ветку» переживала весь набор. Диагноз «ссылка в
+        никуда» вместо «это каталог» отправляет чинить не то.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Инфра](infra) - раздел\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("каталог", output)
+
 
 class MemoryFileNameIsASlug(MemoryFixture):
     """L6: имя файла памяти - строчная латиница, цифры, дефис, подчёркивание.
@@ -478,6 +519,26 @@ class MemoryFileNameIsASlug(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
+
+    def test_cyrillic_file_name_is_an_error(self):
+        """Кириллическое имя - нарушение правила, а не особый случай.
+
+        Тест прежде утверждал обратное: «проект русскоязычный, кириллическое
+        имя файла - вопрос времени», и проверял, что такой файл резолвится.
+        После L6 это неверно, и он проходил по чужой причине - код 1 давала
+        сама кириллица, а не то, что тест собирался проверить.
+
+        Цена правила названа прямо в README: кириллица в именах запрещена,
+        хотя законна и в git, и в файловой системе.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Заметка](заметка.md) - крючок\n",
+            "user.md": "факт\n",
+            "заметка.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertTrue(findings(output, "L6"), output)
 
 
 class OneRowForm(MemoryFixture):
@@ -762,6 +823,116 @@ class IndexParsing(MemoryFixture):
         self.write({"MEMORY.md": "- [Профиль](user.md) - кто\n"},
                    encoding="utf-8-sig", newline="\r\n")
         self.write({"user.md": "факт\n"})
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_lost_rows_counter_resets_when_a_comment_closes(self):
+        """Строки закрытого комментария не должны приплюсовываться к настоящей потере.
+
+        Сброс счётчика стоял только у забора. Строки из благополучно закрытого
+        комментария утекали вперёд и раздували число - в том самом сообщении,
+        которое завели ради честного масштаба потери.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "<!--\n"
+                         "- [A](a.md) - в закрытом комментарии\n"
+                         "- [B](b.md) - тоже\n"
+                         "-->\n"
+                         "\n"
+                         "```markdown\n"
+                         "- [C](c.md) - единственная настоящая потеря\n",
+            "user.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        lost = [line for line in output.splitlines() if "не закрыт" in line]
+        self.assertEqual(len(lost), 1, output)
+        self.assertRegex(lost[0], r"индекса: 1\b",
+                         "число потерянных строк раздуто закрытым комментарием")
+
+    def test_lost_rows_counter_resets_when_a_fence_closes(self):
+        """Строки закрытого забора не должны приплюсовываться к настоящей потере.
+
+        Парный к тесту про комментарий - и найден не рассуждением, а
+        мутационным аудитом: сброс счётчика при закрытии ЗАБОРА оказался
+        единственной веткой из тридцати одной, которую не ловил ни один тест
+        из набора. Тест про комментарий существовал, про забор - нет, хотя
+        сбросов в коде два.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "```markdown\n"
+                         "- [A](a.md) - в закрытом заборе\n"
+                         "- [B](b.md) - тоже\n"
+                         "```\n"
+                         "\n"
+                         "<!--\n"
+                         "- [C](c.md) - единственная настоящая потеря\n",
+            "user.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        lost = [line for line in output.splitlines() if "не закрыт" in line]
+        self.assertEqual(len(lost), 1, output)
+        self.assertRegex(lost[0], r"индекса: 1\b",
+                         "число потерянных строк раздуто закрытым забором")
+
+    def test_closing_fence_with_a_tail_does_not_close_the_block(self):
+        """Правило про пустой хвост обещано в докстроке и не проверялось нигде.
+
+        Закрывающий забор с хвостом (```python вместо ```) не закрывает блок.
+        Иначе пример внутри блока начинает разбираться как настоящий индекс -
+        ложная тревога ровно на приёме «документируем свой формат», который
+        README и советует.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "````markdown\n"
+                         "```python\n"
+                         "- [Пример](primer.md) - это пример, не строка индекса\n"
+                         "```\n"
+                         "````\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_unclosed_fence_notice_says_how_many_rows_were_lost(self):
+        """«Строки ниже в разбор не попали» - а сколько их было?
+
+        Знание «потеряно 3 строки» отличает опечатку в конце файла от
+        проглоченной половины индекса. Без числа человек не знает, срочно это
+        или нет.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "\n"
+                         "```markdown\n"
+                         "- [Раз](a.md) - крючок\n"
+                         "- [Два](b.md) - крючок\n"
+                         "- [Три](c.md) - крючок\n",
+            "user.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        unclosed = [line for line in output.splitlines() if "не закрыт" in line]
+        self.assertEqual(len(unclosed), 1, output)
+        self.assertRegex(unclosed[0], r"\b3\b",
+                         "не названо, сколько строк индекса пропало")
+
+    def test_bracketed_text_without_a_definition_is_not_a_row(self):
+        """Без определения `[что-то]` - обычный текст, а не ссылка.
+
+        Иначе чекбоксы `- [ ]` и любые квадратные скобки в прозе начали бы
+        считаться строками индекса и порождать ошибки на пустом месте.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [ ] не сделано\n"
+                         "- [заметка на полях] просто текст\n",
+            "user.md": "факт\n",
+        })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
 
@@ -1143,47 +1314,31 @@ class StrictRootIndexModel(MemoryFixture):
         self.assertEqual(code, 2, output)
         self.assertIn("имя", output.lower())
 
+    def test_stray_index_hint_is_case_insensitive(self):
+        """`memory_infra.md` строчными - тот же случай, что `MEMORY_infra.md`.
 
-class SmallerFindings(MemoryFixture):
-    """Мелкое из шестого круга: ложная сирота, молчаливый пропуск, ключ вхолостую."""
-
-    def test_empty_destination_is_not_silently_skipped(self):
-        """`- [Заголовок]()` - строка есть, адреса нет: молчать об этом нельзя.
-
-        Прежде такая строка распознавалась и тут же отбрасывалась вместе с
-        якорями. Человек видит строку в индексе и считает файл упомянутым.
-        """
-        self.write({
-            "MEMORY.md": "- [Профиль]() - крючок есть, адреса нет\n",
-            "user.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        self.assertIn("адрес", output.lower())
-
-    def test_anchor_only_destination_stays_allowed(self):
-        """Якорь внутри того же документа - законная строка, её не трогаем."""
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n"
-                         "- [К разделу](#razdel) - якорь внутри индекса\n",
-            "user.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-
-    def test_allow_orphan_accepts_backslash_paths(self):
-        """На Windows человек напишет путь через обратный слэш - и ключ молчал.
-
-        Пути внутри проверки нормализованы через прямой слэш, поэтому шаблон
-        `templates\\*.md` не совпадал ни с чем, а ключ выглядел рабочим.
+        Подсказка про плоскую раскладку сравнивала имя с учётом регистра и на
+        строчном варианте молчала - а человек получал ту же стену сирот.
         """
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n",
             "user.md": "факт\n",
-            "templates/zagotovka.md": "заготовка\n",
+            "memory_infra.md": "- [Сервер](server.md) - прод\n",
+            "server.md": "факт\n",
         })
-        code, output = self.run_linter("--allow-orphan", "templates\\*.md")
-        self.assertEqual(code, 0, output)
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        # Ищем именно заметку про этот файл, а не слово «подпапка» где угодно
+        # в выводе. Прежняя редакция проверяла весь вывод - и умерла молча,
+        # как только то же слово появилось в тексте L2-ошибки: заметку можно
+        # было убрать целиком, а тест оставался зелёным. Ровно тот дешёвый
+        # признак, от которого страхует мутационная проверка (она это и
+        # поймала).
+        notice = [line for line in output.splitlines()
+                  if line.startswith("memory_infra.md:")]
+        self.assertEqual(len(notice), 1,
+                         "заметка про плоскую раскладку не напечатана: %s" % output)
+        self.assertIn("подпапк", notice[0])
 
 
 class OwnMemoryIsConsistent(unittest.TestCase):
@@ -1304,11 +1459,12 @@ class CiGuards(unittest.TestCase):
             % result.stdout.decode("utf-8", "replace"))
 
 
-class PanelReviewFindings(MemoryFixture):
-    """Находки состязательного ревью. Два критических случая - тихий отказ.
+class OrphansAndWhatHidesBehindThem(MemoryFixture):
+    """Сирота, недостижимый под-индекс и счёт того, что скрыто за ним.
 
-    Общая мысль обоих: проверка объявляет память согласованной, когда часть
-    её агенту недоступна. Ровно тот класс, ради которого инструмент написан.
+    Класс назывался по кругу ревью, в котором эти находки всплыли.
+    Имя говорило, КОГДА их заметили, а не ЧТО они держат: чтобы понять,
+    какие тесты покрывают L2, приходилось читать все двести.
     """
 
     def test_orphan_marker_on_sub_index_does_not_legalise_what_it_lists(self):
@@ -1414,278 +1570,6 @@ class PanelReviewFindings(MemoryFixture):
         self.assertIn("скрыто 1 файл", output)
         self.assertNotIn("1 файлов", output)
 
-    def test_marker_works_anywhere_in_a_long_frontmatter(self):
-        """Метка не зависит от того, какой строкой шапки записана.
-
-        Прежде здесь проверялась метка-комментарий и её независимость от
-        номера строки в теле - вместе с меткой этот вопрос не исчез, а
-        переехал: наша конвенция держит в шапке и `name`, и `description`, и
-        `metadata`, так что `orphan` легко оказывается не первым.
-
-        Три соседних теста, проверявшие метку в блоке кода, в бэктиках и в
-        прозе, удалены вместе с ней. Инвариант, ради которого они писались -
-        файл, ОБЪЯСНЯЮЩИЙ метку, себя не освобождает, - теперь держится
-        конструкцией и проверяется в FilesAppearInIndex.
-        """
-        head = ("---\nname: draft\n"
-                + "".join("pole_%d: znachenie\n" % i for i in range(1, 19))
-                + "orphan: true\n---\n")
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n",
-            "user.md": "факт\n",
-            "draft.md": head + "\nТекст заметки.\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-
-    def test_bracketed_text_without_a_definition_is_not_a_row(self):
-        """Без определения `[что-то]` - обычный текст, а не ссылка.
-
-        Иначе чекбоксы `- [ ]` и любые квадратные скобки в прозе начали бы
-        считаться строками индекса и порождать ошибки на пустом месте.
-        """
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n"
-                         "- [ ] не сделано\n"
-                         "- [заметка на полях] просто текст\n",
-            "user.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-
-
-class MinorPanelFindings(MemoryFixture):
-    """Мелкое из панельного ревью. Каждое дёшево чинится и незачем тащить в свет."""
-
-    def test_unclosed_fence_notice_says_how_many_rows_were_lost(self):
-        """«Строки ниже в разбор не попали» - а сколько их было?
-
-        Знание «потеряно 3 строки» отличает опечатку в конце файла от
-        проглоченной половины индекса. Без числа человек не знает, срочно это
-        или нет.
-        """
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n"
-                         "\n"
-                         "```markdown\n"
-                         "- [Раз](a.md) - крючок\n"
-                         "- [Два](b.md) - крючок\n"
-                         "- [Три](c.md) - крючок\n",
-            "user.md": "факт\n",
-        })
-        _code, output = self.run_linter()
-        unclosed = [line for line in output.splitlines() if "не закрыт" in line]
-        self.assertEqual(len(unclosed), 1, output)
-        self.assertRegex(unclosed[0], r"\b3\b",
-                         "не названо, сколько строк индекса пропало")
-
-    def test_stray_index_hint_is_case_insensitive(self):
-        """`memory_infra.md` строчными - тот же случай, что `MEMORY_infra.md`.
-
-        Подсказка про плоскую раскладку сравнивала имя с учётом регистра и на
-        строчном варианте молчала - а человек получал ту же стену сирот.
-        """
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n",
-            "user.md": "факт\n",
-            "memory_infra.md": "- [Сервер](server.md) - прод\n",
-            "server.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        # Ищем именно заметку про этот файл, а не слово «подпапка» где угодно
-        # в выводе. Прежняя редакция проверяла весь вывод - и умерла молча,
-        # как только то же слово появилось в тексте L2-ошибки: заметку можно
-        # было убрать целиком, а тест оставался зелёным. Ровно тот дешёвый
-        # признак, от которого страхует мутационная проверка (она это и
-        # поймала).
-        notice = [line for line in output.splitlines()
-                  if line.startswith("memory_infra.md:")]
-        self.assertEqual(len(notice), 1,
-                         "заметка про плоскую раскладку не напечатана: %s" % output)
-        self.assertIn("подпапк", notice[0])
-
-    def test_folder_is_walked_only_once(self):
-        """Дерево обходится один раз, а не дважды на каждый коммит.
-
-        find_indexes и build_file_map ходили по папке независимо, повторяя и
-        обход, и проверку каждой подпапки на связанность. Хук зовут на каждый
-        коммит - второй обход был бесплатной тратой.
-        """
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Инфра](infra/MEMORY.md) - под\n",
-            "user.md": "факт\n",
-            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
-            "infra/server.md": "факт\n",
-        })
-        real_walk = os.walk
-        calls = []
-
-        def counting_walk(top, *args, **kwargs):
-            calls.append(top)
-            return real_walk(top, *args, **kwargs)
-
-        with unittest.mock.patch.object(linter.os, "walk", counting_walk):
-            code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-        self.assertEqual(len(calls), 1, "дерево обошли %d раз: %s" % (len(calls), calls))
-
-
-class SecondRoundFindings(MemoryFixture):
-    """Второй круг ревью: регрессии, внесённые правками первого круга."""
-
-    def test_mention_hint_respects_the_path_boundary(self):
-        """`vendor/user.md` в чужом тексте - не упоминание нашего `user.md`.
-
-        Замена перебора на токенизацию потеряла границу слева, которую прежний
-        код проверял явно: имя сравнивалось ещё и по basename, а тот обрубает
-        любой ведущий путь. Подсказка начинала указывать на посторонний файл -
-        и отправляла чинить не то.
-        """
-        self.write({
-            "MEMORY.md": "- [Индекс](other.md) - обычный файл памяти\n",
-            "other.md": "Пример структуры лежит в vendor/user.md в их репозитории.\n",
-            "user.md": "реальный факт, забыт в индексе\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        self.assertNotIn("ссылается other.md", output)
-
-    def test_self_mention_does_not_hide_the_real_source(self):
-        """Файл, упомянувший сам себя, не должен занимать место настоящего источника.
-
-        Прежний перебор исключал сам файл до поиска. Новый механизм
-        регистрировал первое совпадение по алфавиту - и если файл упоминал сам
-        себя, полезная подсказка про настоящий источник терялась.
-
-        Проверяем именно строку ПРО сироту: файл-список тоже сирота и даёт
-        собственную ошибку, на которую легко поймать себя ложным совпадением.
-        """
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n",
-            "user.md": "факт\n",
-            "aaa_orphan.md": "Смотри также aaa_orphan.md для истории.\n",
-            "zzz_spisok.md": "- пункт со ссылкой на aaa_orphan.md\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        about = [line for line in output.splitlines()
-                 if line.startswith("L2 aaa_orphan.md")]
-        self.assertEqual(len(about), 1, output)
-        self.assertIn("zzz_spisok.md", about[0])
-
-
-    def test_lost_rows_counter_resets_when_a_comment_closes(self):
-        """Строки закрытого комментария не должны приплюсовываться к настоящей потере.
-
-        Сброс счётчика стоял только у забора. Строки из благополучно закрытого
-        комментария утекали вперёд и раздували число - в том самом сообщении,
-        которое завели ради честного масштаба потери.
-        """
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n"
-                         "\n"
-                         "<!--\n"
-                         "- [A](a.md) - в закрытом комментарии\n"
-                         "- [B](b.md) - тоже\n"
-                         "-->\n"
-                         "\n"
-                         "```markdown\n"
-                         "- [C](c.md) - единственная настоящая потеря\n",
-            "user.md": "факт\n",
-        })
-        _code, output = self.run_linter()
-        lost = [line for line in output.splitlines() if "не закрыт" in line]
-        self.assertEqual(len(lost), 1, output)
-        self.assertRegex(lost[0], r"индекса: 1\b",
-                         "число потерянных строк раздуто закрытым комментарием")
-
-    def test_lost_rows_counter_resets_when_a_fence_closes(self):
-        """Строки закрытого забора не должны приплюсовываться к настоящей потере.
-
-        Парный к тесту про комментарий - и найден не рассуждением, а
-        мутационным аудитом: сброс счётчика при закрытии ЗАБОРА оказался
-        единственной веткой из тридцати одной, которую не ловил ни один тест
-        из набора. Тест про комментарий существовал, про забор - нет, хотя
-        сбросов в коде два.
-        """
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n"
-                         "\n"
-                         "```markdown\n"
-                         "- [A](a.md) - в закрытом заборе\n"
-                         "- [B](b.md) - тоже\n"
-                         "```\n"
-                         "\n"
-                         "<!--\n"
-                         "- [C](c.md) - единственная настоящая потеря\n",
-            "user.md": "факт\n",
-        })
-        _code, output = self.run_linter()
-        lost = [line for line in output.splitlines() if "не закрыт" in line]
-        self.assertEqual(len(lost), 1, output)
-        self.assertRegex(lost[0], r"индекса: 1\b",
-                         "число потерянных строк раздуто закрытым забором")
-
-    def test_mention_hint_does_not_confuse_md_with_mdx(self):
-        """`user.mdx` - другой файл, а не наш `user.md` с хвостом."""
-        self.write({
-            "MEMORY.md": "- [Профиль](profil.md) - кто\n"
-                         "\n"
-                         "Раньше был файл user.mdx, другой формат.\n",
-            "profil.md": "факт\n",
-            "user.md": "забытый факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        self.assertNotIn("в тексте индекса встречается", output)
-
-    def test_two_level_orphan_chain_does_not_launder_deep_facts(self):
-        """Двойная метка не отмывает ветку: факты в глубине всё равно недостижимы."""
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n",
-            "user.md": "факт\n",
-            "infra/MEMORY.md": "---\norphan: true\n---\n\n- [Глубже](nested/MEMORY.md) - под\n",
-            "infra/nested/MEMORY.md": "---\norphan: true\n---\n\n- [Факт](a.md) - раз\n",
-            "infra/nested/a.md": "спрятанный факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        self.assertIn("infra/nested/a.md", output)
-
-    def test_file_listed_in_both_reachable_and_unreachable_index(self):
-        """Упоминания в достижимом индексе достаточно - недостижимый не мешает."""
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Общий](obshiy.md) - факт\n",
-            "user.md": "факт\n",
-            "obshiy.md": "факт\n",
-            "infra/MEMORY.md": "- [Тот же](../obshiy.md) - и тут\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        self.assertNotIn("L2 obshiy.md", output)
-
-    def test_mutual_link_between_sub_indexes_where_one_is_reachable(self):
-        """Взаимная ссылка не создаёт остров, если один из двух достижим."""
-        self.write({
-            "MEMORY.md": "- [Первый](a/MEMORY.md) - под\n",
-            "a/MEMORY.md": "- [Второй](../b/MEMORY.md) - сосед\n- [Факт](x.md) - раз\n",
-            "a/x.md": "факт\n",
-            "b/MEMORY.md": "- [Первый](../a/MEMORY.md) - сосед\n- [Факт](y.md) - два\n",
-            "b/y.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 0, output)
-
-
-class ThirdRoundFindings(MemoryFixture):
-    """Третий круг. Каждая правка проверяется в обе стороны.
-
-    Все находки круга - маятник: прежняя правка закрывала одну сторону и
-    открывала другую. Поэтому здесь на каждый фикс два теста: что он ловит и
-    что при этом остаётся законным.
-    """
-
     def test_hidden_count_ignores_what_is_visible_anyway(self):
         """Ссылка «см. общий индекс» из архивной ветки не прячет весь корень.
 
@@ -1730,36 +1614,118 @@ class ThirdRoundFindings(MemoryFixture):
         self.assertEqual(len(top), 1, output)
         self.assertIn("скрыто 3 файла", top[0])
 
-    def test_filename_followed_by_a_sentence_period_is_found(self):
-        """`... лежит в user.md.` - точка кончает предложение, а не имя файла.
+    def test_two_level_orphan_chain_does_not_launder_deep_facts(self):
+        """Двойная метка не отмывает ветку: факты в глубине всё равно недостижимы."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "---\norphan: true\n---\n\n- [Глубже](nested/MEMORY.md) - под\n",
+            "infra/nested/MEMORY.md": "---\norphan: true\n---\n\n- [Факт](a.md) - раз\n",
+            "infra/nested/a.md": "спрятанный факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("infra/nested/a.md", output)
 
-        Просмотр вперёд, добавленный ради `user.mdx`, запрещал точку после
-        имени - и упоминание в обычной прозе переставало находиться вовсе.
-        Связный текст с точками в конце предложений - стиль этого репозитория.
+    def test_file_listed_in_both_reachable_and_unreachable_index(self):
+        """Упоминания в достижимом индексе достаточно - недостижимый не мешает."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Общий](obshiy.md) - факт\n",
+            "user.md": "факт\n",
+            "obshiy.md": "факт\n",
+            "infra/MEMORY.md": "- [Тот же](../obshiy.md) - и тут\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("L2 obshiy.md", output)
+
+    def test_mutual_link_between_sub_indexes_where_one_is_reachable(self):
+        """Взаимная ссылка не создаёт остров, если один из двух достижим."""
+        self.write({
+            "MEMORY.md": "- [Первый](a/MEMORY.md) - под\n",
+            "a/MEMORY.md": "- [Второй](../b/MEMORY.md) - сосед\n- [Факт](x.md) - раз\n",
+            "a/x.md": "факт\n",
+            "b/MEMORY.md": "- [Первый](../a/MEMORY.md) - сосед\n- [Факт](y.md) - два\n",
+            "b/y.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_allow_orphan_accepts_backslash_paths(self):
+        """На Windows человек напишет путь через обратный слэш - и ключ молчал.
+
+        Пути внутри проверки нормализованы через прямой слэш, поэтому шаблон
+        `templates\\*.md` не совпадал ни с чем, а ключ выглядел рабочим.
         """
         self.write({
-            "MEMORY.md": "- [Список](spisok.md) - перечень\n",
-            "spisok.md": "Полный текст правил лежит в user.md.\n",
-            "user.md": "забытый факт\n",
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "templates/zagotovka.md": "заготовка\n",
         })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        about = [line for line in output.splitlines() if line.startswith("L2 user.md")]
-        self.assertEqual(len(about), 1, output)
-        self.assertIn("spisok.md", about[0])
+        code, output = self.run_linter("--allow-orphan", "templates\\*.md")
+        self.assertEqual(code, 0, output)
 
-    def test_filename_with_a_longer_extension_is_still_a_different_file(self):
-        """Обратная сторона: `user.mdx` - другой файл, ложным совпадением быть не должен."""
+class SourceHintPointsAtTheRightFile(MemoryFixture):
+    """Подсказка «на него ссылается X» обязана называть верный файл.
+
+    Ошибиться тут дороже, чем промолчать: человек идёт править файл,
+    который ни при чём. Отсюда границы имени, отсев самоупоминания и
+    осторожность при однофамильцах.
+    """
+
+    def test_mention_hint_respects_the_path_boundary(self):
+        """`vendor/user.md` в чужом тексте - не упоминание нашего `user.md`.
+
+        Замена перебора на токенизацию потеряла границу слева, которую прежний
+        код проверял явно: имя сравнивалось ещё и по basename, а тот обрубает
+        любой ведущий путь. Подсказка начинала указывать на посторонний файл -
+        и отправляла чинить не то.
+        """
         self.write({
-            "MEMORY.md": "- [Список](spisok.md) - перечень\n",
-            "spisok.md": "Раньше был файл user.mdx, другой формат.\n",
+            "MEMORY.md": "- [Индекс](other.md) - обычный файл памяти\n",
+            "other.md": "Пример структуры лежит в vendor/user.md в их репозитории.\n",
+            "user.md": "реальный факт, забыт в индексе\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("ссылается other.md", output)
+
+    def test_self_mention_does_not_hide_the_real_source(self):
+        """Файл, упомянувший сам себя, не должен занимать место настоящего источника.
+
+        Прежний перебор исключал сам файл до поиска. Новый механизм
+        регистрировал первое совпадение по алфавиту - и если файл упоминал сам
+        себя, полезная подсказка про настоящий источник терялась.
+
+        Проверяем именно строку ПРО сироту: файл-список тоже сирота и даёт
+        собственную ошибку, на которую легко поймать себя ложным совпадением.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "aaa_orphan.md": "Смотри также aaa_orphan.md для истории.\n",
+            "zzz_spisok.md": "- пункт со ссылкой на aaa_orphan.md\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        about = [line for line in output.splitlines()
+                 if line.startswith("L2 aaa_orphan.md")]
+        self.assertEqual(len(about), 1, output)
+        self.assertIn("zzz_spisok.md", about[0])
+
+
+    def test_mention_hint_does_not_confuse_md_with_mdx(self):
+        """`user.mdx` - другой файл, а не наш `user.md` с хвостом."""
+        self.write({
+            "MEMORY.md": "- [Профиль](profil.md) - кто\n"
+                         "\n"
+                         "Раньше был файл user.mdx, другой формат.\n",
+            "profil.md": "факт\n",
             "user.md": "забытый факт\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        about = [line for line in output.splitlines() if line.startswith("L2 user.md")]
-        self.assertEqual(len(about), 1, output)
-        self.assertNotIn("spisok.md", about[0])
+        self.assertNotIn("в тексте индекса встречается", output)
 
     def test_same_basename_elsewhere_is_a_real_source(self):
         """Упоминание в файле с тем же именем, но в другой папке - не самоупоминание.
@@ -1818,10 +1784,6 @@ class ThirdRoundFindings(MemoryFixture):
         self.assertNotIn("ссылается", about[0])
         self.assertNotIn("переименуйте", about[0])
 
-
-class FifthRoundFindings(MemoryFixture):
-    """Пятый круг: честность подсказок и слепые зоны, найденные мутациями."""
-
     def test_bare_name_source_is_not_stated_as_fact_when_namesakes_exist(self):
         """Совпало голое имя, а файлов с таким именем несколько - это догадка.
 
@@ -1864,6 +1826,52 @@ class FifthRoundFindings(MemoryFixture):
         self.assertEqual(len(about), 1, output)
         self.assertIn("На него ссылается spisok.md", about[0])
 
+class FilenameTokenBoundaries(MemoryFixture):
+    """Где кончается имя файла в связном тексте.
+
+    «user.md» внутри «superuser.md», «user.mdx» как другой файл, точка в
+    конце предложения - каждая граница стоила отдельной находки, и
+    каждая правка тут однажды ломала соседнюю.
+    """
+
+    def test_filename_followed_by_a_sentence_period_is_found(self):
+        """`... лежит в user.md.` - точка кончает предложение, а не имя файла.
+
+        Просмотр вперёд, добавленный ради `user.mdx`, запрещал точку после
+        имени - и упоминание в обычной прозе переставало находиться вовсе.
+        Связный текст с точками в конце предложений - стиль этого репозитория.
+        """
+        self.write({
+            "MEMORY.md": "- [Список](spisok.md) - перечень\n",
+            "spisok.md": "Полный текст правил лежит в user.md.\n",
+            "user.md": "забытый факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        about = [line for line in output.splitlines() if line.startswith("L2 user.md")]
+        self.assertEqual(len(about), 1, output)
+        self.assertIn("spisok.md", about[0])
+
+    def test_filename_with_a_longer_extension_is_still_a_different_file(self):
+        """Обратная сторона: `user.mdx` - другой файл, ложным совпадением быть не должен."""
+        self.write({
+            "MEMORY.md": "- [Список](spisok.md) - перечень\n",
+            "spisok.md": "Раньше был файл user.mdx, другой формат.\n",
+            "user.md": "забытый факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        about = [line for line in output.splitlines() if line.startswith("L2 user.md")]
+        self.assertEqual(len(about), 1, output)
+        self.assertNotIn("spisok.md", about[0])
+
+class FrontmatterDiagnostics(MemoryFixture):
+    """Шапка: метка внутри неё, незакрытая шапка и что об этом сказано.
+
+    Человек уже сделал правильное действие - поставил метку, - и ему
+    надо объяснить, почему оно не засчиталось.
+    """
+
     def test_unclosed_frontmatter_explains_why_the_marker_did_not_work(self):
         """Метка внутри незакрытой шапки не читается - об этом надо сказать.
 
@@ -1891,77 +1899,6 @@ class FifthRoundFindings(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
-
-    def test_link_to_a_directory_says_so(self):
-        """`[Инфра](infra)` вместо `infra/MEMORY.md` - частая опечатка.
-
-        Ветка сообщения существовала, но ни один из тестов на неё не попадал:
-        мутация «отключить ветку» переживала весь набор. Диагноз «ссылка в
-        никуда» вместо «это каталог» отправляет чинить не то.
-        """
-        self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Инфра](infra) - раздел\n",
-            "user.md": "факт\n",
-            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
-            "infra/server.md": "факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        self.assertIn("каталог", output)
-
-    def test_cyrillic_file_names_are_handled(self):
-        """Во всех фикстурах набора не было ни одного не-ASCII имени.
-
-        Проект русскоязычный, кириллическое имя файла памяти - вопрос времени.
-        Проверяем обе стороны: связанный файл резолвится, забытый ловится.
-        """
-        self.write({
-            "MEMORY.md": "- [Заметка](заметка.md) - крючок\n",
-            "заметка.md": "факт\n",
-            "сирота файл.md": "забытый факт\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        self.assertIn("сирота файл.md", output)
-        self.assertNotIn("L2 заметка.md", output)
-
-
-class HiddenBehindTerminates(unittest.TestCase):
-    """Обход скрытого обязан завершаться на любой топологии ссылок.
-
-    Дедупликация по посещённым узлам не была покрыта ни тестом, ни мутацией:
-    её снятие проходило весь набор чисто, а на цикле из трёх узлов, не
-    проходящем через стартовый, обход зависал навсегда. Зависший pre-commit -
-    замороженный терминал без единой строки объяснения, худший вид отказа из
-    всех, что этот инструмент старается не допускать.
-    """
-
-    def test_cycle_not_through_the_start_still_terminates(self):
-        sys.path.insert(0, SCRIPTS_DIR)
-        import check_memory_index as linter_module
-
-        per_index = {
-            "a/MEMORY.md": [("Б", "b/MEMORY.md")],
-            "b/MEMORY.md": [("В", "c/MEMORY.md")],
-            "c/MEMORY.md": [("Б", "b/MEMORY.md")],
-        }
-        index_rels = {"a/MEMORY.md", "b/MEMORY.md", "c/MEMORY.md"}
-
-        finished = []
-
-        def call():
-            finished.append(linter_module.hidden_behind(
-                "a/MEMORY.md", per_index, index_rels, set(), set()))
-
-        worker = threading.Thread(target=call, daemon=True)
-        worker.start()
-        worker.join(timeout=10)
-        self.assertFalse(worker.is_alive(), "обход не завершился - цикл не разорван")
-        self.assertEqual(finished[0], {"b/MEMORY.md", "c/MEMORY.md"})
-
-
-class SixthRoundFindings(MemoryFixture):
-    """Шестой круг. Три критических из четырёх - следствие правок пятого."""
 
     def test_unclosed_frontmatter_is_explained_even_when_a_source_is_found(self):
         """Две правки одного коммита: первая сделала вторую недостижимой.
@@ -2002,37 +1939,62 @@ class SixthRoundFindings(MemoryFixture):
         self.assertEqual(len(about), 1, output)
         self.assertNotIn("не закрыта", about[0])
 
-    def test_closing_fence_with_a_tail_does_not_close_the_block(self):
-        """Правило про пустой хвост обещано в докстроке и не проверялось нигде.
+    def test_marker_works_anywhere_in_a_long_frontmatter(self):
+        """Метка не зависит от того, какой строкой шапки записана.
 
-        Закрывающий забор с хвостом (```python вместо ```) не закрывает блок.
-        Иначе пример внутри блока начинает разбираться как настоящий индекс -
-        ложная тревога ровно на приёме «документируем свой формат», который
-        README и советует.
+        Прежде здесь проверялась метка-комментарий и её независимость от
+        номера строки в теле - вместе с меткой этот вопрос не исчез, а
+        переехал: наша конвенция держит в шапке и `name`, и `description`, и
+        `metadata`, так что `orphan` легко оказывается не первым.
+
+        Три соседних теста, проверявшие метку в блоке кода, в бэктиках и в
+        прозе, удалены вместе с ней. Инвариант, ради которого они писались -
+        файл, ОБЪЯСНЯЮЩИЙ метку, себя не освобождает, - теперь держится
+        конструкцией и проверяется в FilesAppearInIndex.
         """
+        head = ("---\nname: draft\n"
+                + "".join("pole_%d: znachenie\n" % i for i in range(1, 19))
+                + "orphan: true\n---\n")
         self.write({
-            "MEMORY.md": "- [Профиль](user.md) - кто\n"
-                         "\n"
-                         "````markdown\n"
-                         "```python\n"
-                         "- [Пример](primer.md) - это пример, не строка индекса\n"
-                         "```\n"
-                         "````\n",
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
             "user.md": "факт\n",
+            "draft.md": head + "\nТекст заметки.\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
 
-    def test_distinct_unicode_names_are_still_distinct(self):
-        """Обратная сторона: нормализация не должна склеивать разные имена."""
-        self.write({
-            "MEMORY.md": "- [Кафе](cafe.md) - крючок\n",
-            "cafe.md": "факт\n",
-            "café.md": "другой файл, в индексе его нет\n",
-        })
-        code, output = self.run_linter()
-        self.assertEqual(code, 1, output)
-        self.assertIn("café.md", output)
+class HiddenBehindTerminates(unittest.TestCase):
+    """Обход скрытого обязан завершаться на любой топологии ссылок.
+
+    Дедупликация по посещённым узлам не была покрыта ни тестом, ни мутацией:
+    её снятие проходило весь набор чисто, а на цикле из трёх узлов, не
+    проходящем через стартовый, обход зависал навсегда. Зависший pre-commit -
+    замороженный терминал без единой строки объяснения, худший вид отказа из
+    всех, что этот инструмент старается не допускать.
+    """
+
+    def test_cycle_not_through_the_start_still_terminates(self):
+        sys.path.insert(0, SCRIPTS_DIR)
+        import check_memory_index as linter_module
+
+        per_index = {
+            "a/MEMORY.md": [("Б", "b/MEMORY.md")],
+            "b/MEMORY.md": [("В", "c/MEMORY.md")],
+            "c/MEMORY.md": [("Б", "b/MEMORY.md")],
+        }
+        index_rels = {"a/MEMORY.md", "b/MEMORY.md", "c/MEMORY.md"}
+
+        finished = []
+
+        def call():
+            finished.append(linter_module.hidden_behind(
+                "a/MEMORY.md", per_index, index_rels, set(), set()))
+
+        worker = threading.Thread(target=call, daemon=True)
+        worker.start()
+        worker.join(timeout=10)
+        self.assertFalse(worker.is_alive(), "обход не завершился - цикл не разорван")
+        self.assertEqual(finished[0], {"b/MEMORY.md", "c/MEMORY.md"})
 
 
 class HotPathStaysLinear(MemoryFixture):
@@ -2123,6 +2085,31 @@ class HotPathStaysLinear(MemoryFixture):
         self.assertLess(spent, 20.0,
                         "500 файлов с 200 сиротами заняли %.1f с - похоже на "
                         "возврат перебора всех файлов на каждую сироту" % spent)
+
+    def test_folder_is_walked_only_once(self):
+        """Дерево обходится один раз, а не дважды на каждый коммит.
+
+        find_indexes и build_file_map ходили по папке независимо, повторяя и
+        обход, и проверку каждой подпапки на связанность. Хук зовут на каждый
+        коммит - второй обход был бесплатной тратой.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Инфра](infra/MEMORY.md) - под\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        real_walk = os.walk
+        calls = []
+
+        def counting_walk(top, *args, **kwargs):
+            calls.append(top)
+            return real_walk(top, *args, **kwargs)
+
+        with unittest.mock.patch.object(linter.os, "walk", counting_walk):
+            code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(calls), 1, "дерево обошли %d раз: %s" % (len(calls), calls))
 
 
 class FilenameTokenScan(unittest.TestCase):
