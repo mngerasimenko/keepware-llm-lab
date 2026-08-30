@@ -4356,6 +4356,21 @@ class PreCommitHook(unittest.TestCase):
         self.git("add", "memory/MEMORY.md", "memory/user.md")
         env = os.environ.copy()
         env["PATH"] = fake + os.pathsep + env.get("PATH", "")
+        # Подмена через PATH доходит не до всякого sh. Обёртка
+        # `Git\bin\sh.exe` ставит свой `/usr/bin` ПЕРЕД унаследованным
+        # PATH, до заглушки очередь не доходит, настоящий sed отрабатывает,
+        # и хук молча выходит с нулём - тест краснел на windows-latest,
+        # проверив ровно ничего. Спрашиваем прямо: подменился ли sed. Само
+        # проверяемое свойство - что `|| :` не даёт `set -e` оборвать
+        # скрипт - принадлежит тексту хука, а не системе, и на POSIX,
+        # где подмена действует, оно проверяется по-настоящему.
+        probe = subprocess.run(
+            [self.sh, "-c", "sed --version >/dev/null 2>&1"],
+            cwd=self.repo, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if probe.returncode != 3:
+            self.skipTest("подмена sed через PATH не доходит до этого sh: "
+                          "код %d вместо 3" % probe.returncode)
         result = self.run_hook(env=env)
         printed = result.stdout.decode("utf-8", "replace")
         # Непустоты вывода мало: оборванный хук успевает напечатать

@@ -560,6 +560,31 @@ class InterruptedRunCleansUpAfterItself(unittest.TestCase):
         with io.open(target, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "ОРИГИНАЛ\n")
 
+    def test_the_backup_names_the_file_it_does_not_address_it(self):
+        """Путь из слепка - это опознание, а не адрес записи.
+
+        Проверка на ВОЗВРАЩАЕМОМ ЗНАЧЕНИИ, а не на эффекте восстановления,
+        и это не педантизм: эффект расходится только там, где обратный слэш
+        не разделитель, то есть на POSIX. Тест соседа
+        (`..._windows_style_path_...`) поймал дефект на ubuntu и на Windows
+        проходил при ОБЕИХ реализациях - там писать по строке из слепка так
+        же безобидно, как по своей. Этот вход различает их на любой системе.
+        """
+        folder, target = self.sandbox()
+        # Форма входа выбрана так, чтобы она РАСХОДИЛАСЬ с каноническим
+        # путём на любой системе. Первая редакция брала
+        # `target.replace("/", "\\")` - и на Windows в пути прямых слэшей
+        # нет вовсе, замена не меняла ничего, строки совпадали, и тест
+        # оставался зелёным на сломанной реализации. Проверено откатом.
+        odd_form = os.path.join(folder, ".", os.path.basename(target))
+        self.assertNotEqual(odd_form, target, "вход не отличается от канона")
+        with unittest.mock.patch.object(mutation_check, "LINTER", target):
+            self.assertEqual(mutation_check.resolve_ours(odd_form), target,
+                             "вернулась строка из слепка, а не свой путь")
+            # Вторая половина пары: посторонний файл своим не становится.
+            self.assertIsNone(mutation_check.resolve_ours(
+                os.path.join(folder, "postoronnii.py")))
+
     def test_an_interruption_before_the_mutation_landed_is_quiet(self):
         """Обрыв ДО применения мутации - не «кто-то уже поправил».
 
