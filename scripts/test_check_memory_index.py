@@ -474,6 +474,39 @@ class MemoryFileNameIsASlug(MemoryFixture):
         self.assertEqual(findings(output, "L5"), [], output)
         self.assertEqual(findings(output, "L6"), [], output)
 
+    def test_excluded_paths_do_not_report_broken_links_either(self):
+        """L4 подчиняется тому же ключу, что L2, L5 и L6.
+
+        Иначе неотслеживаемый черновик, который хук исключает этим самым
+        ключом, сыпал бы предупреждениями на каждом коммите - ровно тем
+        шумом, ради снятия которого исключение и написано. А чинить связи в
+        чужом сгенерированном файле нечем в принципе.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "vendor/chuzhoe.md": "см. [[net_takogo_fakta]] рядом\n",
+        })
+        code, output = self.run_linter("--allow-orphan", "vendor/*.md")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(findings(output, "L4"), [], output)
+
+    def test_a_link_into_an_excluded_file_still_resolves(self):
+        """Вторая половина: цель ссылки остаётся разрешимой.
+
+        Исключение говорит «не аудируй ЭТОТ файл», а не «забудь, что он
+        существует»: ссылка из обычного факта в исключённый файл ложной
+        стать не должна.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "см. [[chuzhoe]] рядом\n",
+            "vendor/chuzhoe.md": "чужое\n",
+        })
+        code, output = self.run_linter("--allow-orphan", "vendor/*.md")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(findings(output, "L4"), [], output)
+
     def test_without_the_key_the_same_files_are_audited(self):
         """Вторая половина пары: без ключа те же файлы проверяются как все.
 
@@ -691,6 +724,28 @@ class IndexParsing(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
+
+    def test_a_code_block_inside_a_wrapped_item_is_still_code(self):
+        """Третий случай пары: блок кода ПОД пунктом, после переноса строки.
+
+        Первая правка теряла вложенный пункт под переносом; вторая, чинившая
+        её флагом «строка с отступом продолжает список», унесла в списки
+        настоящие блоки кода - и индекс, документирующий собственный формат
+        (а README именно это и советует), давал блокирующую ложную ошибку.
+
+        Отступ блока кода отсчитывается от содержимого пункта: у «- » это два
+        символа, значит блок начинается с шести.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто владелец\n"
+                         "  Формат строки индекса такой:\n"
+                         "\n"
+                         "      - [Заголовок](primer.md) - крючок\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(findings(output, "L1"), [], output)
 
     def test_an_indented_block_after_plain_text_is_still_code(self):
         """Вторая половина пары: после обычного текста отступ - это блок кода.
@@ -2909,6 +2964,35 @@ class UnreadableEntries(MemoryFixture):
         self.assertIn("zanyatyi.md", output)
         self.assertNotIn("Память согласована", output)
 
+    def test_an_unreadable_fact_is_said_out_loud_even_with_orphans(self):
+        """Заметка работала ровно тогда, когда была не нужна.
+
+        `map_mentions` читала файлы своим кодом, глотала отказ и клала в кэш
+        пустую строку. Зовут её ТОЛЬКО когда есть сироты - то есть в самом
+        частом состоянии хука: человек чинит разъехавшуюся память и коммитит
+        снова. L4 и L5 по нечитаемому файлу молчали, а прогон уверенно
+        печатал «Нарушений: 1».
+
+        Отличие от соседнего теста ровно в одной строке фикстуры - лишнем
+        файле вне индекса. Без неё вход не различает старую реализацию и
+        новую.
+
+        Код тут 1, а не 2, и это правило, а не поблажка: код 2 приходит,
+        только если нарушений не нашлось, а сирота - настоящее нарушение.
+        Требование к этому входу другое - сказать про нечитаемый файл вслух.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Занятый](zanyatyi.md) - его держит редактор\n",
+            "user.md": "факт\n",
+            "zanyatyi.md": "---\nname: sovsem_drugoe\n---\nсм. [[nikuda_ne_vedet]]\n",
+            "zabytyi.md": "меня забыли внести\n",
+        })
+        self.unreadable("zanyatyi.md")
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("zanyatyi.md: файл не читается", output)
+
     def test_the_same_file_readable_is_audited_as_usual(self):
         """Вторая половина пары: читается - проверяется как все.
 
@@ -2996,6 +3080,13 @@ class WikiLinksBetweenFacts(MemoryFixture):
             ("две подряд [[odin]] и [[dva]]", ["odin", "dva"]),
             ("[[#tolko_yakor]] имени нет", []),
             ("незакрытая [[skobka и всё", []),
+            # Пробел вокруг имени старая форма не принимала, и `.strip()`
+            # добавил бы срабатывания на прозе вроде «[[ 2026 ]]».
+            ("[[ imya_s_probelami ]] это проза", []),
+            # Скобки внутри подписи форма не разбирает: связь пишется
+            # `[[имя]]`, а подпись со скобками - уже не наш формат. Названо
+            # в README, в разделе «Чего проверка не делает».
+            ("[[fakt|razdel [vazhnoe]]]", []),
         ]
         for line, expected in cases:
             self.assertEqual(linter.wiki_targets(line), expected, line)
@@ -3738,6 +3829,127 @@ class PreCommitHook(unittest.TestCase):
             os.makedirs(folder)
         with io.open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("ещё не дописано\n")
+
+    def commit_base(self):
+        """Кладёт здоровую память в первый коммит - чтобы было что удалять."""
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        self.git("-c", "user.email=t@t", "-c", "user.name=t",
+                 "commit", "-q", "-m", "base", "--no-verify")
+
+    def test_removing_the_index_from_the_repo_is_not_silent(self):
+        """`git rm --cached` уносит индекс из репозитория, а на диске оставляет.
+
+        Ветка «папку удаляют» смотрела на ОТСУТСТВИЕ папки на диске и этот
+        случай не видела вовсе. Хуже: файлы, вышедшие из git-индекса, тут же
+        становятся неотслеживаемыми - и механизм исключения черновиков
+        вычёркивал ровно те файлы, которые коммит удаляет из репозитория.
+
+        Проверка ходит по диску и про git не знает ничего, поэтому сказать
+        тут может только хук. Блокировать не обязательно - удаление бывает
+        намеренным, - но молчать нельзя: индекс уходит, а строка импорта в
+        конфиге агента остаётся указывать в пустоту.
+        """
+        self.commit_base()
+        self.git("rm", "-q", "--cached", "memory/MEMORY.md")
+        result = self.run_hook()
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, printed)
+        self.assertIn("MEMORY.md", printed)
+        self.assertNotEqual(printed.strip(), "", "вывод пуст")
+
+    def test_a_staged_deletion_is_not_treated_as_a_draft(self):
+        """Вторая половина пары: файл, уходящий из репозитория, не черновик.
+
+        Пока он попадал в исключения, по нему переставали проверяться и имя
+        файла, и поле `name` - то есть коммит, выносящий память из репо, ещё
+        и отключал часть правил.
+        """
+        self.write_memory("- [Профиль](user.md) - кто\n"
+                          "- [Второй](Vtoroi.md) - имя не по правилу\n",
+                          {"Vtoroi.md": "второй факт\n"})
+        self.git("add", "-A")
+        self.git("-c", "user.email=t@t", "-c", "user.name=t",
+                 "commit", "-q", "-m", "base", "--no-verify")
+        self.git("rm", "-q", "--cached", "memory/Vtoroi.md")
+        result = self.run_hook()
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 1, printed)
+        self.assertIn("L6", printed)
+
+    def test_ignored_files_do_not_eat_the_exclusion_budget(self):
+        """Игнорируемое поддерево вытесняло настоящий черновик.
+
+        Проверка внутрь каталогов на точку не заходит вовсе, поэтому
+        исключать их файлы незачем - а они съедали бюджет и заставляли хук
+        отказаться от исключений целиком. Итог: блокировка здорового
+        коммита ровно той починкой, которая снимала ложную тревогу.
+        """
+        with io.open(os.path.join(self.repo, ".gitignore"), "w",
+                     encoding="utf-8", newline="\n") as fh:
+            fh.write("memory/.cache/\n")
+        cache = os.path.join(self.repo, "memory", ".cache")
+        os.makedirs(cache)
+        for number in range(250):
+            with io.open(os.path.join(cache, "f%d.md" % number), "w",
+                         encoding="utf-8", newline="\n") as fh:
+                fh.write("мусор\n")
+        self.draft("chernoviki", "draft.md")
+        self.git("add", ".gitignore", "memory/MEMORY.md", "memory/user.md")
+        result = self.run_hook()
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, printed)
+
+    def test_config_set_twice_does_not_lose_the_first_value(self):
+        """`git config --get` молча отдаёт последнее из нескольких значений.
+
+        Настройку дописывают через `--add`, и первый набор ключей исчезал
+        без слова. Если в нём было имя индекса - проверка искала `MEMORY.md`,
+        не находила и отдавала код 2, а на коде 2 хук не блокирует: защита
+        выключена насовсем. Спасательный повтор тут не помогает - он тоже
+        возвращает 2.
+        """
+        os.rename(os.path.join(self.repo, "memory", "MEMORY.md"),
+                  os.path.join(self.repo, "memory", "INDEX.md"))
+        self.git("config", "--add", "memorycheck.args", "--index INDEX.md")
+        self.git("config", "--add", "memorycheck.args", "--allow-orphan tmpl/*.md")
+        self.git("add", "-A")
+        result = self.run_hook()
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, printed)
+        self.assertNotIn("Индекс не найден", printed)
+
+    def test_an_index_name_with_a_metacharacter_is_matched_literally(self):
+        """Имя индекса уходит в grep, и точка совпадала с любым символом.
+
+        Проверяем обратную сторону: имя с метасимволом не должно давать
+        ЛОЖНОГО «строка импорта есть». Конфиг агента называет другой файл,
+        отличающийся ровно там, где стоит метасимвол.
+        """
+        os.rename(os.path.join(self.repo, "memory", "MEMORY.md"),
+                  os.path.join(self.repo, "memory", "my.index.md"))
+        self.git("config", "memorycheck.args", "--index my.index.md")
+        with io.open(os.path.join(self.repo, "CLAUDE.md"), "w",
+                     encoding="utf-8", newline="\n") as fh:
+            fh.write("@memory/myXindexYmd\n")
+        self.git("add", "-A")
+        result = self.run_hook()
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertIn("нет строки", printed,
+                      "точка совпала с чужим символом - имя ушло в grep "
+                      "регуляркой")
+
+    def test_a_draft_with_glob_characters_in_its_name_is_excluded(self):
+        """Ключ принимает ШАБЛОН, а мы передаём конкретный путь.
+
+        Без обезвреживания «notes[1].md» сам себе не соответствует, зато
+        соответствует «notes1.md»: исключается не тот файл.
+        """
+        self.write_memory("- [Профиль](user.md) - кто\n")
+        self.draft("chernoviki", "notes[1].md")
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0,
+                         result.stdout.decode("utf-8", "replace"))
 
     def test_a_draft_whose_name_starts_with_a_dash_does_not_disable_the_hook(self):
         """Один файл с неудачным именем выключал защиту насовсем.

@@ -174,7 +174,7 @@ MUTATIONS = [
 
     # --- L4: ссылки [[...]] между фактами ---
     ("битые ссылки [[...]] не сообщаются", LINTER,
-     "    dangling = dangling_wiki_links(exact, cache)", "    dangling = []"),
+     "    dangling = dangling_wiki_links(exact, cache, allow_globs)", "    dangling = []"),
     ("имена каталогов правилу не подчиняются", LINTER,
      "            if not MEMORY_FILE_NAME.match(folder):",
      "            if False:"),
@@ -202,8 +202,8 @@ MUTATIONS = [
      "        if len(target) >= 2 and not any(char.isspace() for char in target):",
      "        if len(target) >= 2:"),
     ("якорь в ссылке [[имя#раздел]] обрывает разбор", LINTER,
-     '        target = inner.split("#", 1)[0].split("|", 1)[0].strip()',
-     '        target = inner.split("|", 1)[0].strip()'),
+     '        target = inner.split("#", 1)[0].split("|", 1)[0]',
+     '        target = inner.split("|", 1)[0]'),
     ("разбор хвостов связи вернулся в регулярку", LINTER,
      r'WIKI_LINK = re.compile(r"\[\[([^\[\]\n]{2,})\]\]")',
      r'WIKI_LINK = re.compile(r"\[\[([^\s\[\]|#]{2,})(?:#[^\]|\n]*)?(?:\|[^\]\n]*)?\]\]")'),
@@ -381,6 +381,35 @@ MUTATIONS = [
     # именно `set -f`, а парный `set +f` ниже безвреден и без него.
     ("аргументы из настройки раскрываются шаблоном", HOOK,
      "set -f\n", ""),
+
+    # --- второй круг ревью ---
+    ("исключение не распространяется на связи [[...]]", LINTER,
+     "        if is_excluded(rel, allow_globs):\n            continue\n"
+     '        opened_fence = ""',
+     '        opened_fence = ""'),
+    ("блок кода отсчитывается от левого края, а не от пункта", LINTER,
+     "        if indent >= item_indent + 4:",
+     "        if indent >= 4:"),
+    ("буллет перестал задавать отступ содержимого", LINTER,
+     "            item_indent = indent + len(bullet.group(0))",
+     "            item_indent = 0"),
+    ("карта упоминаний снова читает файлы мимо кэша", LINTER,
+     "        text = cached_text(path, rel, cache)",
+     "        text = read_all([path]).get(path)"),
+    ("удаления из индекса снова считаются черновиками", HOOK,
+     "    DRAFTS=$KEPT", "    DRAFTS=$DRAFTS"),
+    ("уход индекса из репозитория снова проходит молча", HOOK,
+     '        say "pre-commit: $MEMORY_DIR/$IMPORT_INDEX уходит из репозитория этим коммитом."',
+     "        :"),
+    ("файлы скрытых каталогов снова съедают бюджет", HOOK,
+     "    DRAFTS=$(printf '%s\\n' \"$DRAFTS\" | grep -v '/\\.[^/]*/' || true)",
+     "    :"),
+    ("бюджет исключений снова считается в файлах", HOOK,
+     'if [ "$DRAFT_BYTES" -gt 24000 ]; then',
+     'if [ "$DRAFT_COUNT" -gt 200 ]; then'),
+    ("ключи читаются снова через --get", HOOK,
+     "EXTRA_ARGS=$IMPORT_ARGS",
+     "EXTRA_ARGS=$(git config --get memorycheck.args 2>/dev/null || true)"),
 ]
 
 

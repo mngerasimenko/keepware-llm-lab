@@ -49,6 +49,7 @@ import re
 import stat
 import sys
 from collections import Counter, defaultdict
+from functools import lru_cache
 from urllib.parse import urlparse
 
 # Строка индекса: "- [Заголовок](файл.md) - крючок".
@@ -168,9 +169,14 @@ def address_core(target):
     именем файла памяти.
     """
     core = target.strip()
-    if core.startswith("<") and core.endswith(">"):
-        core = core[1:-1].strip()
-    elif QUOTED_TITLE.match(core):
+    # Скобки снимаем по одной, а не парой: `(<https://example.com` без
+    # закрывающей - опечатка, но адрес от этого не перестаёт быть внешним, а
+    # совет «в индексе одна форма - голый путь» на чужом URL неверен.
+    if core.startswith("<"):
+        core = core[1:].strip()
+    if core.endswith(">"):
+        core = core[:-1].strip()
+    if QUOTED_TITLE.match(core):
         core = core.split(None, 1)[0]
     return core
 
@@ -243,7 +249,9 @@ def parse_index_text(text):
     lost_rows = 0
     opened_fence = ""
     in_comment = False
-    after_list_item = False
+    # Отступ содержимого открытого пункта списка. Ноль - списка нет, и блок
+    # кода начинается с четырёх пробелов от левого края.
+    item_indent = 0
     for lineno, line in enumerate(text.splitlines(), 1):
         if opened_fence:
             mark, tail = fence_delimiter(line)
@@ -273,7 +281,7 @@ def parse_index_text(text):
             # `<!--` - обычный текст, и строка "```markdown <!-- пример"
             # иначе включала бы разом оба состояния.
             opened_fence = mark
-            after_list_item = False
+            item_indent = 0
             continue
         if "<!--" in line:
             line = line[:line.index("<!--")]
@@ -284,12 +292,19 @@ def parse_index_text(text):
         if not body.strip():
             continue  # пустая строка не разрывает список
         indent = len(expanded) - len(body)
-        # Отступ в четыре пробела - это блок кода ТОЛЬКО после обычного текста.
-        # Под пунктом списка те же четыре пробела означают вложенный пункт, и
-        # гитхаб рисует его списком; выкидывать такие строки значило бы объявить
-        # сиротами всё, что человек сгруппировал по темам.
-        if indent >= 4 and not after_list_item:
-            after_list_item = False
+        # Отступ в четыре пробела - это блок кода, но ОТСЧИТЫВАЕТСЯ он от
+        # содержимого открытого пункта, а не от левого края. Под пунктом
+        # списка четыре пробела означают вложенный пункт, и гитхаб рисует его
+        # списком; выкидывать такие строки значило бы объявить сиротами всё,
+        # что человек сгруппировал по темам.
+        #
+        # Держим отступ содержимого, а не флаг «мы в списке». Флаг сбрасывался
+        # любой строкой без буллета, включая ПЕРЕНОС самого пункта, и тогда
+        # вложенный пункт под переносом терялся. Обратная правка - «строка с
+        # отступом продолжает список» - унесла в списки настоящие блоки кода:
+        # индекс, документирующий собственный формат (а README именно это и
+        # советует), давал блокирующую ложную ошибку.
+        if indent >= item_indent + 4:
             continue
         # Определение метки - принадлежность формы, которой у нас нет.
         # Молча пропустить его нельзя: тот, кто написал индекс через метки,
@@ -297,19 +312,18 @@ def parse_index_text(text):
         definition = DEFINITION.match(body)
         if definition:
             rows.append((definition.group(1).strip(), "", lineno, "wrong-form"))
-            after_list_item = False
+            item_indent = 0
             continue
 
-        # Строка индекса - одна строка, но пункт списка может переноситься.
-        # Признак «мы внутри списка» сбрасывался ЛЮБОЙ строкой без буллета, в
-        # том числе продолжением самого пункта, - и следующий за ним вложенный
-        # пункт уходил в «блок кода». Файл объявлялся сиротой, а совет велел
-        # дописать строку, которая в индексе уже есть.
-        #
-        # Отступ и решает: строка с отступом продолжает то, что начато выше,
-        # а список кончается там, где начинается текст от левого края.
-        after_list_item = bool(BULLET.match(body)) or (indent > 0
-                                                       and after_list_item)
+        # Буллет открывает пункт и задаёт отступ его содержимого: у «- » это
+        # два символа, у «1. » было бы три. Строка с отступом продолжает уже
+        # открытый пункт и ничего не меняет. Текст от левого края список
+        # закрывает.
+        bullet = BULLET.match(body)
+        if bullet:
+            item_indent = indent + len(bullet.group(0))
+        elif indent == 0:
+            item_indent = 0
         match = ROW.match(body)
         if match:
             rows.append((match.group(1).strip(), match.group(2).strip(), lineno, "inline"))
@@ -634,7 +648,7 @@ def wiki_targets(line):
     """
     found = []
     for inner in WIKI_LINK.findall(line):
-        target = inner.split("#", 1)[0].split("|", 1)[0].strip()
+        target = inner.split("#", 1)[0].split("|", 1)[0]
         if len(target) >= 2 and not any(char.isspace() for char in target):
             found.append(target)
     return found
@@ -680,7 +694,7 @@ def loose(name):
     return name.replace("-", "_").casefold()
 
 
-def known_memory_names(exact, cache):
+def known_memory_names(exact):
     """Имена, под которыми на память можно сослаться из [[...]].
 
     Возвращает (точные имена, приблизительные -> файлы).
@@ -812,7 +826,7 @@ def name_field_mismatches(exact, index_name, cache, allow_globs=()):
     return found
 
 
-def dangling_wiki_links(exact, cache):
+def dangling_wiki_links(exact, cache, allow_globs=()):
     """Ссылки [[...]], которым не соответствует ни один файл памяти.
 
     Зачем вообще. L1 стережёт ссылки ИЗ индекса - их по портфелю около 390.
@@ -834,10 +848,17 @@ def dangling_wiki_links(exact, cache):
     написанию, имелся в виду, либо None. Без неё сообщение остаётся
     диагнозом: «не ведёт никуда» верно, но чинить по нему нечего.
     """
-    names, similar = known_memory_names(exact, cache)
+    names, similar = known_memory_names(exact)
     found = []
     for rel in sorted(exact):
         if not rel.lower().endswith(".md"):
+            continue
+        # Тот же ключ, что у L2, L5 и L6: путь под шаблоном не аудируется.
+        # Иначе неотслеживаемый черновик, который хук исключает этим ключом,
+        # сыпал бы предупреждениями на каждом коммите - ровно тем шумом, от
+        # которого исключение и написано. Цели ссылок при этом остаются
+        # разрешимыми: ссылка В исключённый файл ложной не станет.
+        if is_excluded(rel, allow_globs):
             continue
         opened_fence = ""
         for lineno, line in enumerate(
@@ -943,13 +964,14 @@ def map_mentions(others, wanted, cache):
     """
     found = {}
     for path, rel in others:
-        text = cache.get(rel)
-        if text is None:
-            try:
-                text = read_text(path)
-            except OSError:
-                text = ""
-            cache[rel] = text
+        # Через общий кэш, а не своим чтением. Собственная копия шести строк
+        # глотала OSError молча и не отмечала файл как непрочитанный - а
+        # вызывается эта функция ТОЛЬКО когда сироты есть, то есть первой, и
+        # клала в кэш пустую строку. Дальше L4 и L5 получали из кэша пустоту,
+        # молчали, и прогон отвечал «Нарушений: 1» про память, часть которой
+        # не открывал. Заметка про нечитаемый файл работала ровно в том
+        # случае, когда сирот нет, - то есть когда она не нужна.
+        text = cached_text(path, rel, cache)
         for token in set(filename_tokens(text)):
             candidate = token.replace("\\", "/")
             # Сравниваем токен целиком и НЕ отрезаем ведущий путь: «vendor/
@@ -983,6 +1005,17 @@ def read_all(paths):
     return texts
 
 
+@lru_cache(maxsize=None)
+def _mention_pattern(name):
+    """Скомпилированный поиск имени в тексте индекса.
+
+    Кэш нужен потому, что зовут это по КАЖДОЙ сироте: сорок сирот - восемьдесят
+    компиляций одних и тех же шаблонов за прогон, а прогон идёт на каждом
+    коммите.
+    """
+    return re.compile(r"(?<![\w\-/])" + re.escape(name) + r"(?![\w\-])(?!\.\w)")
+
+
 def mentioned_in_raw_text(index_texts, *names):
     """Имя файла встречается в тексте индекса, но ссылкой не разобралось.
 
@@ -994,8 +1027,11 @@ def mentioned_in_raw_text(index_texts, *names):
     Границы слева обязательны: без них «user.md» находится внутри
     «superuser.md», и подсказка утверждала бы небылицу.
     """
-    patterns = [re.compile(r"(?<![\w.\-/])" + re.escape(name) + r"(?![\w\-])(?!\.\w)")
-                for name in names if name]
+    # Граница слева та же, что у filename_tokens: точка не часть имени
+    # памяти (L6), поэтому «prefix.user.md» - это упоминание «user.md», а
+    # не другое слово. Пока правило было применено к одному механизму из
+    # двух, два ответа на один вопрос расходились.
+    patterns = [_mention_pattern(name) for name in names if name]
     return any(pattern.search(text)
                for text in index_texts.values() for pattern in patterns)
 
@@ -1521,7 +1557,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
     # `exit 0` в `exit 1`. Ветка без догадки говорила ещё и неправду - «ни в
     # одной шапке нет строки `name: X`», - утверждение, которого проверка
     # сделать не может и которое опровергалось строкой L5 в том же выводе.
-    dangling = dangling_wiki_links(exact, cache)
+    dangling = dangling_wiki_links(exact, cache, allow_globs)
     for rel, lineno, target, guess in dangling:
         if guess:
             warnings.append(
@@ -1543,7 +1579,8 @@ def check(root, index_paths, allow_globs, index_name, file_map):
     for rel in unreadable_files:
         notices.append(
             "%s: файл не читается - ни связи [[...]], ни поле `name` в нём не "
-            "проверены. Закройте редактор или снимите блокировку и повторите"
+            "проверены. Проверьте, что файл на месте и доступен: закройте "
+            "редактор, снимите блокировку или почините ссылку"
             % rel)
 
     return (errors, notices, warnings, row_count,
@@ -1563,7 +1600,8 @@ def build_parser():
                              "Корневой - файл с этим именем в самой папке памяти; "
                              "под-индекс - файл с тем же именем в подпапке")
     parser.add_argument("--allow-orphan", action="append", default=[], metavar="GLOB",
-                        help="файл(ы), которым позволено не быть в индексе; можно повторять")
+                        help="путь(и), которые проверка не аудирует: ни L2, ни L4, ни L5, ни "
+             "L6; можно повторять")
     parser.add_argument("--quiet", action="store_true",
                         help="молчать, когда нарушений нет")
     return parser
