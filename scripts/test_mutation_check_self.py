@@ -58,10 +58,11 @@ class MutationCheckIsAlive(unittest.TestCase):
         """Пустой список мутаций отрапортовал бы «все пойманы» ни о чём.
 
         Порог держим близко к фактическому числу, а не «лишь бы не ноль»:
-        при 76 мутациях потолок в 20 остался бы зелёным после удаления двух
-        третей списка. В CI такой же сторож откалиброван так же плотно.
+        потолок в 20 остался бы зелёным после удаления двух третей списка.
+        Тот же приём, что у гарда «тестов собралось не меньше 150» в CI, -
+        и держать его в синхроне приходится руками, других способов нет.
         """
-        self.assertGreater(len(mutation_check.MUTATIONS), 70,
+        self.assertGreater(len(mutation_check.MUTATIONS), 85,
                            "набор мутаций подозрительно мал")
 
     def test_anchors_do_not_lean_on_comment_text(self):
@@ -104,12 +105,13 @@ class MutationCheckIsAlive(unittest.TestCase):
             returncode = 0
             stdout = b"Ran 215 tests in 44.0s\n\nOK\n"
 
-        def fake_run(command, **kwargs):
+        def fake_run(command, apart, **kwargs):
             seen["command"] = list(command)
             seen["env"] = kwargs.get("env") or {}
+            seen["apart"] = apart
             return FakeResult()
 
-        with unittest.mock.patch.object(mutation_check.subprocess, "run", fake_run):
+        with unittest.mock.patch.object(mutation_check, "run_apart", fake_run):
             verdict = mutation_check.suite_fails()
 
         # Возврат проверяем, а не только команду. Прежде тест звал функцию и
@@ -138,7 +140,7 @@ class MutationCheckIsAlive(unittest.TestCase):
             stdout = (u"FAIL: test_chto_to\nRan 215 tests in 44.0s\n\n"
                       u"FAILED (failures=1)\n").encode("utf-8")
 
-        with unittest.mock.patch.object(mutation_check.subprocess, "run",
+        with unittest.mock.patch.object(mutation_check, "run_apart",
                                         lambda *a, **k: FakeResult()):
             self.assertTrue(mutation_check.suite_fails())
 
@@ -160,11 +162,80 @@ class MutationCheckIsAlive(unittest.TestCase):
                       u"Ran 1 test in 0.000s\n\nFAILED (errors=1)\n"
                       ).encode("utf-8")
 
-        with unittest.mock.patch.object(mutation_check.subprocess, "run",
+        with unittest.mock.patch.object(mutation_check, "run_apart",
                                         lambda *a, **k: FakeResult()):
             with self.assertRaises(SystemExit) as caught:
                 mutation_check.suite_fails()
         self.assertIn("не запустился", str(caught.exception))
+
+    def test_zero_collected_tests_is_not_called_caught_either(self):
+        """Каждое условие гарда проверяется своим входом.
+
+        В фикстуре соседнего теста присутствуют ОБЕ приметы разом - и
+        `_FailedTest`, и `Ran 1 test`. Поэтому выброси из гарда проверку
+        числа тестов, и он останется зелёным: сработает третье условие.
+        Здесь примета одна - собрано ноль.
+        """
+        class FakeResult(object):
+            returncode = 1
+            stdout = b"Ran 0 tests in 0.000s\n\nFAILED (errors=1)\n"
+
+        with unittest.mock.patch.object(mutation_check, "run_apart",
+                                        lambda *a, **k: FakeResult()):
+            with self.assertRaises(SystemExit):
+                mutation_check.suite_fails()
+
+    def test_a_silent_run_is_not_called_caught_either(self):
+        """Третье условие: вывода нет вовсе - значит и судить не по чему."""
+        class FakeResult(object):
+            returncode = 1
+            stdout = b""
+
+        with unittest.mock.patch.object(mutation_check, "run_apart",
+                                        lambda *a, **k: FakeResult()):
+            with self.assertRaises(SystemExit):
+                mutation_check.suite_fails()
+
+    def test_the_word_failedtest_in_a_test_name_does_not_kill_the_tool(self):
+        """Примета - полное имя класса загрузчика, а не подстрока.
+
+        Пока искали `"_FailedTest" in output`, тест с таким словом в имени
+        или в сообщении убил бы инструмент на первой же мутации: SystemExit
+        вместо честного «поймана».
+        """
+        class FakeResult(object):
+            returncode = 1
+            stdout = (u"FAIL: test_FailedTest_naming_is_allowed\n"
+                      u"Ran 215 tests in 44.0s\n\nFAILED (failures=1)\n"
+                      ).encode("utf-8")
+
+        with unittest.mock.patch.object(mutation_check, "run_apart",
+                                        lambda *a, **k: FakeResult()):
+            self.assertTrue(mutation_check.suite_fails())
+
+    def test_a_hook_mutant_that_is_not_valid_sh_is_a_hard_error(self):
+        """Правило про негодный мутант распространяется и на хук.
+
+        Первая редакция проверяла только `.py`, а `--anchors-only` при этом
+        обещал, что мутант компилируется. Негодный мутант хука импорт не
+        роняет: тесты честно краснеют на его синтаксической ошибке, и
+        инструмент печатает «поймана» про ветку, которой не касался. Тот же
+        класс лжи, только в другом файле.
+        """
+        if not mutation_check.find_shell():
+            self.skipTest("sh не найден - проверить нечем")
+        broken = [("выдуманная мутация", mutation_check.HOOK,
+                   'CHECKER="scripts/check_memory_index.py"',
+                   "if then fi )(")]
+        previous = os.getcwd()
+        os.chdir(REPO_DIR)
+        try:
+            with unittest.mock.patch.object(mutation_check, "MUTATIONS", broken):
+                stale = mutation_check.missing_anchors()
+        finally:
+            os.chdir(previous)
+        self.assertEqual(len(stale), 1, stale)
+        self.assertIn("не разбирается как sh", stale[0][1])
 
     def test_a_mutant_that_does_not_compile_is_a_hard_error(self):
         """Правило: негодный мутант - ошибка, как и протухший якорь.
@@ -214,7 +285,12 @@ class InterruptedRunCleansUpAfterItself(unittest.TestCase):
         # песочница должна выдать себя за один из них.
         with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
                 unittest.mock.patch.object(mutation_check, "LINTER", target):
-            mutation_check.save_backup(target, "ОРИГИНАЛ\n")
+            # Отпечаток передаём: без него срабатывает ветка «поля нет,
+            # восстанавливаем как раньше», и сравнение отпечатков не
+            # проверялось НИ ОДНИМ тестом - только с отрицательной стороны.
+            # Замени условие на «всегда отказывать» - набор остался бы
+            # зелёным, а инструмент перестал бы убирать за собой навсегда.
+            mutation_check.save_backup(target, "ОРИГИНАЛ\n", "\n", "МУТАЦИЯ\n")
             with io.open(target, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write("МУТАЦИЯ\n")           # здесь прогон оборвали
             # Сообщение о восстановлении - для человека за терминалом, в
@@ -258,7 +334,11 @@ class InterruptedRunCleansUpAfterItself(unittest.TestCase):
         """Путь берётся из файла на диске, а файл может быть чей угодно.
 
         Инструмент правит ровно два файла - значит и восстанавливать должен
-        только их.
+        только их. И слепок при этом НЕ удалять: прежде эта ветка стирала
+        единственную копию оригинала и молчала. Сценарий не выдуманный -
+        слепок, записанный на Windows, называет `scripts\\check.py`, а на
+        Linux `os.path.normpath` обратный слэш не трогает, и путь переставал
+        совпадать сам с собой.
         """
         folder, target = self.sandbox()
         stranger = os.path.join(folder, "postoronnii.txt")
@@ -268,12 +348,61 @@ class InterruptedRunCleansUpAfterItself(unittest.TestCase):
         with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
                 unittest.mock.patch.object(mutation_check, "LINTER", target):
             mutation_check.save_backup(stranger, "ПОДМЕНА\n")
-            with redirect_stdout(io.StringIO()):
+            with redirect_stdout(io.StringIO()) as printed:
                 restored = mutation_check.restore_interrupted()
 
         self.assertFalse(restored)
         with io.open(stranger, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "ЧУЖОЕ\n")
+        self.assertTrue(os.path.exists(backup),
+                        "слепок удалён - восстановить оригинал больше нечем")
+        self.assertIn("постороннего файла", printed.getvalue())
+
+    def test_a_windows_style_path_in_the_backup_is_still_ours(self):
+        """Вторая половина: свой файл, записанный с обратным слэшем.
+
+        Прогон оборвали на Windows, следующий запуск - из WSL по тому же
+        дереву. Пока сравнение шло через `os.path.normpath`, путь переставал
+        совпадать сам с собой, срабатывала ветка «посторонний файл», и
+        мутация оставалась в дереве.
+        """
+        folder, target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        windows_style = target.replace("/", "\\")
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
+                unittest.mock.patch.object(mutation_check, "LINTER", target):
+            mutation_check.save_backup(windows_style, "ОРИГИНАЛ\n", "\n",
+                                       "МУТАЦИЯ\n")
+            with io.open(target, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("МУТАЦИЯ\n")
+            with redirect_stdout(io.StringIO()):
+                restored = mutation_check.restore_interrupted()
+
+        self.assertTrue(restored, "свой же путь принят за посторонний")
+        with io.open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "ОРИГИНАЛ\n")
+
+    def test_an_interruption_before_the_mutation_landed_is_quiet(self):
+        """Обрыв ДО применения мутации - не «кто-то уже поправил».
+
+        Отпечаток кладётся в слепок раньше, чем мутация ложится на диск.
+        Поэтому обрыв в этом окне давал ложное обвинение, а обещанный
+        «слепок оригинала» затирался первой же следующей мутацией.
+        """
+        folder, target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
+                unittest.mock.patch.object(mutation_check, "LINTER", target):
+            mutation_check.save_backup(target, "ОРИГИНАЛ\n", "\n", "МУТАЦИЯ\n")
+            # мутацию записать не успели - на диске оригинал
+            with redirect_stdout(io.StringIO()) as printed:
+                restored = mutation_check.restore_interrupted()
+
+        self.assertFalse(restored)
+        self.assertNotIn("кто-то", printed.getvalue())
+        self.assertFalse(os.path.exists(backup), "слепок остался висеть")
+        with io.open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "ОРИГИНАЛ\n")
 
     def test_without_a_backup_nothing_is_touched(self):
         """Вторая половина пары: на чистом дереве восстановление молчит.

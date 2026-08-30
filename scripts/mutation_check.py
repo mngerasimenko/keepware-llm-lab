@@ -43,6 +43,8 @@ import hashlib
 import io
 import os
 import re
+import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -92,9 +94,10 @@ MUTATIONS = [
     # «действует из инлайнового кода») удалены вместе с самой меткой: способ
     # пометить файл теперь один, и держится он шапкой, а не обходом заборов.
     ("метка orphan читается не только из шапки", LINTER,
-     "    head, unclosed_head = frontmatter_lines(text)\n"
+     "    head, unclosed_head = frontmatter_lines(cached_text(path, rel, cache))\n"
      "    return any(FRONTMATTER_ORPHAN.match(line) for line in head)",
-     "    return any(FRONTMATTER_ORPHAN.match(line) for line in text.splitlines())"),
+     "    return any(FRONTMATTER_ORPHAN.match(line)\n"
+     "               for line in cached_text(path, rel, cache).splitlines())"),
     ("граница имени файла справа снята", LINTER,
      r'MD_ANCHOR = re.compile(r"\.md(?![\w\-])(?!\.\w)", re.I)',
      r'MD_ANCHOR = re.compile(r"\.md", re.I)'),
@@ -102,9 +105,9 @@ MUTATIONS = [
      "        while start > floor and is_name_char(text[start - 1]):\n"
      "            start -= 1",
      "        pass"),
-    ("точка снова считается частью имени памяти", LINTER,
-     'NAME_PUNCTUATION = "_-/\\\\"',
-     'NAME_PUNCTUATION = "_.-/\\\\"'),
+    ("точка перестала быть частью имени памяти", LINTER,
+     'NAME_PUNCTUATION = "_.-/\\\\"',
+     'NAME_PUNCTUATION = "_-/\\\\"'),
     ("имя начинается прямо после чужого расширения", LINTER,
      "        floor = match.end()",
      "        floor = 0"),
@@ -128,9 +131,11 @@ MUTATIONS = [
      "        if where not in reachable:\n            continue", "        pass"),
     ("метка orphan на под-индексе отмывает ветку за ним", LINTER,
      "            if is_orphan_ok(exact[rel], rel, cache):", "            if True:"),
-    ("нечитаемый файл сходит за намеренную сироту", LINTER,
-     "    if rel in cache.get(UNREADABLE_KEY, ()):\n        return False",
-     "    if False:\n        return False"),
+    # Мутация «нечитаемый файл сходит за намеренную сироту» удалена вместе со
+    # сторожем, на который целилась: он возвращал ровно то же, что и код без
+    # него (нечитаемый файл приходит пустой строкой, а в пустом тексте метки
+    # нет), то есть был эквивалентным мутантом - вечным «ВЫЖИЛА», под который
+    # сопровождающий раз за разом писал бы тест, ничего не меняющий.
     ("обход скрытого перестал помнить посещённые узлы", LINTER,
      "            if (actual_rel in seen or actual_rel == start\n"
      "                    or actual_rel in reachable or actual_rel in referenced):",
@@ -168,7 +173,7 @@ MUTATIONS = [
     ("адреса в выводе снова не дописываются папкой памяти", LINTER,
      "    errors = [with_memory_folder(line, folder, known) for line in errors]",
      "    errors = list(errors)"),
-    ("приписка лезет в ссылки внутри сообщений", LINTER,
+    ("приписка ставится и там, где ведущий токен не путь", LINTER,
      "    if not match or match.group(2) not in known:\n        return line",
      "    if not match:\n        return line"),
 
@@ -272,9 +277,13 @@ MUTATIONS = [
     ("угловые скобки в адресе снова принимаются", LINTER,
      '    if target.startswith("<"):\n        return "в угловых скобках"',
      '    if False:\n        return "в угловых скобках"'),
+    # Замена на 1 гасила ветку целиком - то есть делала ровно то же, что
+    # соседняя мутация «догадка по голому имени выдаётся за факт», и счёт
+    # однофамильцев не проверялся ничем. Двойка ветку, наоборот, включает
+    # всегда: подсказка станет утверждать «(2)» там, где однофамилец один.
     ("однофамильцы считаются неверно", LINTER,
      "                namesakes = namesake_counts[os.path.basename(rel)]",
-     "                namesakes = 1"),
+     "                namesakes = 2"),
     ("догадка по голому имени выдаётся за факт", LINTER,
      "                if by_name is not None and namesakes > 1:",
      "                if False:"),
@@ -300,10 +309,20 @@ MUTATIONS = [
     ("памятью считается любой файл, шапка не смотрится", LINTER,
      "    return any(MEMORY_FIELD.match(line) for line in head)",
      "    return True"),
+    # Три причины «проверка выполнена не до конца» - три мутации, а не одна на
+    # всех. Общая гасила разом незакрытый забор, нечитаемый каталог и
+    # нечитаемый файл, называясь только про первое: теста на любую из трёх
+    # хватало, чтобы напечатать «поймана» про две другие, которых не сторожит
+    # никто.
     ("незакрытый забор не делает прогон непроверяемым", LINTER,
-     "    return (errors, notices, warnings, row_count,\n"
      "            bool(incomplete or unreadable_dirs or unreadable_files))",
-     "    return errors, notices, warnings, row_count, False"),
+     "            bool(unreadable_dirs or unreadable_files))"),
+    ("нечитаемый каталог не делает прогон непроверяемым", LINTER,
+     "            bool(incomplete or unreadable_dirs or unreadable_files))",
+     "            bool(incomplete or unreadable_files))"),
+    ("нечитаемый файл не делает прогон непроверяемым", LINTER,
+     "            bool(incomplete or unreadable_dirs or unreadable_files))",
+     "            bool(incomplete or unreadable_dirs))"),
     ("нечитаемый файл-факт снова глотается молча", LINTER,
      "            cache.setdefault(UNREADABLE_KEY, set()).add(rel)",
      "            pass"),
@@ -535,6 +554,20 @@ def drop_backup():
         pass
 
 
+def same_file(path):
+    """Это один из двух файлов, которые инструмент правит?
+
+    Сравниваем по абсолютному пути с приведёнными слэшами: слепок,
+    записанный на Windows, называет `scripts\\check_memory_index.py`, и на
+    Linux `os.path.normpath` обратный слэш не трогает - путь переставал
+    совпадать сам с собой.
+    """
+    def shape(name):
+        return os.path.normcase(os.path.abspath(name.replace("\\", "/")))
+
+    return shape(path) in (shape(LINTER), shape(HOOK))
+
+
 def restore_interrupted():
     """Возвращает файл, если прошлый прогон оборвали. True, если пришлось.
 
@@ -554,14 +587,28 @@ def restore_interrupted():
     left = parts[2] if len(parts) > 2 else ""
     # Инструмент правит ровно два файла - значит и восстанавливать должен
     # только их. Путь берётся из файла на диске, а файл может быть чей угодно.
-    if not path or os.path.normpath(path) not in (os.path.normpath(LINTER),
-                                                  os.path.normpath(HOOK)):
-        drop_backup()
+    #
+    # Слэши приводим к одному виду: слепок, записанный на Windows, называет
+    # `scripts\check_memory_index.py`, а на Linux `os.path.normpath` обратный
+    # слэш не трогает, и путь перестаёт совпадать с собственным. Прежде эта
+    # ветка в таком случае УДАЛЯЛА слепок и молчала - то есть уничтожала
+    # единственную копию оригинала и оставляла мутацию в дереве. Ровно та
+    # авария, ради которой слепок и написан.
+    if not path or not same_file(path):
+        print("В %s лежит слепок постороннего файла (%s). Не трогаю ни файл, "
+              "ни слепок - разберитесь руками." % (BACKUP, path or "имя пустое"))
         return False
     try:
         current, _newline = read_source(path)
     except OSError:
         current = None
+    # Совпало с ОРИГИНАЛОМ - значит восстанавливать нечего: прогон оборвали до
+    # того, как мутация легла на диск, либо уже после того, как её убрали.
+    # Без этой ветки такой обрыв печатал ложное «кто-то уже поправил», а
+    # обещанный слепок затирался первой же следующей мутацией.
+    if current is not None and fingerprint(current) == fingerprint(text):
+        drop_backup()
+        return False
     if left and current is not None and fingerprint(current) != left:
         print("В дереве лежит НЕ та мутация, которую я оставил: %s кто-то "
               "уже поправил. Ничего не трогаю, слепок оригинала - в %s."
@@ -582,12 +629,18 @@ def missing_anchors():
     Первая: фрагмент не находится ровно один раз. Протухший якорь превращает
     мутацию в тихо не работающую.
 
-    Вторая: мутант не компилируется. Это выяснилось ревью и стоило дорого:
+    Вторая: мутант не разбирается. Это выяснилось ревью и стоило дорого:
     три мутации вклеивали `pass or errors.append(...)`, а `pass` - оператор,
     не выражение. Тестовый файл импортирует линтер на уровне модуля, поэтому
     загрузка падала, `unittest` отдавал ненулевой код, и инструмент печатал
     «поймана», не запустив НИ ОДНОГО теста. Отчёт «все пойманы» на этих
     ветках означал синтаксическую ошибку, а не работу тестов.
+
+    Хук проверяется так же, `sh -n`. Первая редакция этой проверки смотрела
+    только `.py` - и это была ровно половина работы: негодный мутант хука
+    импорт не роняет, тесты честно краснеют на его синтаксической ошибке, и
+    инструмент печатает «поймана» про ветку, которой не касался. Тот же
+    класс лжи, только в другом файле.
     """
     stale = []
     for name, path, old, new in MUTATIONS:
@@ -601,13 +654,57 @@ def missing_anchors():
         if found != 1:
             stale.append((name, "фрагмент найден %d раз вместо одного" % found))
             continue
+        mutated = text.replace(old, new)
         if path.endswith(".py"):
             try:
-                compile(text.replace(old, new), path, "exec")
+                compile(mutated, path, "exec")
             except SyntaxError as exc:
                 stale.append((name, "мутант не компилируется: %s (строка %s)"
                               % (exc.msg, exc.lineno)))
+            continue
+        complaint = shell_syntax_error(mutated)
+        if complaint:
+            stale.append((name, "мутант не разбирается как sh: %s" % complaint))
     return stale
+
+
+def shell_syntax_error(script):
+    """Жалоба `sh -n` на текст скрипта, либо None.
+
+    Если `sh` не найден - молчим: на такой машине и тесты хука пропускаются,
+    и требовать большего от мутационной проверки не за что. В CI переменная
+    MEMCHECK_REQUIRE_SH делает пропуск невозможным.
+    """
+    shell = find_shell()
+    if not shell:
+        return None
+    handle, temporary = tempfile.mkstemp(suffix=".sh")
+    try:
+        with io.open(handle, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(script)
+        checked = subprocess.run([shell, "-n", temporary],
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT)
+        if checked.returncode == 0:
+            return None
+        return (checked.stdout or b"").decode("utf-8", "replace").strip()
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+
+def find_shell():
+    """Путь к `sh`: в PATH либо в комплекте Git на Windows."""
+    found = shutil.which("sh")
+    if found:
+        return found
+    for guess in (r"C:\Program Files\Git\usr\bin\sh.exe",
+                  r"C:\Program Files (x86)\Git\usr\bin\sh.exe"):
+        if os.path.isfile(guess):
+            return guess
+    return None
 
 
 def suite_fails():
@@ -632,10 +729,18 @@ def suite_fails():
     написан слепок. Потолок щедрый (набор идёт около минуты, а две мутации
     намеренно замедляют его до двух), но конечный.
     """
-    result = subprocess.run(
+    # Своя группа процессов: тесты хука запускают `sh`, а тот - ещё один
+    # python. `subprocess.run(timeout=...)` убивает только прямого потомка, и
+    # внуки переживали таймаут - жгли процессор оставшиеся мутации и
+    # оставляли за собой невычищенные временные деревья.
+    if os.name == "nt":
+        apart = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:
+        apart = {"start_new_session": True}
+    result = run_apart(
         [sys.executable, "-m", "unittest", "discover", "-s", "scripts",
          "-p", "test_check_memory_index.py", "-f"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=SUITE_TIMEOUT,
+        apart,
         # MEMCHECK_REQUIRE_SH здесь по той же причине, что и в CI. Без sh
         # тесты хука пропускаются, и три мутации по .githooks/pre-commit
         # печатались бы как ВЫЖИВШИЕ - то есть «ветку не держит ни один
@@ -651,12 +756,45 @@ def suite_fails():
     # же класс лжи, который инструмент ищет, и в CI он уже закрыт отдельным
     # шагом «тестов собралось не меньше 150». Здесь спрашиваем то же самое:
     # тесты обязаны быть запущены, и загрузчик обязан быть цел.
+    #
+    # Примета загрузчика - полное имя класса, а не подстрока «_FailedTest» во
+    # всём выводе: тест с таким словом в имени или в сообщении убил бы
+    # инструмент на первой же мутации.
     ran = re.search(r"^Ran (\d+) tests?", output, re.M)
-    if not ran or int(ran.group(1)) == 0 or "_FailedTest" in output:
+    broken_loader = re.search(r"unittest\.loader\._FailedTest", output)
+    if not ran or int(ran.group(1)) == 0 or broken_loader:
         raise SystemExit(
             "Набор не запустился под мутацией - это не «поймана», а поломка "
             "прогона. Вот его вывод:\n%s" % output)
     return result.returncode != 0
+
+
+def run_apart(command, apart, **kwargs):
+    """Запуск в своей группе процессов: по таймауту гибнет всё дерево."""
+    process = subprocess.Popen(command, **dict(kwargs, **apart))
+    try:
+        out, _err = process.communicate(timeout=SUITE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        kill_tree(process)
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, out, None)
+
+
+def kill_tree(process):
+    """Убивает процесс вместе с потомками. Ошибки глотаем: это уборка."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        process.kill()
+    except Exception:
+        pass
 
 
 def build_parser():
@@ -710,7 +848,7 @@ def main(argv=None):
 
     if args.anchors_only:
         print("Все %d мутаций применимы: якорь на месте, мутант "
-              "компилируется." % len(MUTATIONS))
+              "разбирается." % len(MUTATIONS))
         return 0
 
     # Без этого прогона всё дальнейшее бессмысленно: если набор красный по
@@ -718,7 +856,21 @@ def main(argv=None):
     # то краснеть он будет и на каждой мутации, и отчёт «все пойманы» окажется
     # рапортом о причине, к мутациям отношения не имеющей.
     print("Проверяю, что набор зелёный без мутаций...")
-    if suite_fails():
+    # Базовый прогон страхуем отдельно: мутаций ещё нет, поэтому и таймаут, и
+    # несобравшийся набор говорят не о них, а о дереве. Без обёртки первый
+    # выдавал трейсбек, второй - сообщение «набор не запустился ПОД МУТАЦИЕЙ»,
+    # которого тут ещё быть не может.
+    try:
+        base_red = suite_fails()
+    except subprocess.TimeoutExpired:
+        print("Набор не ответил за %d с ещё БЕЗ мутаций - дело в дереве, не в "
+              "них." % SUITE_TIMEOUT, file=sys.stderr)
+        return 1
+    except SystemExit as exc:
+        print("Набор не запустился ещё БЕЗ мутаций:", file=sys.stderr)
+        print(exc, file=sys.stderr)
+        return 1
+    if base_red:
         print("Тесты не проходят и БЕЗ мутаций - сначала почините дерево.",
               file=sys.stderr)
         print("Пока набор красный, любая мутация засчитается «пойманной» по "
