@@ -57,5 +57,12 @@ jobs:
       - name: Тесты
         run: python -m unittest discover -s scripts -p 'test_*.py' -v
 
+      # Дешёвая половина проверки починок: реестр откатов обязан
+      # применяться к сегодняшнему коду. Полный прогон в CI не гоняем - он
+      # копирует дерево на каждый откат и на Windows выходит дольше самого
+      # набора; протухший же реестр ловится и так, а он и есть тихий отказ.
+      - name: Откаты починок применимы
+        run: python scripts/revert_check.py --anchors-only
+
       - name: Проверка собственной памяти репозитория
         run: python scripts/check_memory_index.py memory

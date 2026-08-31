@@ -764,7 +764,14 @@ class InterruptedRunCleansUpAfterItself(unittest.TestCase):
         here = os.getcwd()
         os.chdir(REPO_DIR)
         self.addCleanup(os.chdir, here)
-        with unittest.mock.patch.object(mutation_check, "BACKUP", backup):
+        # Мутации и прогон набора выключаем. Без этого откат починки уводит
+        # main() ДАЛЬШЕ - в настоящий прогон на два часа, и тест начинает
+        # «различать» реализации временем ожидания. Проверка починок нашла
+        # это первой же своей находкой.
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
+                unittest.mock.patch.object(mutation_check, "MUTATIONS", []), \
+                unittest.mock.patch.object(mutation_check, "suite_fails",
+                                           lambda: False):
             with redirect_stdout(io.StringIO()), \
                     redirect_stderr(io.StringIO()) as complained:
                 code = mutation_check.main([])
