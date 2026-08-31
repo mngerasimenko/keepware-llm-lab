@@ -200,6 +200,33 @@ class RevertCheckIsAlive(unittest.TestCase):
         self.run_tool(folder, [REAL_REVERT])
         self.assertEqual(snapshot(), before, "инструмент правил своё дерево")
 
+    def test_a_test_that_writes_by_a_relative_path_hits_only_the_copy(self):
+        """Запись ЗАПУСКАЕМОГО теста не достаёт до оригинала.
+
+        Соседний тест проверяет, что сам инструмент ничего не пишет. Но
+        главный риск не в нём: тесты идут отдельным процессом и пишут куда
+        захотят. Один такой есть в нашем же реестре - он меняет текущий
+        каталог и зовёт `main()` соседнего инструмента, а тот правит файлы
+        по ОТНОСИТЕЛЬНЫМ путям. Здесь тест делает ровно это.
+        """
+        folder = self.fake_repo(test_body=(
+            "import os\n"
+            "import unittest\n"
+            "import probe\n\n\n"
+            "class Probe(unittest.TestCase):\n"
+            "    def test_value(self):\n"
+            "        os.chdir(os.path.dirname(os.path.dirname(\n"
+            "            os.path.abspath(__file__))))\n"
+            "        with open(os.path.join('scripts', 'sled.txt'), 'w') as fh:\n"
+            "            fh.write('тест писал сюда')\n"
+            "        self.assertEqual(probe.VALUE, 'починено')\n"))
+
+        self.run_tool(folder, [REAL_REVERT])
+
+        self.assertFalse(
+            os.path.exists(os.path.join(folder, "scripts", "sled.txt")),
+            "запись запускаемого теста дошла до оригинального дерева")
+
     def test_no_copies_are_left_behind(self):
         """Копии убираются. Иначе дюжина деревьев за прогон оседает в TEMP.
 

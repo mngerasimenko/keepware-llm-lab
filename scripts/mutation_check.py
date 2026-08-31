@@ -417,7 +417,7 @@ MUTATIONS = [
      '    "$PYTHON" "$CHECKER" "$MEMORY_DIR" --quiet "$@"\n    RETRY=$?',
      '    "$PYTHON" "$CHECKER" "$MEMORY_DIR" --quiet\n    RETRY=$?'),
     ("удаление всей папки памяти снова проходит молча", HOOK,
-     '    if git diff --cached --name-only -- "$MEMORY_DIR" 2>/dev/null | grep -q .; then',
+     '    if [ "$REMOVAL_STATUS" = 0 ] && [ -n "$REMOVAL" ]; then',
      "    if false; then"),
     # `set +f` стоит теперь не сразу за разбором: между ними сбор черновиков,
     # которому раскрытие шаблонов тоже противопоказано. Мутация снимает

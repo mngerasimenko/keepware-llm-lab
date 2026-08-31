@@ -780,6 +780,45 @@ class InterruptedRunCleansUpAfterItself(unittest.TestCase):
         self.assertTrue(os.path.exists(backup), "слепок затёрт прогоном")
         self.assertIn("запускать нельзя", complained.getvalue())
 
+    def test_a_lookalike_with_a_backslash_in_its_name_is_refused(self):
+        """На POSIX обратный слэш - обычный символ имени, а не разделитель.
+
+        Приведение слэшей, которым опознаётся свой файл, НЕИНЪЕКТИВНО: файл
+        с именем `подпапка\\check.py` после приведения неотличим от
+        `подпапка/check.py`. Ровно такой мусор оставляла прежняя редакция
+        восстановления - она писала по сырой строке из слепка, и на Linux
+        обратные слэши уходили в имя файла. Подтверждение через `samefile`
+        стоит для того, чтобы инструмент не восстановил оригинал линтера
+        ПОВЕРХ такого двойника.
+
+        На Windows ветка недостижима: там обратный слэш - разделитель, оба
+        пути ведут в один файл, и различать нечего.
+        """
+        if os.name == "nt":
+            self.skipTest("на Windows обратный слэш - разделитель пути")
+        folder, target = self.sandbox()
+        # Двойник лежит РЯДОМ с папкой и содержит её имя внутри своего:
+        # «<папка>\check.py» одним именем файла.
+        lookalike = os.path.join(
+            os.path.dirname(folder),
+            os.path.basename(folder) + "\\" + os.path.basename(target))
+        with io.open(lookalike, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("ЧУЖОЕ\n")
+        self.addCleanup(os.remove, lookalike)
+        backup = os.path.join(folder, ".mutation-backup")
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
+                unittest.mock.patch.object(mutation_check, "LINTER", target):
+            mutation_check.save_backup(lookalike, "ОРИГИНАЛ\n", "\n",
+                                       "МУТАЦИЯ\n")
+            with redirect_stdout(io.StringIO()) as printed:
+                restored = mutation_check.restore_interrupted()
+
+        self.assertFalse(restored, "двойник принят за наш файл")
+        self.assertIn("постороннего файла", printed.getvalue())
+        with io.open(lookalike, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "ЧУЖОЕ\n", "чужой файл переписан")
+        self.assertTrue(os.path.exists(backup), "слепок удалён")
+
     def test_a_file_we_cannot_ask_about_is_still_ours(self):
         """Отказ СПРОСИТЬ - не ответ «чужой».
 

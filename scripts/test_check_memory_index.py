@@ -94,6 +94,11 @@ class HookPrerequisite(unittest.TestCase):
         self.skipTest(MISSING_SH_MESSAGE)
 
 
+# Примета подставной утилиты. Спрашиваем ЕЁ, а не код возврата: код
+# совпадает с чужим (busybox отвечает на `--version` единицей), а метка нет.
+STUB_MARK = "MEMCHECK-STUB"
+
+
 def find_sh():
     """sh из PATH, а если его там нет - из комплекта Git.
 
@@ -4139,7 +4144,25 @@ class PreCommitHook(unittest.TestCase):
         os.makedirs(os.path.join(self.repo, "memory"))
         shutil.copy(SCRIPT, os.path.join(self.repo, "scripts"))
         shutil.copy(HOOK, os.path.join(self.repo, ".githooks"))
-        subprocess.run(["git", "init", "-q", self.repo], check=True)
+        # Временный репозиторий не должен видеть НИЧЕГО, кроме своего
+        # локального конфига. Иначе он наследует настройки того, кто запускает
+        # тесты: `diff.renames=false` красит две ветки хука по постороннему
+        # поводу, `core.autocrlf=true` меняет содержимое файлов под тестами
+        # про переводы строк. Хуже красного - зелёное по чужой причине, а это
+        # ровно тот класс, который весь набор и ищет.
+        #
+        # Изолируем ОКРУЖЕНИЕМ, а не ключами `-c`: хук сам зовёт git отдельным
+        # процессом и наших ключей не унаследует. Переменные понимает git от
+        # 2.32; более старый их проигнорирует, и будет как раньше - не хуже.
+        empty = os.path.join(self.repo, ".gitconfig-empty")
+        with io.open(empty, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("")
+        self.env = dict(os.environ,
+                        GIT_CONFIG_GLOBAL=empty,
+                        GIT_CONFIG_SYSTEM=empty,
+                        GIT_CONFIG_NOSYSTEM="1")
+        subprocess.run(["git", "init", "-q", self.repo], check=True,
+                       env=self.env)
         self.write_memory("- [Профиль](user.md) - кто\n", {"user.md": "факт\n"})
 
     def write_memory(self, index, files=None):
@@ -4153,23 +4176,34 @@ class PreCommitHook(unittest.TestCase):
 
     def git(self, *args):
         return subprocess.run(["git"] + list(args), cwd=self.repo,
+                              env=self.env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
     def run_hook(self, env=None):
         return subprocess.run(
             [self.sh, os.path.join(self.repo, ".githooks", "pre-commit")],
-            cwd=self.repo, env=env or os.environ.copy(),
+            cwd=self.repo, env=env or dict(self.env),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
 
     def with_fake_tool(self, name, body):
-        """Кладёт заглушку утилиты и возвращает каталог для PATH."""
+        """Кладёт заглушку утилиты и возвращает каталог для PATH.
+
+        На `--version` заглушка отзывается меткой. По ней её и опознаём:
+        код возврата для этого не годится - у busybox `wc` и `tr` на
+        `--version` он тоже ненулевой, и на такой системе проба сказала бы
+        «подмена дошла», хотя отрабатывает настоящая утилита. Три теста
+        побежали бы против неё и покраснели по причине, к проверяемому
+        свойству отношения не имеющей.
+        """
         fake = os.path.join(self.repo, "fakebin")
         if not os.path.isdir(fake):
             os.makedirs(fake)
         target = os.path.join(fake, name)
         with io.open(target, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(body)
+            fh.write("#!/bin/sh\n"
+                     "case \"$1\" in --version) echo %s; exit 3 ;; esac\n"
+                     % STUB_MARK + body)
         os.chmod(target, 0o755)
         return fake
 
@@ -4191,13 +4225,14 @@ class PreCommitHook(unittest.TestCase):
 
     def substitution_reaches_the_shell(self, extra, tool):
         """Дошла ли подмена до оболочки. Пропускать можно только по ней."""
-        return subprocess.run(
+        answered = subprocess.run(
             [self.sh, "-c",
-             'PATH="$1:$PATH"; export PATH; "$2" --version >/dev/null 2>&1',
+             'PATH="$1:$PATH"; export PATH; "$2" --version 2>&1',
              "_", extra, tool],
-            cwd=self.repo, env=os.environ.copy(),
+            cwd=self.repo, env=dict(self.env),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        ).returncode != 0
+        ).stdout.decode("utf-8", "replace")
+        return STUB_MARK in answered
 
     def long_config_args(self, length):
         """Длинный memorycheck.args - записью в конфиг, а не через argv.
@@ -4401,7 +4436,7 @@ class PreCommitHook(unittest.TestCase):
         # Оборвавшийся на середине потока sed (ошибка записи, битый
         # multibyte) отдаёт ровно такую половину.
         fake = self.with_fake_tool(
-            "sed", "#!/bin/sh\necho --allow-orphan=drugoi.md\nexit 3\n")
+            "sed", "echo --allow-orphan=drugoi.md\nexit 3\n")
         self.draft("chernoviki", "draft.md")
         self.git("add", "memory/MEMORY.md", "memory/user.md")
         # Пропускаем ТОЛЬКО если подмена не дошла до оболочки. Прежняя
@@ -4491,7 +4526,7 @@ class PreCommitHook(unittest.TestCase):
         # «а число ли это», и откат проверки статуса оставался зелёным.
         # Числом сторожа разводятся: результат выглядит годным, и поймать
         # подлог может только статус.
-        fake = self.with_fake_tool("tr", "#!/bin/sh\necho 42\nexit 3\n")
+        fake = self.with_fake_tool("tr", "echo 42\nexit 3\n")
         self.draft("chernoviki", "draft.md")
         self.git("add", "memory/MEMORY.md", "memory/user.md")
         if not self.substitution_reaches_the_shell(fake, "tr"):
@@ -4509,7 +4544,7 @@ class PreCommitHook(unittest.TestCase):
         там, где должен был сработать, и argv переполнялся кодом 126 без
         единой строки объяснения.
         """
-        fake = self.with_fake_tool("wc", "#!/bin/sh\nexit 3\n")
+        fake = self.with_fake_tool("wc", "exit 3\n")
         self.draft("chernoviki", "draft.md")
         self.git("add", "memory/MEMORY.md", "memory/user.md")
         if not self.substitution_reaches_the_shell(fake, "wc"):

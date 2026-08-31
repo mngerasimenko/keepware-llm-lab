@@ -110,6 +110,13 @@ REVERTS = [
      "test_mutation_check_self.InterruptedRunCleansUpAfterItself."
      "test_a_file_that_vanished_is_restored_not_blamed"),
 
+    ("двойник с обратным слэшем снова принимается за свой", TOOL,
+     "            if os.path.exists(path) and not os.path.samefile(path, ours):\n"
+     "                return None\n",
+     "",
+     "test_mutation_check_self.InterruptedRunCleansUpAfterItself."
+     "test_a_lookalike_with_a_backslash_in_its_name_is_refused"),
+
     ("отказ спросить снова читается как «чужой файл»", TOOL,
      "            return ours\n        return ours", "            return None\n        return ours",
      "test_mutation_check_self.InterruptedRunCleansUpAfterItself."
