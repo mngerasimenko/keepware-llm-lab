@@ -21,23 +21,40 @@
     python scripts/revert_check.py
 
 Коды возврата: 0 - каждая починка различается своим тестом; 1 - какая-то не
-различается либо её якорь больше не находится в коде.
+различается, её якорь больше не находится в коде, тест не ответил или
+прогон сломался.
 
 **Рабочее дерево инструмент не трогает.** Откат применяется к КОПИИ, и это
 не осторожность ради осторожности: инструмент нужен как раз тогда, когда в
 дереве лежит незакоммиченная работа, и портить её ради проверки было бы
 ровно тем, от чего этот репозиторий защищается.
+
+Отсюда же требование базового прогона. Тест сначала гоняется на копии БЕЗ
+отката и обязан быть зелёным: красный по своей причине тест красен и под
+откатом, и «различает» напечаталось бы на пустом месте - ровно та ложь,
+которую инструмент ищет. Правишь хук, ломаешь по дороге его тест - и без
+базового прогона пять откатов отрапортовали бы успех.
 """
 
 import argparse
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
+
+# Убийство дерева процессов берём у соседа, а не переписываем: тесты хука
+# запускают sh, тот - ещё один python, и внук переживает таймаут прямого
+# потомка, продолжая писать в копию, которую мы в это время удаляем.
+from mutation_check import run_apart  # noqa: E402
+
+REPO = os.path.dirname(SCRIPTS_DIR)
 LINTER = os.path.join("scripts", "check_memory_index.py")
 HOOK = os.path.join(".githooks", "pre-commit")
 TOOL = os.path.join("scripts", "mutation_check.py")
@@ -52,6 +69,14 @@ TEST_TIMEOUT = 300
 # Правило то же, что у мутаций: починили дефект - добавьте сюда откат.
 # Фрагмент должен находиться РОВНО ОДИН раз, иначе откат молча не
 # применится, а «различает» напечатается по чужой причине.
+#
+# Откат обязан МЕНЯТЬ ПОВЕДЕНИЕ. Ревью предложило для двух записей ниже
+# «точную инверсию» - вернуть в условие `left and` и умолчание
+# `NEWLINE_BY_NAME.get(kind, "\n")` вместо гашения раннего гарда. Прогон
+# показал, что обе такие правки НИЧЕГО НЕ МЕНЯЮТ: гард отсекает раньше, и
+# код за ним недостижим, поэтому тест остаётся зелёным. Это не находка про
+# тест, а доказательство, что тот код мёртв, - и заодно причина, почему
+# откат здесь гасит именно гард: гард И ЕСТЬ починка.
 REVERTS = [
     ("восстановление адресует файл строкой из слепка", TOOL,
      "    path = ours\n", "    \n",
@@ -74,8 +99,7 @@ REVERTS = [
      "test_an_unknown_line_ending_in_the_backup_is_refused"),
 
     ("оставшийся слепок не останавливает прогон", TOOL,
-     '    if os.path.isfile(BACKUP):\n        print("Слепок %s остался',
-     '    if False:\n        print("Слепок %s остался',
+     "    if os.path.isfile(BACKUP):", "    if False:",
      "test_mutation_check_self.InterruptedRunCleansUpAfterItself."
      "test_a_backup_left_behind_stops_the_run"),
 
@@ -86,20 +110,46 @@ REVERTS = [
      "test_mutation_check_self.InterruptedRunCleansUpAfterItself."
      "test_a_file_that_vanished_is_restored_not_blamed"),
 
+    ("отказ спросить снова читается как «чужой файл»", TOOL,
+     "            return ours\n        return ours", "            return None\n        return ours",
+     "test_mutation_check_self.InterruptedRunCleansUpAfterItself."
+     "test_a_file_we_cannot_ask_about_is_still_ours"),
+
+    ("неудача удалить слепок снова молчит", TOOL,
+     "        return True\n    except FileNotFoundError:\n"
+     "        return True\n    except OSError:\n        return False",
+     "        return True\n    except FileNotFoundError:\n"
+     "        return True\n    except OSError:\n        return True",
+     "test_mutation_check_self.InterruptedRunCleansUpAfterItself."
+     "test_a_backup_that_cannot_be_deleted_is_named_correctly"),
+
+    ("потолок снова ниже настоящей границы", HOOK,
+     'if [ "$DRAFT_BYTES" -gt 32000 ]; then',
+     'if [ "$DRAFT_BYTES" -gt 30000 ]; then',
+     "test_check_memory_index.PreCommitHook."
+     "test_user_keys_do_not_eat_the_draft_budget_twice"),
+
+    ("замер снова прячется за наличием черновиков", HOOK,
+     "DRAFT_BYTES=0\nset +e\nDRAFT_BYTES=$(printf",
+     'DRAFT_BYTES=0\nif [ -z "$DRAFT_ARGS" ]; then DRAFT_ARGS=""; fi\n'
+     'set +e\nif [ -n "$DRAFT_ARGS" ]; then DRAFT_BYTES=$(printf',
+     "test_check_memory_index.PreCommitHook."
+     "test_long_user_keys_alone_are_named"),
+
     ("замер длины снова без set +e", HOOK,
-     "    set +e\n    DRAFT_BYTES=", "    DRAFT_BYTES=",
+     "set +e\nDRAFT_BYTES=$(printf", "DRAFT_BYTES=$(printf",
      "test_check_memory_index.PreCommitHook."
      "test_a_failing_tr_does_not_abort_the_hook"),
 
     ("статус замера не проверяется", HOOK,
-     '    [ "$MEASURE_STATUS" = 0 ] || MEASURE_OK=0\n', "",
+     '[ "$MEASURE_STATUS" = 0 ] || MEASURE_OK=0\n', "",
      "test_check_memory_index.PreCommitHook."
      "test_a_failing_tr_does_not_abort_the_hook"),
 
     ("результат замера не проверяется на число", HOOK,
-     '    case "$DRAFT_BYTES" in\n'
-     "        ''|*[!0-9]*) MEASURE_OK=0 ;;\n"
-     "    esac\n",
+     'case "$DRAFT_BYTES" in\n'
+     "    ''|*[!0-9]*) MEASURE_OK=0 ;;\n"
+     "esac\n",
      "",
      "test_check_memory_index.PreCommitHook."
      "test_a_failing_wc_does_not_switch_the_budget_off_silently"),
@@ -111,80 +161,152 @@ REVERTS = [
      "test_a_failing_sed_does_not_abort_the_hook"),
 
     ("счётчик не пересчитывается после отсева кавычек", HOOK,
-     '    DRAFT_COUNT=0\n    if [ -n "$DRAFTS" ]; then\n'
+     "    DRAFT_COUNT=0\n    if [ -n \"$DRAFTS\" ]; then\n"
      "        DRAFT_COUNT=$(printf '%s\\n' \"$DRAFTS\" | grep -c . || true)\n"
-     "    fi\nfi",
+     "        case \"$DRAFT_COUNT\" in\n"
+     "            ''|*[!0-9]*) DRAFT_COUNT=0; DRAFTS=\"\" ;;\n"
+     "        esac\n    fi\nfi",
      "fi",
      "test_check_memory_index.PreCommitHook."
      "test_drafts_named_in_quotes_do_not_fake_a_failure"),
-
-    ("ограничитель обратного прохода снят", LINTER,
-     "        while start > floor and is_name_char(text[start - 1]):",
-     "        while start > 0 and is_name_char(text[start - 1]):",
-     "test_check_memory_index.FilenameTokenScan."
-     "test_many_anchors_inside_one_run_do_not_blow_up"),
 ]
+# Ограничитель обратного прохода (`floor`) сюда намеренно НЕ занесён: его
+# держит мутация в `mutation_check.py`, а единственный тест, который на его
+# откате краснеет, меряет ВРЕМЯ. Различать реализации временем ожидания
+# инструмент объявляет негодным - и делать для себя исключение не станет.
+# Тот же откат стоил бы полному прогону лишние сорок пять секунд.
 
+# Состояния прогона одного теста.
+RED = "красный"
+GREEN = "зелёный"
+SKIPPED = "пропущен"
+HUNG = "ЗАВИС"
+BROKEN = "ПРОГОН СЛОМАН"
+# Вердикты по случаю.
 DISTINGUISHES = "различает"
 BLIND = "НЕ РАЗЛИЧАЕТ"
-SKIPPED = "пропущен"
 STALE = "ЯКОРЬ"
-HUNG = "ЗАВИС"
+BASE_RED = "БАЗА КРАСНАЯ"
+
+RAN = re.compile(r"^Ran (\d+) tests?", re.M)
+# Примета сломанного загрузчика - полное имя класса, а не подстрока во всём
+# выводе: тест, у которого это слово в имени или в сообщении, иначе выдавал
+# бы поломку прогона на пустом месте. Тот же приём, что у соседа.
+BROKEN_LOADER = re.compile(r"unittest\.loader\._FailedTest")
+OUTCOME = re.compile(r"^(OK|FAILED)\b(.*)$", re.M)
+SKIPPED_COUNT = re.compile(r"skipped=(\d+)")
 
 
 def copy_tree(destination):
-    """Копия дерева без .git и мусора сборки."""
-    shutil.copytree(REPO, destination, ignore=shutil.ignore_patterns(
-        ".git", "__pycache__", "*.pyc", ".mutation-backup"))
+    """Копия дерева без .git и мусора сборки.
+
+    `symlinks=True` обязателен: без него висячая ссылка в дереве роняет
+    копирование трейсбеком, то есть посторонний файл выключает проверку -
+    ровно тот класс отказа, который весь этот репозиторий и ищет.
+    """
+    shutil.copytree(REPO, destination, symlinks=True,
+                    ignore=shutil.ignore_patterns(
+                        ".git", "__pycache__", "*.pyc", ".mutation-backup",
+                        ".venv", ".idea", ".vscode"))
 
 
 def apply_revert(folder, relative, old, new):
     """Возвращает текст жалобы, если откат не применился ровно один раз."""
     target = os.path.join(folder, relative)
-    with io.open(target, encoding="utf-8") as stream:
+    with io.open(target, encoding="utf-8", newline="") as stream:
         text = stream.read()
     found = text.count(old)
     if found != 1:
         return "фрагмент найден %d раз вместо одного" % found
-    with io.open(target, "w", encoding="utf-8", newline="\n") as stream:
+    # `newline=""` с обеих сторон: переводы строк остаются такими же, какими
+    # были. Иначе копия отличается от дерева ещё и ими, и тест проверял бы
+    # не тот файл, что лежит в репозитории.
+    with io.open(target, "w", encoding="utf-8", newline="") as stream:
         stream.write(text.replace(old, new, 1))
     return None
 
 
-def run_test(folder, test):
-    """Прогон одного именованного теста на копии. Вердикт и хвост вывода."""
+def run_one(folder, test):
+    """Один именованный тест на копии. Состояние и хвост вывода."""
+    environment = dict(os.environ,
+                       # Без этого тесты хука молча пропускаются там, где не
+                       # нашёлся sh, и «не различает» печаталось бы на
+                       # исправной починке. Сосед выставляет то же самое.
+                       MEMCHECK_REQUIRE_SH="1",
+                       # Потомок печатает по-русски; на Windows без этого он
+                       # пишет в трубу в cp1251, и диагностика приходит
+                       # мусором.
+                       PYTHONIOENCODING="utf-8")
+    # Своя группа процессов: тест хука запускает sh, тот - ещё один python,
+    # и внук переживает таймаут прямого потомка. Он продолжал бы писать в
+    # копию ровно тогда, когда мы её удаляем.
+    if os.name == "nt":
+        apart = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:
+        apart = {"start_new_session": True}
     try:
-        done = subprocess.run(
-            [sys.executable, "-m", "unittest", test],
-            cwd=os.path.join(folder, "scripts"),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=TEST_TIMEOUT)
+        done = run_apart(
+            [sys.executable, "-m", "unittest", test], apart,
+            timeout=TEST_TIMEOUT,
+            cwd=os.path.join(folder, "scripts"), env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     except subprocess.TimeoutExpired:
-        # Отдельный вердикт, а не «не различает». Формально зависание
-        # реализации ОТЛИЧАЕТ - но отличать их временем ожидания негодно:
-        # такой тест не скажет, что сломалось, и на медленной машине
-        # покраснеет сам по себе. Первая же находка инструмента была
-        # именно такой: тест звал main(), и на откате тот уходил в
-        # настоящий прогон мутаций.
+        # Отдельное состояние, а не «зелёный» и не «красный». Формально
+        # зависание реализации ОТЛИЧАЕТ - но отличать их временем ожидания
+        # негодно: такой тест не скажет, что сломалось, и покраснеет сам по
+        # себе на медленной машине. Первая находка инструмента была именно
+        # такой: тест звал main(), и на откате тот уходил в настоящий прогон.
         return HUNG, "тест не ответил за %d с" % TEST_TIMEOUT
-    printed = done.stdout.decode("utf-8", "replace")
+    printed = (done.stdout or b"").decode("utf-8", "replace")
     tail = (printed.strip().splitlines() or [""])[-1]
-    # Пропущенный тест возвращает НОЛЬ, как и прошедший. Без этой ветки
-    # `skipTest` на чужой системе печатался бы как «не различает», а на своей
-    # - как «различает», и инструмент врал бы в обе стороны.
-    if "skipped=" in printed or " skipped " in printed:
+    # Ненулевой код сам по себе не значит «тест упал»: его даёт и опечатка в
+    # имени теста, и ошибка импорта, и сломанная копия. Считать это
+    # «различает» - тот же класс лжи, который инструмент ищет.
+    ran = RAN.search(printed)
+    if not ran or int(ran.group(1)) == 0 or BROKEN_LOADER.search(printed):
+        return BROKEN, tail or "тестов не запущено"
+    outcome = OUTCOME.search(printed)
+    if not outcome:
+        return BROKEN, tail or "итоговой строки нет"
+    # Порядок важен: пропуск смотрим ТОЛЬКО у зелёного исхода. Иначе
+    # «FAILED (failures=1, skipped=1)» читалось бы как пропуск, и настоящая
+    # находка глохла бы; а слово skipped в чужом сообщении об ошибке
+    # выключало бы проверку целиком.
+    if outcome.group(1) == "FAILED":
+        return RED, tail
+    # Пропуск засчитываем, только если пропущено ВСЁ. Класс, где один тест
+    # пропущен, а остальные отработали, - это зелёный прогон: иначе один
+    # `skipTest` по соседству выключал бы проверку всей починки, и инструмент
+    # печатал бы «различение не проверено» там, где оно проверено.
+    skipped = SKIPPED_COUNT.search(outcome.group(2))
+    if skipped and int(skipped.group(1)) >= int(ran.group(1)):
         return SKIPPED, tail
-    if done.returncode == 0:
-        return BLIND, tail
-    return DISTINGUISHES, tail
+    return GREEN, tail
 
 
-def check_one(case, folder):
+def check_one(case, folder, base_cache):
+    """Вердикт по одному откату. Копия уже сделана и принадлежит нам."""
     _name, relative, old, new, test = case
+    # Сначала база: тест обязан быть зелёным ДО отката. Красный по своей
+    # причине тест красен и под откатом, и «различает» напечаталось бы, не
+    # проверив ничего.
+    if test not in base_cache:
+        base_cache[test] = run_one(folder, test)
+    base, base_tail = base_cache[test]
+    if base == SKIPPED:
+        return SKIPPED, base_tail
+    if base != GREEN:
+        return BASE_RED, "до отката: %s (%s)" % (base, base_tail)
+
     stale = apply_revert(folder, relative, old, new)
     if stale:
         return STALE, stale
-    return run_test(folder, test)
+    state, tail = run_one(folder, test)
+    if state == RED:
+        return DISTINGUISHES, tail
+    if state == GREEN:
+        return BLIND, tail
+    return state, tail
 
 
 def build_parser():
@@ -193,7 +315,8 @@ def build_parser():
                     "откатить. Рабочее дерево не трогает - откат "
                     "применяется к копии.",
         epilog="Коды возврата: 0 - каждая починка различается своим тестом, "
-               "1 - какая-то не различается или её якорь протух.")
+               "1 - какая-то не различается, её якорь протух, тест не "
+               "ответил или прогон сломался.")
     parser.add_argument(
         "--anchors-only", action="store_true",
         help="только проверить, что все откаты применимы (фрагмент "
@@ -214,61 +337,73 @@ def main(argv=None):
         print("Не нахожу %s рядом с собой - дерево неполное" % LINTER,
               file=sys.stderr)
         return 1
+    # Пустой реестр - не «всё в порядке». Вычисти его, и прогон печатал бы
+    # успех, не проверив ни одной починки.
+    if not REVERTS:
+        print("Реестр откатов пуст - проверять нечего, и это отказ, а не "
+              "успех.", file=sys.stderr)
+        return 1
 
     base = tempfile.mkdtemp(prefix="revert-check-")
     width = max(len(case[0]) for case in REVERTS)
-    blind = []
-    stale = []
+    base_cache = {}
+    trouble = {BLIND: [], STALE: [], HUNG: [], BROKEN: [], BASE_RED: []}
     skipped = []
-    hung = []
     try:
         for number, case in enumerate(REVERTS, 1):
             folder = os.path.join(base, "case%02d" % number)
             copy_tree(folder)
-            if args.anchors_only:
-                complaint = apply_revert(folder, case[1], case[2], case[3])
-                verdict = STALE if complaint else "применим"
-                detail = complaint or "фрагмент на месте"
-            else:
-                verdict, detail = check_one(case, folder)
-            if verdict == BLIND:
-                blind.append(case[0])
-            elif verdict == STALE:
-                stale.append(case[0])
-            elif verdict == SKIPPED:
-                skipped.append(case[0])
-            elif verdict == HUNG:
-                hung.append(case[0])
-            print("[%2d/%d] %-12s %-*s  %s"
-                  % (number, len(REVERTS), verdict, width, case[0], detail),
-                  flush=True)
-            # Копия больше не нужна: держать двенадцать деревьев разом
-            # незачем, а на Windows они ещё и заметны на диске.
-            shutil.rmtree(folder, ignore_errors=True)
+            try:
+                if args.anchors_only:
+                    complaint = apply_revert(folder, case[1], case[2], case[3])
+                    verdict = STALE if complaint else "применим"
+                    detail = complaint or "фрагмент на месте"
+                else:
+                    verdict, detail = check_one(case, folder, base_cache)
+                if verdict in trouble:
+                    trouble[verdict].append(case[0])
+                elif verdict == SKIPPED:
+                    skipped.append(case[0])
+                print("[%2d/%d] %-13s %-*s  %s"
+                      % (number, len(REVERTS), verdict, width, case[0],
+                         detail), flush=True)
+            finally:
+                # Копия больше не нужна. Держать дюжину деревьев разом
+                # незачем, а на Windows они ещё и заметны на диске.
+                shutil.rmtree(folder, ignore_errors=True)
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
     print()
-    if args.anchors_only and not stale:
-        print("Все %d откатов применимы: фрагмент на месте." % len(REVERTS))
-        return 0
-    for name in stale:
-        print("Якорь протух: %s" % name, file=sys.stderr)
-    for name in blind:
-        print("Не различает: %s" % name, file=sys.stderr)
-    for name in hung:
-        print("Тест не ответил (различать зависанием негодно): %s" % name,
-              file=sys.stderr)
+    complaints = [
+        (STALE, "Якорь протух"),
+        (BLIND, "Не различает"),
+        (HUNG, "Тест не ответил (различать зависанием негодно)"),
+        (BROKEN, "Прогон сломан - тест не запустился, а не упал"),
+        (BASE_RED, "Тест красный ДО отката - чинить его, а не починку"),
+    ]
+    for verdict, caption in complaints:
+        for name in trouble[verdict]:
+            print("%s: %s" % (caption, name), file=sys.stderr)
     if skipped:
         print("Пропущено на этой системе (различение не проверено): %d из %d"
               % (len(skipped), len(REVERTS)))
         for name in skipped:
             print("   %s" % name)
-    if stale or blind or hung:
-        print("Починок без охраны: %d, протухших якорей: %d, зависших: %d."
-              % (len(blind), len(stale), len(hung)), file=sys.stderr)
+    if any(trouble.values()):
+        print("Починок без охраны: %d, протухших якорей: %d, зависших: %d, "
+              "сломанных прогонов: %d, красных до отката: %d."
+              % (len(trouble[BLIND]), len(trouble[STALE]), len(trouble[HUNG]),
+                 len(trouble[BROKEN]), len(trouble[BASE_RED])),
+              file=sys.stderr)
         return 1
-    print("Все %d починок различаются своими тестами." % len(REVERTS))
+    if args.anchors_only:
+        print("Все %d откатов применимы: фрагмент на месте." % len(REVERTS))
+        return 0
+    # Число называем ЧЕСТНОЕ: пропущенные не проверены, и складывать их с
+    # проверенными значило бы выдавать пропуск за работу.
+    print("Починок различается своими тестами: %d из %d."
+          % (len(REVERTS) - len(skipped), len(REVERTS)))
     return 0
 
 

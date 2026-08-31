@@ -780,6 +780,61 @@ class InterruptedRunCleansUpAfterItself(unittest.TestCase):
         self.assertTrue(os.path.exists(backup), "слепок затёрт прогоном")
         self.assertIn("запускать нельзя", complained.getvalue())
 
+    def test_a_file_we_cannot_ask_about_is_still_ours(self):
+        """Отказ СПРОСИТЬ - не ответ «чужой».
+
+        Подтверждение через `samefile` статит оба пути, и на Windows файл
+        доли секунды держит антивирус или индексатор - тот самый транзиент,
+        ради которого рядом стоят лестницы из пяти попыток. Пока любой
+        `OSError` уводил в «слепок постороннего файла», такая случайность
+        оставляла мутацию в дереве, а прогон после этого не запускался вовсе,
+        пока человек не удалил бы слепок руками.
+        """
+        folder, target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
+                unittest.mock.patch.object(mutation_check, "LINTER", target):
+            mutation_check.save_backup(target, "ОРИГИНАЛ\n", "\n",
+                                       "МУТАЦИЯ\n")
+            with io.open(target, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("МУТАЦИЯ\n")
+            with unittest.mock.patch("os.path.samefile",
+                                     side_effect=PermissionError(13, "занят")), \
+                    redirect_stdout(io.StringIO()) as printed:
+                restored = mutation_check.restore_interrupted()
+
+        self.assertTrue(restored, "свой файл объявлен посторонним")
+        self.assertNotIn("постороннего файла", printed.getvalue())
+        with io.open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "ОРИГИНАЛ\n")
+
+    def test_a_backup_that_cannot_be_deleted_is_named_correctly(self):
+        """«Восстановил, но не удалил» - не «разобрать не смог».
+
+        Пока `drop_backup` глотал отказ молча, это было безвредно: следующий
+        слепок перезаписал бы файл. С тех пор как оставшийся слепок
+        ОСТАНАВЛИВАЕТ прогон, молчание стало блокировкой с ложным
+        объяснением: человек читал «разобрать не смог» про слепок, который
+        разобран и отработан, а дерево при этом чистое.
+        """
+        folder, target = self.sandbox()
+        backup = os.path.join(folder, ".mutation-backup")
+        with unittest.mock.patch.object(mutation_check, "BACKUP", backup), \
+                unittest.mock.patch.object(mutation_check, "LINTER", target):
+            mutation_check.save_backup(target, "ОРИГИНАЛ\n", "\n",
+                                       "МУТАЦИЯ\n")
+            with io.open(target, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("МУТАЦИЯ\n")
+            with unittest.mock.patch("os.remove",
+                                     side_effect=PermissionError(13, "занят")), \
+                    redirect_stdout(io.StringIO()) as printed:
+                restored = mutation_check.restore_interrupted()
+
+        self.assertTrue(restored)
+        self.assertIn("удалить не смог", printed.getvalue())
+        with io.open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "ОРИГИНАЛ\n", "дерево не восстановлено")
+
     def test_an_interruption_before_the_mutation_landed_is_quiet(self):
         """Обрыв ДО применения мутации - не «кто-то уже поправил».
 

@@ -4199,6 +4199,17 @@ class PreCommitHook(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         ).returncode != 0
 
+    def long_config_args(self, length):
+        """Длинный memorycheck.args - записью в конфиг, а не через argv.
+
+        `git config ключ ЗНАЧЕНИЕ` с тридцатью килобайтами сам упирается в
+        предел командной строки: тест про переполнение argv не смог бы
+        задать вход, ради которого написан (WinError 206 на Windows).
+        """
+        with io.open(os.path.join(self.repo, ".git", "config"), "a",
+                     encoding="utf-8", newline="\n") as fh:
+            fh.write("[memorycheck]\n\targs = --quiet%s\n" % ("x" * length))
+
     def draft(self, *parts):
         """Кладёт неотслеживаемый черновик в папку памяти."""
         path = os.path.join(self.repo, "memory", *parts)
@@ -4430,6 +4441,40 @@ class PreCommitHook(unittest.TestCase):
         printed = self.run_hook().stdout.decode("utf-8", "replace")
         self.assertIn("имена в кавычках", printed)
         self.assertNotIn("не смог подготовить исключения", printed)
+
+    def test_user_keys_do_not_eat_the_draft_budget_twice(self):
+        """Запас на ключи пользователя списывается ОДИН раз.
+
+        Потолок 30000 закладывал запас на ключи и при этом мерил одни только
+        черновики. Когда ключи добавили в замер, а потолок оставили, запас
+        стал списываться дважды: три черновика при длинном `memorycheck.args`
+        объявлялись «слишком многими», исключения выбрасывались, и человек
+        получал ложные L2 - средство, к причине переполнения отношения не
+        имеющее.
+        """
+        # Длина выбрана МЕЖДУ порогами: 30500 байт больше прежних 30000 и
+        # меньше нынешних 32000. На 29000 тест не различал реализации - он
+        # проходил при обоих потолках, то есть не проверял ничего.
+        self.long_config_args(30500)
+        for number in range(3):
+            self.draft("chernoviki", "draft%d.md" % number)
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        result = self.run_hook()
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertNotIn("слишком много", printed)
+        self.assertEqual(result.returncode, 0, printed)
+
+    def test_long_user_keys_alone_are_named(self):
+        """Черновиков нет, а строка всё равно длинная - причина в ключах.
+
+        Выбрасывать тут нечего, и замер под `if [ -n "$DRAFT_ARGS" ]` молчал
+        вовсе: человек упирался в предел командной строки и получал код 126
+        без единого слова. Сказать надо, даже когда сделать нельзя.
+        """
+        self.long_config_args(33000)
+        self.git("add", "memory/MEMORY.md", "memory/user.md")
+        printed = self.run_hook().stdout.decode("utf-8", "replace")
+        self.assertIn("memorycheck.args слишком длинный", printed)
 
     def test_a_failing_tr_does_not_abort_the_hook(self):
         """Замер длины был единственным местом без `set +e`.
