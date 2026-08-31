@@ -110,10 +110,21 @@ REVERTS = [
      "test_mutation_check_self.InterruptedRunCleansUpAfterItself."
      "test_a_file_that_vanished_is_restored_not_blamed"),
 
+    ("под-индекс за забором снова получает ложный совет", LINTER,
+     "            cut_at = behind_unclosed(rel)\n            if cut_at:",
+     "            cut_at = None\n            if cut_at:",
+     "test_check_memory_index.FilesAppearInIndex."
+     "test_a_sub_index_behind_an_unclosed_fence_is_named_not_blamed"),
+
+    ("файл за таким под-индексом снова обвиняется отдельно", LINTER,
+     "            cut_at = behind_unclosed(stranded[rel])",
+     "            cut_at = None",
+     "test_check_memory_index.FilesAppearInIndex."
+     "test_a_file_behind_such_a_sub_index_gets_the_same_cause"),
+
     ("двойник с обратным слэшем снова принимается за свой", TOOL,
-     "            if os.path.exists(path) and not os.path.samefile(path, ours):\n"
-     "                return None\n",
-     "",
+     "            if os.path.exists(path) and not os.path.samefile(path, ours):",
+     "            if False:",
      "test_mutation_check_self.InterruptedRunCleansUpAfterItself."
      "test_a_lookalike_with_a_backslash_in_its_name_is_refused"),
 
@@ -218,18 +229,29 @@ def copy_tree(destination):
 
 
 def apply_revert(folder, relative, old, new):
-    """Возвращает текст жалобы, если откат не применился ровно один раз."""
+    """Возвращает текст жалобы, если откат не применился как надо."""
     target = os.path.join(folder, relative)
     with io.open(target, encoding="utf-8", newline="") as stream:
         text = stream.read()
     found = text.count(old)
     if found != 1:
         return "фрагмент найден %d раз вместо одного" % found
+    changed = text.replace(old, new, 1)
+    # Откат обязан оставить файл РАЗБИРАЕМЫМ. Свой первый негодный откат
+    # инструмент нашёл на себе: он вырезал тело `try`, оставив пустой блок,
+    # и тест падал на IndentationError - то есть «покраснел» бы по причине,
+    # к починке отношения не имеющей. У соседа этот урок уже записан
+    # (`missing_anchors` компилирует мутанта), здесь его не было.
+    if relative.endswith(".py"):
+        try:
+            compile(changed, relative, "exec")
+        except SyntaxError as exc:
+            return "мутант не разбирается: %s" % exc
     # `newline=""` с обеих сторон: переводы строк остаются такими же, какими
     # были. Иначе копия отличается от дерева ещё и ими, и тест проверял бы
     # не тот файл, что лежит в репозитории.
     with io.open(target, "w", encoding="utf-8", newline="") as stream:
-        stream.write(text.replace(old, new, 1))
+        stream.write(changed)
     return None
 
 

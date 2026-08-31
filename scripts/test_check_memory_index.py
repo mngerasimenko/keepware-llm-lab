@@ -1416,6 +1416,72 @@ class FilesAppearInIndex(MemoryFixture):
         self.assertIn("infra/MEMORY.md", output)
 
 
+    def test_a_sub_index_behind_an_unclosed_fence_is_named_not_blamed(self):
+        """Строка про под-индекс ЕСТЬ - её просто не успели разобрать.
+
+        Худший из возможных ответов: блокирующая ошибка с советом «добавьте
+        строку», когда строка в индексе уже есть - человек идёт дописывать
+        дубль вместо того, чтобы закрыть забор. Причина названа отдельной
+        заметкой рядом, но связать её с файлом проверка не умела.
+
+        Ответ теперь - заметка и код 2: память может быть в полном порядке,
+        проверка просто не смогла её прочесть. Хук на код 2 коммит не
+        блокирует.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n\n"
+                         "Пример формата:\n\n"
+                         "```\n"
+                         "- [Заголовок](imya.md) - крючок\n\n"
+                         "- [Подпапка](infra/MEMORY.md) - раздел\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 2, output)
+        self.assertIn("infra/MEMORY.md", output)
+        self.assertIn("в разбор не попала", output)
+        self.assertNotIn("Добавьте в MEMORY.md строку", output)
+
+    def test_a_file_behind_such_a_sub_index_gets_the_same_cause(self):
+        """Вторая половина: файл за под-индексом, который за забором.
+
+        Он ни в чём не виноват и в своём индексе перечислен. Пока причина не
+        связывалась, он получал ВТОРОЕ блокирующее сообщение с тем же
+        неверным советом - два обвинения на одну опечатку в заборе.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n\n"
+                         "```\n"
+                         "- [Подпапка](infra/MEMORY.md) - раздел\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 2, output)
+        self.assertIn("infra/server.md", output)
+        self.assertIn("не закрыт", output)
+
+    def test_an_ordinary_unreachable_sub_index_is_still_an_error(self):
+        """Парная половина: без забора всё по-прежнему.
+
+        Заборная ветка не должна проглотить обычный случай - под-индекс, на
+        который ссылки действительно нет. Там совет «добавьте строку» верен,
+        и ошибка обязана остаться блокирующей.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("Добавьте в MEMORY.md строку", output)
+
+
 class MentionHintDrawsTheSameBoundary(MemoryFixture):
     """Оба механизма поиска упоминаний считают точку частью имени.
 
