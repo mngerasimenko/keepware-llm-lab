@@ -30,6 +30,9 @@ jobs:
     # станет зелёным при невыполненной проверке.
     env:
       MEMCHECK_REQUIRE_SH: "1"
+      # У inline-скрипта гарда нет force_utf8_output, а печатает он по-русски:
+      # на windows-latest иначе UnicodeEncodeError вместо внятного сообщения.
+      PYTHONIOENCODING: "utf-8"
     strategy:
       fail-fast: false
       matrix:
@@ -43,8 +46,27 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # Свой возврат 5 «ни одного теста не собрано» unittest получил только в
+      # 3.12, а в матрице есть 3.9: там сломанный discover дал бы зелёную
+      # галочку при невыполненных тестах. Тот же класс, что MEMCHECK_REQUIRE_SH.
+      - name: Тесты вообще собрались
+        run: python -c "import unittest, sys; n = unittest.defaultTestLoader.discover('scripts', 'test_*.py').countTestCases(); print('собрано тестов:', n); sys.exit(0 if n >= 250 else 1)"
+
+      # Шаблон тот же, что в гарде выше: у discover без ключа он «test*.py»,
+      # без обязательного подчёркивания, и наборы могли бы разъехаться.
       - name: Тесты
-        run: python -m unittest discover -s scripts -v
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
+
+      # Настоящий прогон проверки починок, а не `--anchors-only`:
+      # применимость реестра и так держит тест
+      # `test_every_revert_anchor_is_still_found` на предыдущем шаге, и
+      # отдельный шаг был бы дублем. Только на Linux: там тесты хука идут
+      # секунды, а на Windows каждый поднимает свой репозиторий, и шаг
+      # выходит дольше всего набора. Заодно на Linux проверяется откат,
+      # который на Windows пропускается: имя файла с кавычкой там не создать.
+      - name: Починки закреплены тестами
+        if: runner.os == 'Linux'
+        run: python scripts/revert_check.py
 
       - name: Проверка собственной памяти репозитория
         run: python scripts/check_memory_index.py memory
