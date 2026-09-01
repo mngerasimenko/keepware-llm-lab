@@ -285,7 +285,7 @@ python -m unittest discover -s scripts -p 'test_*.py'
 
 **Быстрый путь:** дайте своему агенту промпт [`prompts/setup-memory.md`](./prompts/setup-memory.md) - он развернёт саму память. Проверку согласованности он не ставит: её подключает второй промпт, [`prompts/connect-linter.md`](./prompts/connect-linter.md).
 
-Оба промпта обкатаны **только на Claude Opus 5**, на других моделях не проверялись - подробнее в [`prompts/README.md`](./prompts/README.md).
+Оба промпта обкатаны на **Claude Opus 5 и Sonnet 5**, других моделей мы не пробовали - подробнее в [`prompts/README.md`](./prompts/README.md).
 
 **Вручную** (те же шаги, что делает промпт):
 
