@@ -122,6 +122,90 @@ REVERTS = [
      "test_check_memory_index.FilesAppearInIndex."
      "test_a_file_behind_such_a_sub_index_gets_the_same_cause"),
 
+    ("закрытые имена (claude, DOS) снова проходят правило", LINTER,
+     "    low = closed_stem(stem)\n    return low == \"claude\" or low in DOS_RESERVED_NAMES",
+     "    return False",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_claude_name_is_an_error"),
+
+    ("вывод о закрытом имени снова называет чужую причину", LINTER,
+     "        if is_closed_name(stem):\n", "        if False:\n",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_the_message_for_a_closed_name_names_the_real_reason"),
+
+    ("`$` вместо `\\Z` снова пускает имя с хвостовым переводом строки", LINTER,
+     "MEMORY_FILE_NAME = re.compile(r\"\\A[a-z0-9][a-z0-9_-]*\\Z\")",
+     "MEMORY_FILE_NAME = re.compile(r\"^[a-z0-9][a-z0-9_-]*$\")",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_a_name_with_a_trailing_newline_is_not_a_slug"),
+
+    ("закрытое имя снова проходит как имя индекса", LINTER,
+     "        index_closed = closed_segment(index_stem)\n",
+     "        index_closed = None\n",
+     "test_check_memory_index.StrictRootIndexModel."
+     "test_a_closed_index_name_is_refused"),
+
+    ("закрытое имя папки памяти снова проходит", LINTER,
+     "        if is_closed_name(root_name):\n", "        if False:\n",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_a_closed_memory_folder_name_is_refused"),
+
+    ("предок пути снова считается именем памяти", LINTER,
+     "        root_name = os.path.basename(os.path.normpath(args.memory_dir))\n",
+     "        root_name = closed_segment(args.memory_dir) or \"\"\n",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_a_closed_segment_above_the_memory_folder_is_not_our_business"),
+
+    ("законное имя снова считается закрытым", LINTER,
+     "    return low == \"claude\" or low in DOS_RESERVED_NAMES",
+     "    return \"claude\" in low or low in DOS_RESERVED_NAMES",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_lawful_names_are_not_closed"),
+
+    ("разрыв строки снова не экранируется", LINTER,
+     "        if ch in _LINE_BREAKS:\n", "        if False:\n",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_no_output_line_is_torn_apart_by_a_name"),
+
+    ("узкое снятие пробелов снова стало широким", LINTER,
+     "    return stem.strip(\"\\r\\n\\t \").lower()",
+     "    return stem.strip().lower()",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_unicode_space_does_not_make_a_name_closed"),
+
+    ("экранирование находок снова снято", LINTER,
+     "    return ([printable_name(line) for line in errors],\n"
+     "            [printable_name(line) for line in notices],\n"
+     "            [printable_name(line) for line in warnings])",
+     "    return (errors, notices, warnings)",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_no_output_line_is_torn_apart_by_a_name"),
+
+    ("закрытое имя каталога снова проходит правило", LINTER,
+     "            if not MEMORY_FILE_NAME.match(folder) or is_closed_name(folder):",
+     "            if not MEMORY_FILE_NAME.match(folder):",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_a_closed_directory_name_is_an_error"),
+
+    ("причина закрытого имени снова одна на оба класса", LINTER,
+     "    if closed_stem(stem) == \"claude\":\n",
+     "    if False:\n",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_the_message_for_a_closed_name_names_the_real_reason"),
+
+    ("каталогу снова советуют [[связи]]", LINTER,
+     "        links = (\"поправьте ссылки в индексе\" if what == \"каталога\"\n"
+     "                 else \"поправьте ссылки (в индексе и в [[связях]])\")",
+     "        links = \"поправьте ссылки (в индексе и в [[связях]])\"",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_the_message_for_a_closed_directory_does_not_advise_the_name_field"),
+
+    ("закрытое имя файла снова проходит правило", LINTER,
+     "        if not MEMORY_FILE_NAME.match(stem) or is_closed_name(stem):",
+     "        if not MEMORY_FILE_NAME.match(stem):",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_claude_name_is_an_error"),
+
     ("двойник с обратным слэшем снова принимается за свой", TOOL,
      "            if os.path.exists(path) and not os.path.samefile(path, ours):",
      "            if False:",
