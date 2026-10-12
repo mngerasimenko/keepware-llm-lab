@@ -417,15 +417,18 @@ class IndexLinksToFiles(MemoryFixture):
 
 
 class MemoryFileNameIsASlug(MemoryFixture):
-    """L6: имя файла памяти - строчная латиница, цифры, дефис, подчёркивание.
+    """L6: имя файла и каталогов памяти - слаг, и не закрытое имя.
 
     Имя здесь не украшение, а идентификатор: по нему ссылается индекс, по нему
     же ведут [[связи]], и с ним обязано совпадать поле `name`. Пока оно могло
     быть любым, каждая вольность обзаводилась своим обработчиком - пробел,
-    процент, регистр.
+    процент, регистр. Отдельно закрыты имена `claude` и устройств DOS: форму
+    слага они проходят, но работать с ними нельзя.
 
     Замер на девяти живых памятях: 405 файлов, ни одного нарушения. Правило
-    описывает то, как уже пишут, - переименовывать нечего.
+    описывает то, как уже пишут, - переименовывать нечего. Это повторный замер
+    после введения правила; в README приведён более ранний (391 файл в восьми
+    памятях, до введения).
     """
 
     def test_space_in_the_name_is_an_error(self):
@@ -572,6 +575,296 @@ class MemoryFileNameIsASlug(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
+
+    def test_claude_name_is_an_error(self):
+        """Имя `claude` закрыто: его режут инструменты, публикующие память.
+
+        Файл `memory/claude.md` проходил L6 (слаг), но инструменты публикации
+        ловят сегмент `claude` отдельно и не публикуют файл. Тихая потеря файла
+        памяти. Правило имени должно запрещать `claude` само, а не оставлять
+        это чужому гейту: одно правило, а не два расходящихся.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Плохое](claude.md) - имя закрыто\n",
+            "user.md": "факт\n",
+            "claude.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertTrue(findings(output, "L6"), output)
+
+    def test_the_message_for_a_closed_name_names_the_real_reason(self):
+        """Вывод - задание для агента: он обязан назвать причину, а не диагноз.
+
+        Для `claude.md` форма слага ПРОЙДЕНА, и прежнее сообщение («имя не по
+        правилу: строчная латиница, цифры...») опровергало само себя: агент
+        видел нарушение правила, которое на деле выполнено, и делал вывод «баг
+        линтера». Сообщение о закрытом имени обязано назвать закрытость.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Плохое](claude.md) - имя закрыто\n",
+            "user.md": "факт\n",
+            "claude.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        lines = findings(output, "L6")
+        self.assertTrue(lines, output)
+        self.assertIn("закрыт", lines[0].lower(), output)
+        self.assertNotIn("не по правилу", lines[0].lower(), output)
+        # Причина названа по классу: `claude` - публикация, DOS - Windows.
+        self.assertIn("не публикуют", lines[0], output)
+
+    def test_the_message_for_a_closed_dos_name_names_the_dos_reason(self):
+        """Вторая половина пары: у DOS-имени причина своя, а не «claude».
+
+        Классификация причины (`closed_name_reason`) не проверялась ничем:
+        реестры держали существование ветки, а не выбор причины, - и
+        регрессия «любое закрытое имя получает DOS-текст» проходила все тесты.
+        """
+        dos = ["con", "nul", "aux", "prn", "com1", "com9", "lpt1", "lpt9"]
+        exact = {"user.md"} | {"%s.md" % n for n in dos}
+        found = linter.badly_named_files(exact, "MEMORY.md")
+        for _rel, stem, _kind in found:
+            self.assertIn("устройств DOS", linter.closed_name_reason(stem), stem)
+
+    def test_the_message_about_a_closed_name_does_not_claim_the_slug_form(self):
+        """Прописное закрытое имя форму слага НЕ проходит - и вывод не врёт.
+
+        Ветка закрытого имени срабатывает без учёта регистра, и безусловное
+        «форму слага оно проходит» для `CLAUDE`/`Con`/`NUL` ложно: прописные
+        слаг не проходят. Это тот же самоопровергающийся вывод, ради которого
+        ветка и заводилась, - только с другой стороны.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Плохое](CLAUDE.md) - имя закрыто\n",
+            "user.md": "факт\n",
+            "CLAUDE.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        lines = findings(output, "L6")
+        self.assertTrue(lines, output)
+        self.assertIn("закрыт", lines[0].lower(), output)
+        self.assertNotIn("форму слага", lines[0].lower(), output)
+
+    def test_dos_reserved_names_are_errors(self):
+        """DOS-имена не создаются на Windows - файл молча не тот, что ждали.
+
+        `con.md`, `nul.md` и родня не существуют как обычные файлы: запись
+        уходит в устройство или проваливается, а проверка «файл есть» может
+        пройти ложно. Класс тот же, что у `claude`: имя проходит форму слага,
+        но работать с ним нельзя.
+
+        Проверяется прямо на функции, а не файлами в фикстуре: на Windows
+        такие имена создать нельзя (`aux.md` - `FileNotFoundError`, `con.md`
+        схлопывается в устройство), и фикстура проверяла бы не то.
+        """
+        dos = ["con", "nul", "aux", "prn", "com1", "com9", "lpt1", "lpt9"]
+        exact = {"user.md"} | {"%s.md" % n for n in dos}
+        found = linter.badly_named_files(exact, "MEMORY.md")
+        named = {stem for _, stem, kind in found if kind == "файла"}
+        self.assertEqual(named, set(dos), found)
+
+    def test_closed_names_are_recognised_regardless_of_case(self):
+        """`Con.md` - то же устройство: NTFS регистр не различает.
+
+        Прямой вызов, а не через `badly_named_files`: там прописные отсекает
+        регулярка слага раньше, и `is_closed_name` до них не доходит вовсе.
+        Прежний тест через `badly_named_files` оставался зелёным, даже если
+        сделать `is_closed_name` регистрозависимым, - то есть не держал то,
+        что называл в докстринге.
+        """
+        for name in ("Con", "NUL", "Aux", "CLAUDE", "Claude"):
+            self.assertTrue(linter.is_closed_name(name), name)
+
+    def test_lawful_names_are_not_closed(self):
+        """Обратная сторона границы: законное имя закрытым не считается.
+
+        Все тесты утверждали, что закрытые имена ловятся; ни один - что
+        законные не ловятся. Регрессия `low == "claude"` → `"claude" in low`
+        проходила весь набор, а `claudex.md`, `console.md`, `claude-notes.md`
+        и путь `~/.claude/...` начинали падать с кодом 1.
+        """
+        for name in ("claude-notes", "my-claude", "claude_notes", "claudex",
+                     "console", "nullet", ".claude", "claude2"):
+            self.assertFalse(linter.is_closed_name(name), name)
+
+    def test_a_memory_with_a_lawful_claude_like_name_passes(self):
+        """Сквозная проверка: имя с подстрокой `claude` - не нарушение."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Заметки](claude-notes.md) - про claude\n",
+            "user.md": "факт\n",
+            "claude-notes.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 0, output)
+
+    def test_a_name_with_a_trailing_newline_is_not_a_slug(self):
+        """`$` в регулярке матчит хвостовой перевод строки - имя проходило.
+
+        На Linux файл `memory/user\\n.md` существует как обычный, и имя с
+        хвостовым `\\n` проходило правило: `MEMORY_FILE_NAME` с `$` матчит один
+        хвостовой `\\n`. Проверяется вызовом функции: на Windows такое имя в
+        фикстуру не положить.
+
+        Имя здесь НЕ закрытое намеренно: закрытое (`claude\\n`) ловит ещё и
+        `is_closed_name` (он снимает перевод строки), а свойство «`\\Z`, а не
+        `$`» держится только на обычном имени.
+        """
+        found = linter.badly_named_files({"user\n.md"}, "MEMORY.md")
+        self.assertTrue(found, "имя с хвостовым переводом строки прошло правило")
+
+    def test_a_closed_directory_name_is_an_error(self):
+        """`claude/` и `con/` закрыты и как каталоги: правило действует на папки.
+
+        Дизъюнкт `is_closed_name(folder)` в строке каталогов не упражнялся
+        ничем: единственный тест на каталог (`ok space`) падает по регулярке
+        слага, а не по закрытости. Снятие дизъюнкта оставалось невидимым.
+        Проверяется вызовом функции: каталог `con` на Windows не создать.
+        """
+        found = linter.badly_named_files(
+            {"claude/prod.md", "con/prod.md"}, "MEMORY.md")
+        dirs = {name for _, name, kind in found if kind == "каталога"}
+        self.assertEqual(dirs, {"claude", "con"}, found)
+
+    def test_the_message_for_a_closed_directory_does_not_advise_the_name_field(self):
+        """Каталогу не советуют поле `name` и [[связи]]: их у него нет.
+
+        Хвост «а для файла ещё и поле `name` в его шапке» и «[[связях]]»
+        унаследован из файловой ветки и для каталога - лишняя невыполнимая
+        правка в задании агенту: у каталога нет шапки, а [[связи]] именные, и
+        переименование каталога их не ломает (ломаются только адреса в индексе).
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "claude/prod.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        lines = [line for line in findings(output, "L6") if "каталога" in line]
+        self.assertTrue(lines, output)
+        self.assertNotIn("поле `name`", lines[0], output)
+        self.assertNotIn("[[связях]]", lines[0], output)
+        self.assertIn("поправьте ссылки в индексе", lines[0], output)
+
+    def test_the_message_for_a_closed_file_keeps_the_links_and_name_advice(self):
+        """Вторая половина пары: файлу советы про [[связи]] и `name` нужны."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Плохое](claude.md) - имя\n",
+            "user.md": "факт\n",
+            "claude.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        lines = [line for line in findings(output, "L6") if "файла" in line]
+        self.assertTrue(lines, output)
+        self.assertIn("[[связях]]", lines[0], output)
+        self.assertIn("поле `name`", lines[0], output)
+
+    def test_a_name_with_a_newline_is_printed_on_one_line(self):
+        """Имя с переводом строки не рвёт находку на две строки.
+
+        Такое имя реально (Linux, CI двухсистемный), и печаталось оно сырым -
+        построчный разбор вывода агентом получал битый адрес: находка
+        распадалась надвое. Экранируется и САМО имя, и АДРЕС находки (`rel`).
+
+        Проверяется вызовом `check` с подделанной картой: файл с `\\n` в имени
+        на Windows не создать, а инвариант - про печать, не про файловую
+        систему. Экранирование стоит в `check` - общей точке сборки находок.
+        """
+        errors, notices, warnings, _rows, _bad = linter.check(
+            self.root, ["MEMORY.md"], (), "MEMORY.md",
+            ({"MEMORY.md": "x", "claude\n.md": "x"}, {}, [], []))
+        lines = list(errors) + list(notices) + list(warnings)
+        self.assertTrue(lines, "ни одной находки - проверять нечего")
+        for line in lines:
+            self.assertEqual(len(line.splitlines()), 1, repr(line))
+        self.assertTrue(any("claude\\n.md" in line for line in lines), lines)
+
+    def test_a_name_with_any_line_break_is_printed_on_one_line(self):
+        """Не только `\\n`: `splitlines()` рвёт и на `\\x0b`, `\\x0c`, `\\x85`.
+
+        Экранировались три символа из девяти, на которых строковый разбор
+        проекта (`output.splitlines()`) делит строку, - и находка с `\\x0b` в
+        имени рвалась натрое под собственным разбором инструмента.
+        """
+        for ch in ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85",
+                   " ", " "):
+            errors, notices, warnings, _rows, _bad = linter.check(
+                self.root, ["MEMORY.md"], (), "MEMORY.md",
+                ({"MEMORY.md": "x", "user%s.md" % ch: "x"}, {}, [], []))
+            lines = list(errors) + list(notices) + list(warnings)
+            self.assertTrue(lines, repr(ch))
+            for line in lines:
+                self.assertEqual(len(line.splitlines()), 1,
+                                 "%r: %r" % (ch, line))
+
+    def test_a_newline_in_the_index_name_is_printed_on_one_line(self):
+        """Тот же инвариант для отказа `--index`: имя печатается экранированным."""
+        self.write({
+            "user.md": "факт\n",
+        })
+        _code, output = self.run_linter("--index", "claude\n.md")
+        self.assertIn("claude\\n", output, output)
+        self.assertNotIn("claude\n.md", output, output)
+
+    def test_unicode_space_does_not_make_a_name_closed(self):
+        """`claude\\u00a0` - не закрытое имя, а имя не по правилу слага.
+
+        `strip()` снимает и юникод-пробелы (`\\u00a0`, `\\u2003`), из-за чего
+        такое имя получало причину «`claude` не публикуют инструменты», хотя
+        настоящая причина - форма слага. Действие одно, но причина названа
+        неверно - тот же класс лжи, против которого ветка и заводилась.
+        """
+        self.assertFalse(linter.is_closed_name("claude "),
+                         "юникод-пробел сделал имя закрытым")
+
+    def test_a_closed_segment_above_the_memory_folder_is_not_our_business(self):
+        """Предки пути - раскладка машины, а не имя памяти: отказ по ним ложен.
+
+        Первая редакция проверяла ЛЮБОЙ сегмент абсолютного пути, и законная
+        папка памяти внутри каталога `claude` отказывала с советом
+        «переименуйте папку» - по предку, который к памяти отношения не имеет.
+        Имя памяти - это сама папка и то, что внутри неё; выше начинается
+        раскладка машины.
+        """
+        self.write({
+            "claude/memory/MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "claude/memory/user.md": "факт\n",
+        })
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = linter.main([os.path.join(self.root, "claude", "memory")])
+        output = out.getvalue() + err.getvalue()
+        self.assertEqual(code, 0, output)
+
+    def test_a_closed_memory_folder_name_is_refused(self):
+        """А вот САМА папка памяти закрытым именем названа быть не может."""
+        self.write({
+            "claude/MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "claude/user.md": "факт\n",
+        })
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = linter.main([os.path.join(self.root, "claude")])
+        output = out.getvalue() + err.getvalue()
+        self.assertEqual(code, 2, output)
+        self.assertIn("закрыт", output.lower())
+
+    def test_a_closed_segment_in_the_index_path_is_refused(self):
+        """`--index claude/MEMORY.md` - закрытый сегмент в пути индекса.
+
+        Путь индекса - это адрес ВНУТРИ памяти (как `infra/MEMORY.md`), и
+        закрытый каталог в нём - имя памяти, а не раскладка машины.
+        """
+        self.write({
+            "claude/MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter("--index", "claude/MEMORY.md")
+        self.assertEqual(code, 2, output)
+        self.assertIn("закрыт", output.lower())
 
     def test_directory_names_obey_the_rule_too(self):
         """Каталог входит в адрес наравне с именем файла.
@@ -1730,6 +2023,51 @@ class StrictRootIndexModel(MemoryFixture):
         self.assertEqual(code, 2, output)
         self.assertIn("имя", output.lower())
 
+    def test_a_closed_index_name_is_refused(self):
+        """Закрытое имя закрыто и для индекса: `--index claude.md` - отказ.
+
+        Имя индекса правило имени не проверяет (оно задаётся отдельно), и
+        `--index claude.md` дал бы индекс, который L6 не тронет, а публикация
+        всё равно не увезёт, - тот же дефект класса, против которого правило.
+        """
+        self.write({
+            "claude.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter("--index", "claude.md")
+        self.assertEqual(code, 2, output)
+        self.assertIn("закрыт", output.lower())
+
+    def test_a_closed_index_name_is_refused_in_any_form(self):
+        """Отказ держится для DOS-имени, прописных и хвостового перевода строки.
+
+        Композиция `splitext` + `is_closed_name` держалась на одном входе
+        (`claude.md`). DOS-имя, прописная форма (естественная для индекса,
+        который намеренно набран прописными) и имя с хвостовым `\\n` - тот же
+        закрытый класс и должны отклоняться так же.
+
+        Проверяется и ПРИЧИНА, а не только слово «закрыт»: оно одинаково в
+        обеих ветках, и тест, довольный им, слеп к тому, какая причина
+        напечатана. `claude.md` - самая естественная форма входа (имя индекса
+        это имя файла), и именно на ней причина путалась с DOS.
+
+        Имена передаются ТОЛЬКО аргументом: свойство аргументное, а DOS-имя в
+        фикстуру не положить - на Windows `con.md` уходит в устройство и файла
+        не создаёт (соседний тест объясняет это же).
+        """
+        self.write({
+            "user.md": "факт\n",
+        })
+        for name in ("con.md", "CLAUDE.md", "nul.md", "claude\n.md"):
+            code, output = self.run_linter("--index", name)
+            self.assertEqual(code, 2, "%s: %s" % (name, output))
+            self.assertIn("закрыт", output.lower(), name)
+        # Причина названа по классу имени, а не одна на оба.
+        _code, out_claude = self.run_linter("--index", "CLAUDE.md")
+        self.assertIn("не публикуют", out_claude, out_claude)
+        _code, out_dos = self.run_linter("--index", "con.md")
+        self.assertIn("устройств DOS", out_dos, out_dos)
+
     def test_stray_index_hint_is_case_insensitive(self):
         """`memory_infra.md` строчными - тот же случай, что `MEMORY_infra.md`.
 
@@ -2792,6 +3130,26 @@ class AddressesAreClickable(MemoryFixture):
         "user.md": "факт\n",
         "draft.md": "черновик\n",
     }
+
+    def test_no_output_line_is_torn_apart_by_a_name(self):
+        """Ни одна строка вывода не рвётся - и не только в L6.
+
+        Имя с символом разрыва (`\\x0b` и родня) законно на Linux, и вывод
+        делится на строки тем же `splitlines()`, которым его читает агент.
+        Экранирование стояло только в L6 и отказах `main`, а L1/L2/L4/L5
+        печатали имя сырым - и находка распадалась надвое.
+
+        Проверяется вызовом `check` с подделанной картой: файл с `\\x0b` в
+        имени на Windows не создать, а инвариант - про печать.
+        """
+        errors, notices, hints, _rows, _bad = linter.check(
+            self.root, ["MEMORY.md"], (), "MEMORY.md",
+            ({"MEMORY.md": "x", "draft\x0b.md": "x"}, {}, [], []))
+        lines = list(errors) + list(notices) + list(hints)
+        self.assertTrue(lines, "ни одной находки - проверять нечего")
+        for line in lines:
+            self.assertEqual(len(line.splitlines()), 1, repr(line))
+        self.assertTrue(any("draft\\x0b.md" in line for line in lines), lines)
 
     def test_relative_run_prefixes_the_address(self):
         self.write(self.FILES)
