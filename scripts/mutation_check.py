@@ -189,8 +189,8 @@ MUTATIONS = [
      "    errors = [with_memory_folder(line, folder, known) for line in errors]",
      "    errors = list(errors)"),
     ("приписка ставится и там, где ведущий токен не путь", LINTER,
-     "    if not match or match.group(2) not in known:\n        return line",
-     "    if not match:\n        return line"),
+     "    if not leads_to_known_path(rest, known):\n        return line",
+     "    if False:\n        return line"),
 
     # --- L4: ссылки [[...]] между фактами ---
     ("битые ссылки [[...]] не сообщаются", LINTER,

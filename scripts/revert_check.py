@@ -278,10 +278,8 @@ REVERTS = [
      "test_escaped_name_still_gets_the_prefix"),
 
     ("папка памяти снова подставляется в строку сырой", LINTER,
-     "    return \"%s%s/%s%s%s%s%s\" % (code or \"\", printable_name(folder), path,\n"
-     "                                lineno or \"\", colon, tail, line[match.end():])",
-     "    return \"%s%s/%s%s%s%s%s\" % (code or \"\", folder, path, lineno or \"\",\n"
-     "                                colon, tail, line[match.end():])",
+     "    return \"%s%s/%s\" % (code, printable_name(folder), rest)",
+     "    return \"%s%s/%s\" % (code, folder, rest)",
      "test_check_memory_index.AddressesAreClickable."
      "test_a_folder_with_a_line_break_does_not_tear_the_line"),
 
@@ -292,6 +290,94 @@ REVERTS = [
      "                  file=sys.stderr)",
      "test_check_memory_index.AddressesAreClickable."
      "test_early_refusals_escape_the_names_they_print"),
+
+    ("отказ по шаблону --index снова печатает ключ сырым", LINTER,
+     "            print(\"Ключ --index принимает ИМЯ файла индекса, а не шаблон: %s. \"\n"
+     "                  \"Например: --index MEMORY.md\" % printable_name(args.index),\n"
+     "                  file=sys.stderr)",
+     "            print(\"Ключ --index принимает ИМЯ файла индекса, а не шаблон: %s. \"\n"
+     "                  \"Например: --index MEMORY.md\" % args.index,\n"
+     "                  file=sys.stderr)",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_early_refusals_escape_the_names_they_print"),
+
+    ("L2 о пропавшем индексе снова печатает его имя сырым", LINTER,
+     "                      % (printable_name(args.index),\n"
+     "                         files_count(len(orphaned)), shown, more))",
+     "                      % (args.index,\n"
+     "                         files_count(len(orphaned)), shown, more))",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_early_refusals_escape_the_names_they_print"),
+
+    ("«Корневой индекс не найден» снова печатает имена сырыми", LINTER,
+     "                      % (printable_name(args.index),\n"
+     "                         printable_name(args.memory_dir), where),",
+     "                      % (args.index,\n"
+     "                         args.memory_dir, where),",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_two_other_early_refusals_escape_the_names_they_print"),
+
+    ("«Индекс не найден» снова печатает имена сырыми", LINTER,
+     "                print(\"Индекс не найден: %s/%s\"\n"
+     "                      % (printable_name(args.memory_dir.replace(os.sep, \"/\").rstrip(\"/\")),\n"
+     "                         printable_name(args.index)), file=sys.stderr)",
+     "                print(\"Индекс не найден: %s/%s\"\n"
+     "                      % (args.memory_dir.replace(os.sep, \"/\").rstrip(\"/\"),\n"
+     "                         args.index), file=sys.stderr)",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_two_other_early_refusals_escape_the_names_they_print"),
+
+    ("адреса из середины фразы снова печатаются сырыми", LINTER,
+     "    if not folder or os.path.isabs(rel):\n"
+     "        return printable_name(rel)",
+     "    if not folder or os.path.isabs(rel):\n"
+     "        return rel",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_two_other_early_refusals_escape_the_names_they_print"),
+
+    ("сироты в L2 снова без приписки папки", LINTER,
+     "                shown = \", \".join(with_folder_prefix(rel, folder)\n"
+     "                                  for rel in orphaned[:5])",
+     "                shown = \", \".join(printable_name(rel) for rel in orphaned[:5])",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_early_refusal_prefixes_the_orphans_it_lists"),
+
+    ("найденный глубже индекс снова без приписки папки", LINTER,
+     "                where = \", \".join(sorted(with_folder_prefix(\n"
+     "                    relative_to_root(root, p) or p, folder)\n"
+     "                    for p in index_paths))",
+     "                where = \", \".join(sorted(printable_name(relative_to_root(root, p) or p)\n"
+     "                                         for p in index_paths))",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_early_refusal_prefixes_the_deep_index_it_lists"),
+
+    ("сообщение исключения снова печатается сырым", LINTER,
+     "              % (type(exc).__name__, printable_name(str(exc))), file=sys.stderr)",
+     "              % (type(exc).__name__, exc), file=sys.stderr)",
+     "test_check_memory_index.ExitCodeContract."
+     "test_internal_failure_escapes_the_name_in_its_own_message"),
+
+    ("поток снова перекодируется без режима ошибок", LINTER,
+     "            stream.reconfigure(encoding=\"utf-8\", errors=\"backslashreplace\")",
+     "            stream.reconfigure(encoding=\"utf-8\")",
+     "test_check_memory_index.OutputEncoding."
+     "test_a_surrogate_in_a_name_does_not_crash_the_print"),
+
+    ("отказ argparse снова печатает аргумент сырым", LINTER,
+     "        self.exit(2, \"%s: error: %s\\n\" % (self.prog, printable_name(message)))",
+     "        self.exit(2, \"%s: error: %s\\n\" % (self.prog, message))",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_argparse_errors_escape_the_names_they_print"),
+
+    ("разбор ведущего адреса снова до пробела и двоеточия", LINTER,
+     "    for path in sorted(known, key=len, reverse=True):\n"
+     "        if rest.startswith(path) and ADDRESS_TAIL.match(rest, len(path)):\n"
+     "            return True\n"
+     "    return False",
+     "    match = re.match(r\"([^\\s:]+)(:\\d+)?(:?)(\\s|$)\", rest)\n"
+     "    return bool(match and match.group(1) in known)",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_a_name_with_a_space_gets_the_prefix"),
 ]
 # Ограничитель обратного прохода (`floor`) сюда намеренно НЕ занесён: его
 # держит мутация в `mutation_check.py`, а единственный тест, который на его

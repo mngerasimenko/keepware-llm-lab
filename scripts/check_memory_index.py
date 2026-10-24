@@ -133,10 +133,17 @@ EXIT_USAGE = 2
 
 
 def force_utf8_output():
-    """Иначе на Windows русские сообщения уезжают в кодировку консоли."""
+    """Иначе на Windows русские сообщения уезжают в кодировку консоли.
+
+    `errors="backslashreplace"` обязателен, а не украшение: `reconfigure`
+    с одним `encoding=` режим ошибок не трогает, и остаётся `strict`. Имя с
+    байтом вне UTF-8 приходит в строку через `surrogateescape` (Linux), и
+    печать такого имени в `strict` падает `UnicodeEncodeError` - агент
+    получил бы трейсбек и exit 1 вместо находки.
+    """
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8")
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
         except Exception:
             pass  # поток без reconfigure или уже отсоединённый - не повод падать
 
@@ -1837,8 +1844,23 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                  or cache.get(UNREADABLE_KEY)))
 
 
+class _Parser(argparse.ArgumentParser):
+    r"""Парсер, чьи отказы не рвут строку именем из аргумента.
+
+    Стандартный `error` печатает аргументы сырыми: `error: unrecognized
+    arguments: foo\nbar.md` уходил в stderr двумя строками - до `try` и до
+    `escaped_findings`, то есть мимо обоих держателей инварианта «ни одна
+    строка вывода не рвётся». Правка ровно одна: сообщение проходит через
+    `printable_name`. Внешний вид отказа сохранён - argparse, не наш формат.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, "%s: error: %s\n" % (self.prog, printable_name(message)))
+
+
 def build_parser():
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         description="Проверяет, что индекс памяти и файлы памяти не разошлись.",
         epilog="Коды возврата: 0 - порядок, 1 - нарушения L1/L2/L5/L6, "
                "2 - проверку выполнить не удалось.",
@@ -1857,10 +1879,32 @@ def build_parser():
     return parser
 
 
-# Ведущий адрес строки: «L2 draft.md ...», «L1 MEMORY.md:2 ...», «draft.md: ...».
-# Двоеточие в путь не берём - внутри папки памяти его в именах не бывает, а
-# отделяет оно как раз номер строки.
-LEADING_ADDRESS = re.compile(r"^(L\d )?([^\s:]+)(:\d+)?(:?)(\s|$)")
+# Хвост ведущего адреса после пути: «:2», «:», пробел или конец строки.
+ADDRESS_TAIL = re.compile(r"(:\d+)?(:?)(\s|$)")
+LEADING_CODE = re.compile(r"^(L\d )?")
+
+
+def leads_to_known_path(rest, known):
+    r"""Ведущий адрес `rest` указывает на один из известных путей?
+
+    Берём САМЫЙ ДЛИННЫЙ префикс из `known`: имя с пробелом или с двоеточием
+    (оба законны на Linux, где память лежит) разбирается целиком, а не до
+    первого разделителя. Прежний разбор брал в путь `[^\s:]+`, и `Моя
+    Папка.md` не совпадала ни с чем - приписка не ставилась, а агент шёл по
+    адресу, по которому файла нет.
+
+    Хвост после пути обязан совпасть с формой адреса («:2», «:», пробел,
+    конец строки). Без этого `draft.md` сошёл бы за адрес строки про
+    `draft.md.backup`, и папка приписалась бы не тому файлу.
+
+    Фолбэк на прежний разбор не нужен: всё, что он принимал, принимает и
+    этот - его токен `[^\s:]+` сам является таким префиксом с тем же
+    хвостом.
+    """
+    for path in sorted(known, key=len, reverse=True):
+        if rest.startswith(path) and ADDRESS_TAIL.match(rest, len(path)):
+            return True
+    return False
 
 
 def with_memory_folder(line, folder, known):
@@ -1878,6 +1922,10 @@ def with_memory_folder(line, folder, known):
     индекс и отсчитываются от него, а не от текущего каталога. Разбор по
     началу строки к ним физически не подступается.
 
+    Путь, номер строки, двоеточие и хвост склеиваются обратно в остаток
+    строки, поэтому правка есть вставка папки ровно после кода - границы
+    пути на вывод не влияют, влияют только на решение «адрес это или фраза».
+
     Папка подставляется в УЖЕ экранированную строку находки (`escaped_findings`),
     поэтому и сама она идёт через `printable_name`: имя папки с символом
     разрыва законно на Linux, а правило слага на имя папки не
@@ -1886,12 +1934,27 @@ def with_memory_folder(line, folder, known):
     """
     if not folder:
         return line
-    match = LEADING_ADDRESS.match(line)
-    if not match or match.group(2) not in known:
+    code_match = LEADING_CODE.match(line)
+    code = code_match.group(1) or ""
+    rest = line[code_match.end():]
+    if not leads_to_known_path(rest, known):
         return line
-    code, path, lineno, colon, tail = match.groups()
-    return "%s%s/%s%s%s%s%s" % (code or "", printable_name(folder), path,
-                                lineno or "", colon, tail, line[match.end():])
+    return "%s%s/%s" % (code, printable_name(folder), rest)
+
+
+def with_folder_prefix(rel, folder):
+    """Адрес, вшитый в середину фразы: приписка папки, если она уместна.
+
+    `with_memory_folder` правит только ВЕДУЩИЙ адрес строки, а списки в
+    ранних отказах (сироты в `L2 ... агент не увидит ни одного (...)` и
+    найденные глубже индексы в «Корневой индекс не найден») вшиты в середину
+    фразы и до неё не доходят: агент получал `draft.md` вместо
+    `memory/draft.md` и шёл по пути, которого нет. Абсолютный путь не
+    приписываем - папка уже в нём самом.
+    """
+    if not folder or os.path.isabs(rel):
+        return printable_name(rel)
+    return "%s/%s" % (printable_name(folder), printable_name(rel))
 
 
 def display_folder(memory_dir):
@@ -1917,6 +1980,11 @@ def display_folder(memory_dir):
 def main(argv=None):
     force_utf8_output()
     args = build_parser().parse_args(argv)
+    # Папка памяти нужна и ранним отказам: их адреса вшиты в середину фраз и
+    # до with_memory_folder не доходят. Считаем раньше, чтобы каждое
+    # сообщение печатало адрес, по которому файл находится из каталога
+    # запуска, - а не голое имя.
+    folder = display_folder(args.memory_dir)
 
     try:
         # abspath внутри перехвата намеренно: на Linux он зовёт getcwd(), а тот
@@ -1989,7 +2057,8 @@ def main(argv=None):
         if not any(os.path.dirname(p) == root for p in index_paths):
             orphaned = memory_files_without_index(file_map[0], args.index)
             if orphaned:
-                shown = ", ".join(printable_name(rel) for rel in orphaned[:5])
+                shown = ", ".join(with_folder_prefix(rel, folder)
+                                  for rel in orphaned[:5])
                 more = " и ещё %d" % (len(orphaned) - 5) if len(orphaned) > 5 else ""
                 print("L2 корневой индекс %s пропал из папки памяти, а файлов "
                       "памяти в ней %s: агент не увидит ни одного (%s%s). "
@@ -2000,8 +2069,9 @@ def main(argv=None):
                 print("\nНарушений: 1 (строк в индексе: 0)")
                 return EXIT_VIOLATION
             if index_paths:
-                where = ", ".join(sorted(printable_name(relative_to_root(root, p) or p)
-                                         for p in index_paths))
+                where = ", ".join(sorted(with_folder_prefix(
+                    relative_to_root(root, p) or p, folder)
+                    for p in index_paths))
                 print("Корневой индекс не найден: %s нет в самой папке %s "
                       "(с этим именем нашлось только глубже: %s). Либо указана "
                       "не та папка, либо корневой индекс назван иначе"
@@ -2021,8 +2091,12 @@ def main(argv=None):
         errors, notices, warnings, row_count, unverifiable = check(
             root, index_paths, args.allow_orphan, args.index, file_map)
     except Exception as exc:  # проверка сломалась - это не нарушение памяти
+        # Сообщение исключения несёт имена файлов, и печатать его сырым -
+        # та же дыра, что и в ранних отказах: `ValueError` с именем,
+        # содержащим символ разрыва, рвал бы строку надвое. `OSError`
+        # экранирует имя через `repr` сам, но класс исключений шире.
         print("Проверку выполнить не удалось: %s: %s"
-              % (type(exc).__name__, exc), file=sys.stderr)
+              % (type(exc).__name__, printable_name(str(exc))), file=sys.stderr)
         return EXIT_USAGE
 
     # Предупреждения первыми: они объясняют, откуда взялись ошибки, и под
@@ -2045,7 +2119,6 @@ def main(argv=None):
     # Адреса в выводе дописываем папкой памяти - см. with_memory_folder.
     # Список известных путей берём из карты файлов: приписка ставится только
     # там, где ведущий токен и правда путь, а не начало фразы.
-    folder = display_folder(args.memory_dir)
     # Каталоги тоже адреса. Прежде список знал только файлы, и обе каталожные
     # заметки («связанный каталог пропущен», «каталог не читается») выходили
     # без приписки - с путём, по которому из корня репозитория ничего нет.
