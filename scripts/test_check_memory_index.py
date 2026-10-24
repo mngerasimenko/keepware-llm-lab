@@ -664,6 +664,18 @@ class MemoryFileNameIsASlug(MemoryFixture):
         named = {stem for _, stem, kind in found if kind == "файла"}
         self.assertEqual(named, set(dos), found)
 
+    def test_dos_list_edges_are_not_closed(self):
+        """Границы DOS-списка: `com0` и `lpt10` устройствами НЕ являются.
+
+        Список зарезервированных имён конечен (`com1`-`com9`, `lpt1`-`lpt9`),
+        и правило обязано кончаться там же, где кончается система. Тест на
+        `com1`/`com9` этого не показывает: он пройдёт и на реализации, где
+        закрыто ВСЁ, начинающееся с `com` - а такая реализация запретила бы
+        законное имя `com10.md`. Граница зафиксирована с обеих сторон.
+        """
+        for name in ("com0", "com10", "lpt0", "lpt10", "com", "lpt"):
+            self.assertFalse(linter.is_closed_name(name), name)
+
     def test_closed_names_are_recognised_regardless_of_case(self):
         """`Con.md` - то же устройство: NTFS регистр не различает.
 
