@@ -271,6 +271,27 @@ REVERTS = [
      "fi",
      "test_check_memory_index.PreCommitHook."
      "test_drafts_named_in_quotes_do_not_fake_a_failure"),
+
+    ("список известных путей снова не знает экранированной формы", LINTER,
+     "    known |= {printable_name(rel) for rel in known}\n", "    \n",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_escaped_name_still_gets_the_prefix"),
+
+    ("папка памяти снова подставляется в строку сырой", LINTER,
+     "    return \"%s%s/%s%s%s%s%s\" % (code or \"\", printable_name(folder), path,\n"
+     "                                lineno or \"\", colon, tail, line[match.end():])",
+     "    return \"%s%s/%s%s%s%s%s\" % (code or \"\", folder, path, lineno or \"\",\n"
+     "                                colon, tail, line[match.end():])",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_a_folder_with_a_line_break_does_not_tear_the_line"),
+
+    ("ранние отказы снова печатают имена сырыми", LINTER,
+     "            print(\"Папка памяти не найдена: %s\" % printable_name(args.memory_dir),\n"
+     "                  file=sys.stderr)",
+     "            print(\"Папка памяти не найдена: %s\" % args.memory_dir,\n"
+     "                  file=sys.stderr)",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_early_refusals_escape_the_names_they_print"),
 ]
 # Ограничитель обратного прохода (`floor`) сюда намеренно НЕ занесён: его
 # держит мутация в `mutation_check.py`, а единственный тест, который на его

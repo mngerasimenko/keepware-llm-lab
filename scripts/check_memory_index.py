@@ -1877,6 +1877,12 @@ def with_memory_folder(line, folder, known):
     `- [Заголовок](draft.md)`» - обязаны остаться как есть: они пишутся в
     индекс и отсчитываются от него, а не от текущего каталога. Разбор по
     началу строки к ним физически не подступается.
+
+    Папка подставляется в УЖЕ экранированную строку находки (`escaped_findings`),
+    поэтому и сама она идёт через `printable_name`: имя папки с символом
+    разрыва законно на Linux, а правило слага на имя папки не
+    распространяется - сырое имя рвало бы каждую строку с припиской надвое,
+    то есть ровно тот инвариант, ради которого экранирование заведено.
     """
     if not folder:
         return line
@@ -1884,8 +1890,8 @@ def with_memory_folder(line, folder, known):
     if not match or match.group(2) not in known:
         return line
     code, path, lineno, colon, tail = match.groups()
-    return "%s%s/%s%s%s%s%s" % (code or "", folder, path, lineno or "",
-                                colon, tail, line[match.end():])
+    return "%s%s/%s%s%s%s%s" % (code or "", printable_name(folder), path,
+                                lineno or "", colon, tail, line[match.end():])
 
 
 def display_folder(memory_dir):
@@ -1918,7 +1924,8 @@ def main(argv=None):
         # то есть "у вас разъехалась память" вместо "проверка не выполнилась".
         root = os.path.abspath(args.memory_dir)
         if not os.path.isdir(root):
-            print("Папка памяти не найдена: %s" % args.memory_dir, file=sys.stderr)
+            print("Папка памяти не найдена: %s" % printable_name(args.memory_dir),
+                  file=sys.stderr)
             return EXIT_USAGE
 
         # Имя, а не шаблон. Прежняя форма ключа принимала глоб, и из него
@@ -1927,7 +1934,8 @@ def main(argv=None):
         # вслух: тихо «почти работающий» ключ хуже отказа.
         if any(ch in args.index for ch in "*?["):
             print("Ключ --index принимает ИМЯ файла индекса, а не шаблон: %s. "
-                  "Например: --index MEMORY.md" % args.index, file=sys.stderr)
+                  "Например: --index MEMORY.md" % printable_name(args.index),
+                  file=sys.stderr)
             return EXIT_USAGE
 
         # Имя индекса правило имени не проверяет (оно задаётся отдельно и
@@ -1981,30 +1989,33 @@ def main(argv=None):
         if not any(os.path.dirname(p) == root for p in index_paths):
             orphaned = memory_files_without_index(file_map[0], args.index)
             if orphaned:
-                shown = ", ".join(orphaned[:5])
+                shown = ", ".join(printable_name(rel) for rel in orphaned[:5])
                 more = " и ещё %d" % (len(orphaned) - 5) if len(orphaned) > 5 else ""
                 print("L2 корневой индекс %s пропал из папки памяти, а файлов "
                       "памяти в ней %s: агент не увидит ни одного (%s%s). "
                       "Если вы указали папку, внутри которой лежит НЕСКОЛЬКО "
                       "памятей, проверяйте каждую отдельно"
-                      % (args.index, files_count(len(orphaned)), shown, more))
+                      % (printable_name(args.index),
+                         files_count(len(orphaned)), shown, more))
                 print("\nНарушений: 1 (строк в индексе: 0)")
                 return EXIT_VIOLATION
             if index_paths:
-                where = ", ".join(sorted(relative_to_root(root, p) or p
+                where = ", ".join(sorted(printable_name(relative_to_root(root, p) or p)
                                          for p in index_paths))
                 print("Корневой индекс не найден: %s нет в самой папке %s "
                       "(с этим именем нашлось только глубже: %s). Либо указана "
                       "не та папка, либо корневой индекс назван иначе"
-                      % (args.index, args.memory_dir, where), file=sys.stderr)
+                      % (printable_name(args.index),
+                         printable_name(args.memory_dir), where),
+                      file=sys.stderr)
             else:
                 # Прямой слэш, как и все остальные пути в выводе: на Windows
                 # os.path.join дал бы «memory\MEMORY.md» - единственный путь
                 # в другую сторону, и по нему видно, что строку собирали
                 # отдельно от прочих.
                 print("Индекс не найден: %s/%s"
-                      % (args.memory_dir.replace(os.sep, "/").rstrip("/"),
-                         args.index), file=sys.stderr)
+                      % (printable_name(args.memory_dir.replace(os.sep, "/").rstrip("/")),
+                         printable_name(args.index)), file=sys.stderr)
             return EXIT_USAGE
 
         errors, notices, warnings, row_count, unverifiable = check(

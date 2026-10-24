@@ -3285,6 +3285,66 @@ class AddressesAreClickable(MemoryFixture):
         self.assertIn("L6 %s/draft\\x0b.md" % name, output,
                       "адрес с экранированным именем остался без приписки")
 
+    def test_a_folder_with_a_line_break_does_not_tear_the_line(self):
+        """Папка памяти - часть адреса, и экранируется она так же, как имя файла.
+
+        `with_memory_folder` подставляет папку в УЖЕ экранированную строку
+        находки, а `display_folder` отдаёт её сырой. Имя папки с символом
+        разрыва (законно на Linux; правило слага на имя папки не
+        распространяется) рвёт каждую строку с припиской - тот самый
+        инвариант, который держит тест выше. На Windows такую папку не
+        создать, поэтому подделываем `display_folder`.
+        """
+        self.write(self.FILES)
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(linter, "display_folder",
+                                        lambda _dir: "mem\x0bory"):
+            with redirect_stdout(out), redirect_stderr(err):
+                code = linter.main([os.path.basename(self.root)])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertEqual(code, 1, output)
+        self.assertIn("L2 mem\\x0bory/draft.md", output,
+                      "адрес потерял папку вместо того, чтобы получить её "
+                      "экранированной")
+        self.assertNotIn("mem\x0bory", output,
+                         "имя папки ушло в вывод сырым и рвёт строку надвое")
+
+    def test_early_refusals_escape_the_names_they_print(self):
+        """Ранние выходы `main` печатают имена - и тоже обязаны их экранировать.
+
+        Три ветки: папки памяти нет, ключ `--index` дан шаблоном, корневой
+        индекс пропал. Первые две достижимы и на Windows, третью подделываем:
+        файл с `\\x0b` в имени здесь не создать. Соседние ранние печати
+        (закрытое имя в `--index`, закрытое имя папки) экранирование
+        применяют - в этих трёх оно было забыто, и строка рвалась надвое.
+        """
+        bad = "mem\x0bory"
+        for argv in ([bad], [self.root, "--index", "bad\x0b*"]):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = linter.main(argv)
+            output = out.getvalue() + err.getvalue()
+            self.assertEqual(code, 2, output)
+            self.assertIn("\\x0b", output, argv)
+            self.assertNotIn("\x0b", output, argv)
+
+        self.write({"draft.md": "черновик\n"})
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(linter, "memory_files_without_index",
+                                        lambda _exact, _name: ["draft\x0b.md"]):
+            with redirect_stdout(out), redirect_stderr(err):
+                code = linter.main([self.root])
+        output = out.getvalue() + err.getvalue()
+        self.assertEqual(code, 1, output)
+        self.assertIn("draft\\x0b.md", output,
+                      "имя сироты ушло в вывод сырым")
+        self.assertNotIn("\x0b", output, "строка о пропавшем индексе рвётся")
+
 
 class LinkedSubtrees(MemoryFixture):
     """Связанные каталоги внутри памяти: junction на Windows, симлинк на POSIX."""
