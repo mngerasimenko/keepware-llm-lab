@@ -2048,6 +2048,13 @@ def main(argv=None):
         rel = relative_to_root(root, where)
         if rel:
             known.add(rel)
+    # Строки находок экранированы (escaped_findings), а адрес в строке - часть
+    # строки: имя с `\x0b` печатается как `draft\x0b.md`. Сверка ведущего
+    # токена идёт по строке, поэтому список известных путей обязан знать и
+    # экранированную форму - иначе такой адрес остаётся без приписки, то есть
+    # ровно с той бедой, ради которой приписка написана. Для имён без символов
+    # разрыва форма совпадает с сырой, и добавление ничего не меняет.
+    known |= {printable_name(rel) for rel in known}
     notices = [with_memory_folder(line, folder, known) for line in notices]
     warnings = [with_memory_folder(line, folder, known) for line in warnings]
     errors = [with_memory_folder(line, folder, known) for line in errors]

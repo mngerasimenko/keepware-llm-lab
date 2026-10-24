@@ -3238,6 +3238,41 @@ class AddressesAreClickable(MemoryFixture):
         self.assertIn("L2 draft.md", output)
         self.assertNotIn(self.root, output)
 
+    def test_escaped_name_still_gets_the_prefix(self):
+        """Приписка доходит и до адреса, чьё имя экранировано в выводе.
+
+        Экранирование (`escaped_findings`) превращает имя с `\\x0b` в
+        литеральное `draft\\x0b.md`, а список известных путей собирался из
+        СЫРЫХ имён. Для такого адреса совпадения не было, и приписка папки
+        не ставилась - то есть ровно тот дефект, ради которого приписка
+        написана: по строке `L6 draft\\x0b.md` из каталога запуска файла не
+        найти. Имя с `\\x0b` законно на Linux, а на Windows такой файл не
+        создать - поэтому карту подделываем, как в тесте выше.
+        """
+        self.write(self.FILES)
+        name = os.path.basename(self.root)
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+        real = linter.build_file_map
+
+        def with_a_bad_name(root, *args, **kwargs):
+            exact, folded, unreadable, linked = real(root, *args, **kwargs)
+            exact = dict(exact)
+            exact["draft\x0b.md"] = os.path.join(root, "draft\x0b.md")
+            return (exact, folded, unreadable, linked)
+
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(linter, "build_file_map",
+                                        with_a_bad_name):
+            with redirect_stdout(out), redirect_stderr(err):
+                code = linter.main([name])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertEqual(code, 1, output)
+        self.assertIn("L6 %s/draft\\x0b.md" % name, output,
+                      "адрес с экранированным именем остался без приписки")
+
 
 class LinkedSubtrees(MemoryFixture):
     """Связанные каталоги внутри памяти: junction на Windows, симлинк на POSIX."""
