@@ -309,8 +309,8 @@ class IndexLinksToFiles(MemoryFixture):
 
     def test_brackets_inside_link_text_still_parse(self):
         self.write({
-            "MEMORY.md": "- [VPScan [beta]](vps.md) - сканер\n",
-            "vps.md": "факт\n",
+            "MEMORY.md": "- [Scanner [beta]](scanner.md) - сканер\n",
+            "scanner.md": "факт\n",
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
@@ -567,10 +567,10 @@ class MemoryFileNameIsASlug(MemoryFixture):
         """
         self.write({
             "MEMORY.md": "- [Раз](feedback_ask_dont_guess.md) - подчёркивания\n"
-                         "- [Два](project-vpscan-2026.md) - дефисы и цифры\n"
+                         "- [Два](project-scanner-2026.md) - дефисы и цифры\n"
                          "- [Три](infra/prod.md) - в подпапке\n",
             "feedback_ask_dont_guess.md": "факт\n",
-            "project-vpscan-2026.md": "факт\n",
+            "project-scanner-2026.md": "факт\n",
             "infra/prod.md": "факт\n",
         })
         code, output = self.run_linter()
@@ -4052,7 +4052,7 @@ class WikiLinksBetweenFacts(MemoryFixture):
         self.assertNotIn("feedback_rule]]", output)
 
     def test_prose_in_double_brackets_is_not_a_link(self):
-        """«[[в /ideas]]» - это проза, а не ссылка: имя памяти без пробелов."""
+        """«[[владелец проекта]]» - это проза, а не ссылка: имя памяти без пробелов."""
         self.write({
             "MEMORY.md": self.INDEX,
             "user.md": "решение принимает [[владелец проекта]]\n",
