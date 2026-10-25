@@ -133,10 +133,17 @@ EXIT_USAGE = 2
 
 
 def force_utf8_output():
-    """Иначе на Windows русские сообщения уезжают в кодировку консоли."""
+    """Иначе на Windows русские сообщения уезжают в кодировку консоли.
+
+    `errors="backslashreplace"` обязателен, а не украшение: `reconfigure`
+    с одним `encoding=` режим ошибок не трогает, и остаётся `strict`. Имя с
+    байтом вне UTF-8 приходит в строку через `surrogateescape` (Linux), и
+    печать такого имени в `strict` падает `UnicodeEncodeError` - агент
+    получил бы трейсбек и exit 1 вместо находки.
+    """
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8")
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
         except Exception:
             pass  # поток без reconfigure или уже отсоединённый - не повод падать
 
@@ -571,33 +578,48 @@ MEMORY_FIELD = re.compile(r"^(name|description)\s*:\s*\S", re.I)
 
 
 def looks_like_memory_file(path):
-    """Файл несёт шапку формата памяти."""
+    """Файл несёт шапку формата памяти.
+
+    `None` - файл не открылся: решить, память ли это, не удалось, и
+    вызывающий обязан сказать об этом вслух. Раньше отказ превращался в
+    `False`, нечитаемый `.md` пропадал из выдачи молча, и прогон отвечал
+    «Индекс не найден» с кодом 2 - будто путь указан неверно.
+    """
     try:
         head, _unclosed = frontmatter_lines(read_text(path))
     except OSError:
-        return False
+        return None
     return any(MEMORY_FIELD.match(line) for line in head)
 
 
 def memory_files_without_index(exact, index_name):
     """Файлы памяти в папке, где корневого индекса не нашлось.
 
-    Пусто - папка памятью не является: код 2 и совет проверить путь.
-    Непусто - память есть, а входа в неё нет: агент не увидит ни одного
-    файла, и это нарушение, а не невыполнимая проверка.
+    Возвращает (файлы памяти, нечитаемые). Нечитаемые - отдельным списком,
+    а не молча мимо: проверяющий не знает, память ли это, и обязан сказать
+    об этом, а не подменить ответом «проверьте путь».
+
+    Пустой первый список и пустой второй - папка памятью не является: код 2
+    и совет проверить путь. Непустой первый - память есть, а входа в неё
+    нет: агент не увидит ни одного файла, и это нарушение, а не
+    невыполнимая проверка.
 
     Читает файлы только в этой ветке, то есть когда корневого индекса уже
     нет. На горячий путь ничего не добавляется.
     """
     found = []
+    unreadable = []
     for rel in sorted(exact):
         if not rel.lower().endswith(".md"):
             continue
         if os.path.basename(rel) == index_name:
             continue
-        if looks_like_memory_file(exact[rel]):
+        verdict = looks_like_memory_file(exact[rel])
+        if verdict is None:
+            unreadable.append(rel)
+        elif verdict:
             found.append(rel)
-    return found
+    return found, unreadable
 
 
 def find_indexes(exact, index_name):
@@ -843,15 +865,19 @@ _LINE_BREAKS = frozenset(
 
 
 def closed_segment(path):
-    """Закрытый сегмент в пути (по любому разделителю), или None.
+    """Закрытый сегмент в значении (по любому разделителю), или None.
 
-    Для `--index`: его значение - адрес ВНУТРИ памяти (как `infra/MEMORY.md`),
-    поэтому закрытый каталог в нём - имя памяти, и проверяется весь путь.
-    Имя САМОЙ папки памяти так не проверяется - там только basename (сегменты
-    выше это раскладка машины, `~/.claude/...` и `/home/aux/memory`).
+    Для `--index`: значение - ИМЯ файла индекса, а не путь (`infra/MEMORY.md`
+    отвергается ниже, «принимается имя»). Проверяется всё значение, а не
+    только имя: закрытый сегмент в любом куске - более специфичный отказ
+    («закрыто»), и он называется первым. Сегмент проверяется по СТЕМУ, как
+    L6: `aux.md` закрыто наравне с `aux`, иначе расширение прятало причину
+    за «а не путь». Имя САМОЙ папки памяти так не проверяется - там только
+    basename (сегменты выше это раскладка машины, `~/.claude/...` и
+    `/home/aux/memory`).
     """
     for part in path.replace("\\", "/").split("/"):
-        if part and is_closed_name(part):
+        if part and is_closed_name(os.path.splitext(part)[0]):
             return part
     return None
 
@@ -915,8 +941,13 @@ def badly_named_files(exact, index_name, allow_globs=()):
             if where in seen_dirs:
                 continue
             seen_dirs.add(where)
-            if not MEMORY_FILE_NAME.match(folder) or is_closed_name(folder):
-                found.append((where, folder, "каталога"))
+            # Каталог проверяется по СТЕМУ, как файл ниже: `claude.md` -
+            # то же закрытое имя, что `claude`, и полное имя прятало
+            # закрытость за формой слага (точка), а задание агенту называло
+            # не ту причину.
+            folder_stem = os.path.splitext(folder)[0]
+            if not MEMORY_FILE_NAME.match(folder_stem) or is_closed_name(folder_stem):
+                found.append((where, folder_stem, "каталога"))
         base = parts[-1]
         if base == index_name:
             continue
@@ -1174,7 +1205,7 @@ def mentioned_in_raw_text(index_texts, *names):
                for text in index_texts.values() for pattern in patterns)
 
 
-def check_files_alone(exact, index_name, cache, allow_globs,
+def check_files_alone(exact, index_name, cache, allow_globs, folder,
                       errors, warnings, notices):
     """L4, L5 и L6: всё, что проверяется по файлам, без участия индекса.
 
@@ -1193,7 +1224,7 @@ def check_files_alone(exact, index_name, cache, allow_globs,
         errors.append(
             "L5 %s: в шапке `name: %s`, а файл называется `%s`. Имя у памяти "
             "одно - имя её файла; приведите поле к нему: `name: %s`"
-            % (rel, declared, expected, expected))
+            % (with_folder_prefix(rel, folder), declared, expected, expected))
 
     # L6: имя файла памяти - слаг. Ошибка: имя здесь не украшение, а
     # идентификатор, по которому на память ссылаются из индекса и из
@@ -1219,13 +1250,14 @@ def check_files_alone(exact, index_name, cache, allow_globs,
             errors.append(
                 "L6 %s: имя %s `%s` закрыто. Работать с таким именем нельзя: "
                 "%s. Возьмите другое имя и %s%s"
-                % (rel, what, stem, closed_name_reason(stem), links, tail))
+                % (with_folder_prefix(rel, folder), what, stem,
+                   closed_name_reason(stem), links, tail))
             continue
         errors.append(
             "L6 %s: имя %s `%s` не по правилу. Имя в памяти - строчная "
             "латиница, цифры, дефис и подчёркивание, первый символ буква или "
             "цифра. Переименуйте и %s%s"
-            % (rel, what, stem, links, tail))
+            % (with_folder_prefix(rel, folder), what, stem, links, tail))
 
     # L4: ссылка [[имя]] из тела факта ведёт к существующей памяти.
     # Печатаем ВСЕ до одной. Первая редакция резала список на десятой строке,
@@ -1253,13 +1285,14 @@ def check_files_alone(exact, index_name, cache, allow_globs,
                 "L4 %s:%d ссылка [[%s]] никуда не ведёт. Похоже, имелся в виду "
                 "%s: исправьте ссылку на [[%s]] либо переименуйте тот файл в "
                 "`%s.md`"
-                % (rel, lineno, target, guess, os.path.splitext(guess)[0],
-                   target))
+                % (with_folder_prefix(rel, folder), lineno, target,
+                   with_folder_prefix(guess, folder),
+                   os.path.splitext(guess)[0], target))
         else:
             warnings.append(
                 "L4 %s:%d ссылка [[%s]] никуда не ведёт: файла `%s.md` в памяти "
                 "нет. Поправьте имя в ссылке или заведите такой файл"
-                % (rel, lineno, target, target))
+                % (with_folder_prefix(rel, folder), lineno, target, target))
 
     # Файлы, которые не открылись. По ним не проверены ни L4, ни L5, ни
     # намеренность сиротства - значит проверка выполнена не до конца, и это
@@ -1275,7 +1308,7 @@ def check_files_alone(exact, index_name, cache, allow_globs,
             "%s: файл не читается - ни связи [[...]], ни поле `name` в нём не "
             "проверены. Проверьте, что файл на месте и доступен: закройте "
             "редактор, снимите блокировку или почините ссылку"
-            % rel)
+            % with_folder_prefix(rel, folder))
 
 
 def escaped_findings(errors, notices, warnings):
@@ -1291,7 +1324,7 @@ def escaped_findings(errors, notices, warnings):
             [printable_name(line) for line in warnings])
 
 
-def check(root, index_paths, allow_globs, index_name, file_map):
+def check(root, index_paths, allow_globs, index_name, file_map, folder):
     """Возвращает (ошибки, структурные заметки, советы, строк, непроверяемо).
 
     Заметка структурная, если часть проверки не выполнилась: незакрытый блок
@@ -1339,14 +1372,16 @@ def check(root, index_paths, allow_globs, index_name, file_map):
         # другое - кусок памяти, которого проверка не видела.
         notices.append("%s: в проверку не попало - содержимое отсюда не "
                        "прочитано, о забытых в индексе файлах судить нельзя"
-                       % (relative_to_root(root, where) or where))
+                       % with_folder_prefix(relative_to_root(root, where) or where,
+                                            folder))
 
     # Связанные каталоги пропускаются намеренно (чужая память), но человек по
     # выводу не отличит «проверено и чисто» от «сюда даже не заходили».
     for where in linked_dirs:
         notices.append("%s: связанный каталог (симлинк или junction) - пропущен, "
                        "его содержимое не проверялось"
-                       % (relative_to_root(root, where) or where))
+                       % with_folder_prefix(relative_to_root(root, where) or where,
+                                            folder))
 
     index_rels = {relative_to_root(root, p) for p in index_paths}
     # Корневой индекс ОДИН: файл с заданным именем в самой папке памяти.
@@ -1369,7 +1404,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             "корневой индекс один (%s), а под-индекс живёт в подпапке под тем "
             "же именем (например infra/%s). Строки этого файла не разбираются, "
             "и то, на что он ссылается, будет считаться сиротами"
-            % (stray, index_name, index_name)
+            % (with_folder_prefix(stray, folder), index_name, index_name)
         )
 
     # L1: каждая ссылка из индекса ведёт на существующий файл.
@@ -1378,7 +1413,9 @@ def check(root, index_paths, allow_globs, index_name, file_map):
         try:
             index_rows, unclosed, lost_rows = parse_index(index_path)
         except OSError as exc:
-            notices.append("%s: файл не читается (%s)" % (where, exc.strerror or exc))
+            notices.append("%s: файл не читается (%s)"
+                           % (with_folder_prefix(where, folder),
+                              exc.strerror or exc))
             unreadable.append(where)
             continue
         if unclosed:
@@ -1388,7 +1425,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                     if lost_rows else "")
             notices.append(
                 "%s: %s не закрыт до конца файла - строки ниже в разбор не попали%s"
-                % (where, unclosed, lost)
+                % (with_folder_prefix(where, folder), unclosed, lost)
             )
             # Часть индекса не прочитана - тот же случай, что нечитаемый индекс.
             # Прежде печаталась заметка, а код оставался нулевым: CI зеленел на
@@ -1410,7 +1447,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                     "L1 %s:%d строка индекса записана через метку «%s». В "
                     "индексе одна форма: `- [Заголовок](имя-файла.md) - крючок`. "
                     "Перепишите строку так, а определение метки уберите"
-                    % (where, lineno, title)
+                    % (with_folder_prefix(where, folder), lineno, title)
                 )
                 continue
             target = raw_target.strip()
@@ -1420,7 +1457,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                 errors.append(
                     "L1 %s:%d строка без адреса: «%s». Допишите путь к файлу в "
                     "круглых скобках: `- [%s](имя-файла.md) - крючок`"
-                    % (where, lineno, title, title))
+                    % (with_folder_prefix(where, folder), lineno, title, title))
                 continue
             # Сначала выясняем, наш ли это адрес вообще, и только потом
             # придираемся к его записи. Порядок был обратным, и обычная
@@ -1445,7 +1482,8 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                 errors.append(
                     "L1 %s:%d адрес записан %s: `%s`. В индексе одна форма - "
                     "голый путь: `- [%s](имя-файла.md) - крючок`"
-                    % (where, lineno, wrong, target, title))
+                    % (with_folder_prefix(where, folder), lineno, wrong,
+                       target, title))
                 continue
 
             # Без unquote: `%20` в адресе нужен был для пробела в пути, а L6
@@ -1461,7 +1499,8 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                     "L1 %s:%d ссылка выходит за папку памяти: %s "
                     "(такой путь разрешается по-разному в зависимости от того, "
                     "откуда открыли файл). Перенесите файл внутрь папки памяти "
-                    "и сошлитесь на него оттуда" % (where, lineno, target)
+                    "и сошлитесь на него оттуда"
+                    % (with_folder_prefix(where, folder), lineno, target)
                 )
                 continue
 
@@ -1482,8 +1521,10 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                     index_links[where].add(actual_rel)
                 row_key = (where, title, actual_rel)
                 if row_key in seen_rows:
-                    warnings.append("L3 %s:%d строка повторяется: «%s» → %s"
-                                    % (where, lineno, title, actual_rel))
+                    warnings.append(
+                        "L3 %s:%d строка повторяется: «%s» → %s"
+                        % (with_folder_prefix(where, folder), lineno, title,
+                           with_folder_prefix(actual_rel, folder)))
                 seen_rows.add(row_key)
 
             if hit is not None:
@@ -1494,23 +1535,35 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             # напечатал, - а читать его будет и человек, и агент, которому
             # эту память чинить.
             if twin is not None:
+                # «На диске» - адрес файла, его открывают; повтор того же пути
+                # после «Приведите ссылку» - литерал для строки индекса, он
+                # отсчитывается от КАТАЛОГА ИНДЕКСА и остаётся голым. От корня
+                # памяти он был бы вредным: под-индекс `sub/MEMORY.md` получал
+                # задание вписать `sub/user.md`, и такая ссылка из `sub/`
+                # вела бы в `sub/sub/user.md`.
                 errors.append(
                     "L1 %s:%d регистр не совпадает: в индексе «%s», на диске «%s» "
                     "(на Windows пройдёт, в CI на Linux упадёт). Приведите ссылку "
                     "к тому, что на диске: `%s`"
-                    % (where, lineno, rel, relative_to_root(root, twin),
-                       relative_to_root(root, twin))
+                    % (with_folder_prefix(where, folder), lineno, rel,
+                       with_folder_prefix(relative_to_root(root, twin), folder),
+                       os.path.relpath(twin, os.path.dirname(index_path))
+                       .replace(os.sep, "/"))
                 )
             elif os.path.isdir(absolute):
                 errors.append(
                     "L1 %s:%d ссылка на каталог, а не на файл: %s. Сошлитесь на "
                     "файл внутри него - например `%s/%s`"
-                    % (where, lineno, target, target.rstrip("/"), index_name))
+                    % (with_folder_prefix(where, folder), lineno,
+                       with_folder_prefix(rel, folder),
+                       target.rstrip("/"), index_name))
             else:
                 errors.append(
                     "L1 %s:%d ссылка в никуда: %s. Создайте этот файл либо "
                     "поправьте путь в строке индекса; если файл больше не нужен "
-                    "- уберите строку" % (where, lineno, target))
+                    "- уберите строку"
+                    % (with_folder_prefix(where, folder), lineno,
+                       with_folder_prefix(rel, folder)))
 
     # Ноль разобранных строк - это «я не понял индекс», а не «память разъехалась».
     # Ошибкой это быть не должно: иначе первый же коммит новой, ещё пустой памяти
@@ -1532,7 +1585,8 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             for where in empty_indexes:
                 notices.append(
                     "%s: ни одной строки формата `- [Заголовок](файл.md) - крючок` "
-                    "- проверьте формат строк индекса" % where
+                    "- проверьте формат строк индекса"
+                    % with_folder_prefix(where, folder)
                 )
 
     # Индекс не прочитан - значит про упоминания сказать НЕЧЕГО, и объявлять
@@ -1546,7 +1600,7 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             "L4, L5 и L6 от индекса не зависят и проверены"
             % len(unreadable)
         )
-        check_files_alone(exact, index_name, cache, allow_globs,
+        check_files_alone(exact, index_name, cache, allow_globs, folder,
                           errors, warnings, notices)
         errors, notices, warnings = escaped_findings(errors, notices, warnings)
         return errors, notices, warnings, row_count, True
@@ -1624,7 +1678,8 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                     notices.append(
                         "%s: под-индекс помечен как намеренно вне индекса, но до "
                         "него неоткуда дойти%s - пометьте скрытое тоже или "
-                        "исключите каталог ключом --allow-orphan" % (rel, tail)
+                        "исключите каталог ключом --allow-orphan"
+                        % (with_folder_prefix(rel, folder), tail)
                     )
                 continue
             # Строка про него в индексе ЕСТЬ - просто её не успели
@@ -1639,16 +1694,22 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                     "попала - там не закрыт %s, и всё ниже проверка не читает. "
                     "Закройте его в %s; пока он открыт, сказать, достижим "
                     "под-индекс или забыт, нельзя%s"
-                    % (rel, cut_at, kind, cut_at, tail))
+                    % (with_folder_prefix(rel, folder),
+                       with_folder_prefix(cut_at, folder), kind,
+                       with_folder_prefix(cut_at, folder), tail))
                 continue
             # Действие называем прямо. Соседнее сообщение - для помеченного
             # под-индекса - его даёт, а эта ветка, которая коммит блокирует,
             # прежде оставляла человека с одним диагнозом.
+            #
+            # `rel` здесь дважды: адресом - с припиской, примером строки
+            # индекса - голым, его впишут в индекс и отсчитают от него.
             errors.append(
                 "L2 %s - под-индекс, до которого неоткуда дойти: от корневого "
-                "индекса (%s) цепочки ссылок на него нет%s. Добавьте в %s "
+                "индекса цепочки ссылок на него нет%s. Добавьте в %s "
                 "строку вида `- [Заголовок](%s) - крючок`"
-                % (rel, index_name, tail, index_name, rel)
+                % (with_folder_prefix(rel, folder), tail,
+                   with_folder_prefix(index_name, folder), rel)
             )
             continue
         if rel in referenced or is_orphan_ok(exact[rel], rel, cache):
@@ -1713,7 +1774,9 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                 "%s: строка про него в %s есть, но в разбор не попала - там не "
                 "закрыт %s, и всё ниже проверка не читает. Закройте его в %s; "
                 "пока он открыт, сказать, упомянут файл или забыт, нельзя"
-                % (rel, cut_at, kind, cut_at))
+                % (with_folder_prefix(rel, folder),
+                   with_folder_prefix(cut_at, folder), kind,
+                   with_folder_prefix(cut_at, folder)))
             continue
         if rel in stranded:
             # Если недостижим не он, а перечисляющий его под-индекс, и
@@ -1728,7 +1791,11 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                     "%s: он перечислен в %s, а строка про сам %s в %s есть, но "
                     "в разбор не попала - там не закрыт %s. Закройте его в %s, "
                     "и станет видно всё, что за ним"
-                    % (rel, stranded[rel], stranded[rel], cut_at, kind, cut_at))
+                    % (with_folder_prefix(rel, folder),
+                       with_folder_prefix(stranded[rel], folder),
+                       with_folder_prefix(stranded[rel], folder),
+                       with_folder_prefix(cut_at, folder), kind,
+                       with_folder_prefix(cut_at, folder)))
                 continue
             # Чинить надо не этот файл, а путь до индекса, который его
             # перечисляет: сам он ни в чём не виноват, и правка его шапки
@@ -1736,10 +1803,12 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             # чинить не то место.
             errors.append(
                 "L2 %s не упомянут ни в одном достижимом индексе: он перечислен "
-                "в %s, а до того от корневого индекса (%s) дойти неоткуда. "
+                "в %s, а до того от корневого индекса дойти неоткуда. "
                 "Добавьте в %s строку `- [Заголовок](%s) - крючок` - тогда "
                 "станут видны и он, и всё, что за ним"
-                % (rel, stranded[rel], index_name, index_name, stranded[rel])
+                % (with_folder_prefix(rel, folder),
+                   with_folder_prefix(stranded[rel], folder),
+                   with_folder_prefix(index_name, folder), stranded[rel])
             )
             continue
         # Ветка «на него ссылается X» ниже от однофамильцев прикрыта, а эта
@@ -1790,7 +1859,10 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                         "виду в %s - совпало голое имя файла, а файлов с таким "
                         "именем несколько (%d). Индексом считается файл с именем "
                         "%s - переименуйте нужный так или задайте своё имя ключом "
-                        "--index%s" % (rel, source, namesakes, index_name, head_note)
+                        "--index%s"
+                        % (with_folder_prefix(rel, folder),
+                           with_folder_prefix(source, folder), namesakes,
+                           index_name, head_note)
                     )
                 else:
                     # «Переименуйте его так» на файле в КОРНЕ невыполнимо:
@@ -1804,7 +1876,9 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                         "с именем %s - перенесите список в подпапку под этим именем "
                         "(например infra/%s) и сошлитесь на неё из корневого, либо "
                         "задайте своё имя ключом --index%s"
-                        % (rel, source, index_name, index_name, head_note)
+                        % (with_folder_prefix(rel, folder),
+                           with_folder_prefix(source, folder), index_name,
+                           index_name, head_note)
                     )
                 continue
         # Самая частая находка - и до сих пор единственная без действия.
@@ -1818,16 +1892,19 @@ def check(root, index_paths, allow_globs, index_name, file_map):
             "L2 %s не упомянут ни в одном индексе - агент его не увидит%s%s. "
             "Добавьте в %s строку `- [Заголовок](%s) - крючок`; если файл вне "
             "индекса намеренно - `orphan: true` в его шапку"
-            % (rel, hint, head_note, index_name, rel))
+            % (with_folder_prefix(rel, folder), hint, head_note,
+               with_folder_prefix(index_name, folder), rel))
 
     # L3: одинаковый заголовок у разных файлов - предупреждение, не ошибка.
     # Индекс намеренно не уникальный ключ, поэтому это сигнал, а не запрет.
     for title, paths in sorted(titles.items()):
         if len(paths) > 1:
-            warnings.append("L3 заголовок «%s» ведёт на разные файлы: %s"
-                            % (title, ", ".join(sorted(paths))))
+            warnings.append(
+                "L3 заголовок «%s» ведёт на разные файлы: %s"
+                % (title, ", ".join(with_folder_prefix(path, folder)
+                                    for path in sorted(paths))))
 
-    check_files_alone(exact, index_name, cache, allow_globs,
+    check_files_alone(exact, index_name, cache, allow_globs, folder,
                       errors, warnings, notices)
 
     errors, notices, warnings = escaped_findings(errors, notices, warnings)
@@ -1837,12 +1914,32 @@ def check(root, index_paths, allow_globs, index_name, file_map):
                  or cache.get(UNREADABLE_KEY)))
 
 
+class _Parser(argparse.ArgumentParser):
+    r"""Парсер, чьи отказы не рвут строку именем из аргумента.
+
+    Стандартный `error` печатает аргументы сырыми: `error: unrecognized
+    arguments: foo\nbar.md` уходил в stderr двумя строками - до `try` и до
+    `escaped_findings`, то есть мимо обоих держателей инварианта «ни одна
+    строка вывода не рвётся». Правка ровно одна: сообщение проходит через
+    `printable_name`. Внешний вид отказа сохранён - argparse, не наш формат.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, "%s: error: %s\n" % (self.prog, printable_name(message)))
+
+
 def build_parser():
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         description="Проверяет, что индекс памяти и файлы памяти не разошлись.",
         epilog="Коды возврата: 0 - порядок, 1 - нарушения L1/L2/L5/L6, "
                "2 - проверку выполнить не удалось.",
     )
+    # `prog` - имя файла, а имя в выводе печатается экранированным. Обе
+    # строки отказа argparse (`usage: ...` и `...: error: ...`) берут его
+    # отсюда, поэтому экранируем один раз на входе - `printable_name`
+    # идемпотентен, и вторая обработка в `error` ничего не удвоит.
+    parser.prog = printable_name(parser.prog)
     parser.add_argument("memory_dir", nargs="?", default="memory",
                         help="папка памяти (по умолчанию: memory)")
     parser.add_argument("--index", default="MEMORY.md", metavar="ИМЯ",
@@ -1857,14 +1954,8 @@ def build_parser():
     return parser
 
 
-# Ведущий адрес строки: «L2 draft.md ...», «L1 MEMORY.md:2 ...», «draft.md: ...».
-# Двоеточие в путь не берём - внутри папки памяти его в именах не бывает, а
-# отделяет оно как раз номер строки.
-LEADING_ADDRESS = re.compile(r"^(L\d )?([^\s:]+)(:\d+)?(:?)(\s|$)")
-
-
-def with_memory_folder(line, folder, known):
-    """Дописывает папку памяти к ведущему адресу строки.
+def with_folder_prefix(rel, folder):
+    """Адрес вывода: приписка папки памяти, если она уместна.
 
     Пути внутри проверки отсчитываются от папки памяти, а читают вывод из
     того каталога, откуда её запустили: строка «L2 draft.md» указывает на
@@ -1872,20 +1963,29 @@ def with_memory_folder(line, folder, known):
     такой строке не прыгнет ни редактор, ни grep, а агент, получивший вывод
     как задание, не найдёт файл с первой попытки.
 
-    Правится ТОЛЬКО ведущий адрес и только если он совпал с реально
-    существующим путём. Ссылки внутри сообщений - «Добавьте строку
-    `- [Заголовок](draft.md)`» - обязаны остаться как есть: они пишутся в
-    индекс и отсчитываются от него, а не от текущего каталога. Разбор по
-    началу строки к ним физически не подступается.
+    Место сборки адреса с припиской - единственное, и потому оно вызывается
+    на месте сборки каждого сообщения, а не разбором готовой строки. Полный
+    путь «Индекс не найден: <папка>/<имя>» в ранних отказах собирает себя
+    сам: это не адрес файла в памяти, а путь к несуществующему индексу от
+    каталога запуска. Разбор строки по ведущему токену не отличал адрес от слова фразы
+    («Индекс пуст» при файле `Индекс` в дереве приписывал папку к прозе) и
+    не доставал до адресов из середины фразы («Похоже, имелся в виду X»).
+    Здесь разбирать нечего: приходит путь, уходит адрес.
+
+    В сообщение НЕ через эту функцию попадают имена и примеры строк индекса
+    - «Добавьте строку `- [Заголовок](draft.md)`», `[[имя]]`, поле `name`:
+    они пишутся в индекс или читаются как имя, отсчитываются от индекса и
+    остаются голыми. Адрес - то, что из каталога запуска открывают.
+
+    Абсолютный путь не приписываем - папка уже в нём самом. Обе части идут
+    через `printable_name`: имя папки с символом разрыва законно на Linux
+    (правило слага на имя папки не распространяется), и сырое имя рвало бы
+    каждую строку с припиской надвое. Повторный проход `escaped_findings`
+    по всей строке безопасен: `printable_name` идемпотентен.
     """
-    if not folder:
-        return line
-    match = LEADING_ADDRESS.match(line)
-    if not match or match.group(2) not in known:
-        return line
-    code, path, lineno, colon, tail = match.groups()
-    return "%s%s/%s%s%s%s%s" % (code or "", folder, path, lineno or "",
-                                colon, tail, line[match.end():])
+    if not folder or os.path.isabs(rel):
+        return printable_name(rel)
+    return "%s/%s" % (printable_name(folder), printable_name(rel))
 
 
 def display_folder(memory_dir):
@@ -1911,6 +2011,10 @@ def display_folder(memory_dir):
 def main(argv=None):
     force_utf8_output()
     args = build_parser().parse_args(argv)
+    # Папка памяти нужна и ранним отказам: их адреса вшиты в середину фраз.
+    # Считаем раньше, чтобы каждое сообщение печатало адрес, по которому файл
+    # находится из каталога запуска, - а не голое имя.
+    folder = display_folder(args.memory_dir)
 
     try:
         # abspath внутри перехвата намеренно: на Linux он зовёт getcwd(), а тот
@@ -1918,7 +2022,8 @@ def main(argv=None):
         # то есть "у вас разъехалась память" вместо "проверка не выполнилась".
         root = os.path.abspath(args.memory_dir)
         if not os.path.isdir(root):
-            print("Папка памяти не найдена: %s" % args.memory_dir, file=sys.stderr)
+            print("Папка памяти не найдена: %s" % printable_name(args.memory_dir),
+                  file=sys.stderr)
             return EXIT_USAGE
 
         # Имя, а не шаблон. Прежняя форма ключа принимала глоб, и из него
@@ -1927,7 +2032,8 @@ def main(argv=None):
         # вслух: тихо «почти работающий» ключ хуже отказа.
         if any(ch in args.index for ch in "*?["):
             print("Ключ --index принимает ИМЯ файла индекса, а не шаблон: %s. "
-                  "Например: --index MEMORY.md" % args.index, file=sys.stderr)
+                  "Например: --index MEMORY.md" % printable_name(args.index),
+                  file=sys.stderr)
             return EXIT_USAGE
 
         # Имя индекса правило имени не проверяет (оно задаётся отдельно и
@@ -1940,10 +2046,30 @@ def main(argv=None):
         index_stem = os.path.splitext(args.index)[0]
         index_closed = closed_segment(index_stem)
         if index_closed:
+            # Причина - по СТЕМУ сегмента, не по его сырой форме:
+            # `closed_segment` возвращает `claude.md` как есть, а
+            # `closed_name_reason` для полного имени дал бы чужую (DOS)
+            # причину. Одно-компонентные значения спасал предварительный
+            # `splitext`, многосегментные с точкой в среднем сегменте - нет.
             print("Ключ --index называет закрытое имя: %s. Такое имя не годится: "
                   "%s; возьмите другое, например MEMORY.md"
                   % (printable_name(args.index),
-                     closed_name_reason(index_closed)),
+                     closed_name_reason(os.path.splitext(index_closed)[0])),
+                  file=sys.stderr)
+            return EXIT_USAGE
+
+        # Имя, а не путь. Путь-значение (`infra/MEMORY.md`) до правки не
+        # находило ничего: `find_indexes` сравнивает по basename, и человек
+        # получал ложное блокирующее «корневой индекс пропал» при файле,
+        # который лежит на месте. Под-индексу путь и не нужен: он живёт в
+        # подпапке под ТЕМ ЖЕ именем - `--index MEMORY.md` находит и
+        # `infra/MEMORY.md`. Закрытый сегмент проверен выше: его причина
+        # специфичнее и называется первой.
+        if "/" in args.index or "\\" in args.index:
+            print("Ключ --index принимает ИМЯ файла индекса, а не путь: %s. "
+                  "Корневой лежит в самой папке памяти, под-индекс - в "
+                  "подпапке под тем же именем. Например: --index MEMORY.md"
+                  % printable_name(args.index),
                   file=sys.stderr)
             return EXIT_USAGE
 
@@ -1953,11 +2079,16 @@ def main(argv=None):
         # сегменты выше - раскладка машины (`/home/aux/memory`, `~/.claude/...`),
         # и отказ по ним был бы ложным (замер: `aux` - обычное имя каталога).
         root_name = os.path.basename(os.path.normpath(args.memory_dir))
-        if is_closed_name(root_name):
+        # `is_closed_name` принимает СТЕМ: `claude.md` - то же закрытое имя,
+        # что `claude`. Ветка `--index` расширение снимает, а имя папки уходило
+        # в проверку целиком, и `con.md`/`claude.md`/`nul.md` закрытыми не
+        # считались - обход того же класса с той же причиной.
+        root_stem = os.path.splitext(root_name)[0]
+        if is_closed_name(root_stem):
             print("Папка памяти названа закрытым именем: %s. Такое имя не "
                   "годится: %s; переименуйте папку"
                   % (printable_name(root_name),
-                     closed_name_reason(root_name)),
+                     closed_name_reason(root_stem)),
                   file=sys.stderr)
             return EXIT_USAGE
 
@@ -1979,39 +2110,78 @@ def main(argv=None):
         # проходил молча, а забытый черновик рядом - блокировался. Градиент
         # был обратный ущербу.
         if not any(os.path.dirname(p) == root for p in index_paths):
-            orphaned = memory_files_without_index(file_map[0], args.index)
+            # Имя сравнивается точно - и здесь же точность ломала вход:
+            # `--index memory.md` при файле `MEMORY.md` находило ничего, и
+            # человек получал блокирующее «корневой индекс пропал» при
+            # индексе, который лежит на месте. Регистровый двойник в корне -
+            # это не пропажа, а имя в другом регистре: код 2 и то, что лежит
+            # на деле. Глубже не смотрим: под-индекс - это отдельная память,
+            # и её регистр к имени корневого не относится.
+            for rel in sorted(file_map[0]):
+                if "/" in rel:
+                    continue
+                if rel != args.index and rel.casefold() == args.index.casefold():
+                    print("Ключ --index называет %s, а в корне памяти лежит "
+                          "%s: имя индекса сравнивается точно и файл не "
+                          "нашёлся. На Windows оба имени - один файл, в CI на "
+                          "Linux - два разных. Укажите имя как лежит: --index "
+                          "%s" % (printable_name(args.index),
+                                  printable_name(rel), printable_name(rel)),
+                          file=sys.stderr)
+                    return EXIT_USAGE
+            orphaned, unreadable_orphans = memory_files_without_index(
+                file_map[0], args.index)
             if orphaned:
-                shown = ", ".join(orphaned[:5])
+                shown = ", ".join(with_folder_prefix(rel, folder)
+                                  for rel in orphaned[:5])
                 more = " и ещё %d" % (len(orphaned) - 5) if len(orphaned) > 5 else ""
                 print("L2 корневой индекс %s пропал из папки памяти, а файлов "
                       "памяти в ней %s: агент не увидит ни одного (%s%s). "
                       "Если вы указали папку, внутри которой лежит НЕСКОЛЬКО "
                       "памятей, проверяйте каждую отдельно"
-                      % (args.index, files_count(len(orphaned)), shown, more))
+                      % (printable_name(args.index),
+                         files_count(len(orphaned)), shown, more))
+                for rel in sorted(unreadable_orphans):
+                    print("%s: файл не читается - проверить его не удалось. "
+                          "Проверьте, что файл на месте и доступен: закройте "
+                          "редактор, снимите блокировку или почините ссылку"
+                          % with_folder_prefix(rel, folder))
                 print("\nНарушений: 1 (строк в индексе: 0)")
                 return EXIT_VIOLATION
             if index_paths:
-                where = ", ".join(sorted(relative_to_root(root, p) or p
-                                         for p in index_paths))
+                where = ", ".join(sorted(with_folder_prefix(
+                    relative_to_root(root, p) or p, folder)
+                    for p in index_paths))
                 print("Корневой индекс не найден: %s нет в самой папке %s "
                       "(с этим именем нашлось только глубже: %s). Либо указана "
                       "не та папка, либо корневой индекс назван иначе"
-                      % (args.index, args.memory_dir, where), file=sys.stderr)
+                      % (printable_name(args.index),
+                         printable_name(args.memory_dir), where),
+                      file=sys.stderr)
             else:
                 # Прямой слэш, как и все остальные пути в выводе: на Windows
                 # os.path.join дал бы «memory\MEMORY.md» - единственный путь
                 # в другую сторону, и по нему видно, что строку собирали
                 # отдельно от прочих.
                 print("Индекс не найден: %s/%s"
-                      % (args.memory_dir.replace(os.sep, "/").rstrip("/"),
-                         args.index), file=sys.stderr)
+                      % (printable_name(args.memory_dir.replace(os.sep, "/").rstrip("/")),
+                         printable_name(args.index)), file=sys.stderr)
+            for rel in sorted(unreadable_orphans):
+                print("%s: файл не читается - проверить его не удалось. "
+                      "Проверьте, что файл на месте и доступен: закройте "
+                      "редактор, снимите блокировку или почините ссылку"
+                      % with_folder_prefix(rel, folder))
             return EXIT_USAGE
 
         errors, notices, warnings, row_count, unverifiable = check(
-            root, index_paths, args.allow_orphan, args.index, file_map)
+            root, index_paths, args.allow_orphan, args.index, file_map, folder)
     except Exception as exc:  # проверка сломалась - это не нарушение памяти
+        # Сообщение исключения несёт имена файлов, и печатать его сырым -
+        # та же дыра, что и в ранних отказах: `ValueError` с именем,
+        # содержащим символ разрыва, рвал бы строку надвое. `OSError`
+        # экранирует имя через `repr` сам, но класс исключений шире.
         print("Проверку выполнить не удалось: %s: %s"
-              % (type(exc).__name__, exc), file=sys.stderr)
+              % (type(exc).__name__, printable_name(str(exc))), file=sys.stderr)
         return EXIT_USAGE
 
     # Предупреждения первыми: они объясняют, откуда взялись ошибки, и под
@@ -2030,28 +2200,8 @@ def main(argv=None):
     # том, чтобы посмотреть и сказать, что не так.
     #
     # Заметки печатались всегда и раньше: они говорят, что часть проверки не
-    # выполнилась.
-    # Адреса в выводе дописываем папкой памяти - см. with_memory_folder.
-    # Список известных путей берём из карты файлов: приписка ставится только
-    # там, где ведущий токен и правда путь, а не начало фразы.
-    folder = display_folder(args.memory_dir)
-    # Каталоги тоже адреса. Прежде список знал только файлы, и обе каталожные
-    # заметки («связанный каталог пропущен», «каталог не читается») выходили
-    # без приписки - с путём, по которому из корня репозитория ничего нет.
-    # Ровно та беда, ради которой приписка и написана.
-    known = set(file_map[0])
-    for rel in list(known):
-        parts = rel.split("/")
-        for depth in range(1, len(parts)):
-            known.add("/".join(parts[:depth]))
-    for where in list(file_map[2]) + list(file_map[3]):
-        rel = relative_to_root(root, where)
-        if rel:
-            known.add(rel)
-    notices = [with_memory_folder(line, folder, known) for line in notices]
-    warnings = [with_memory_folder(line, folder, known) for line in warnings]
-    errors = [with_memory_folder(line, folder, known) for line in errors]
-
+    # выполнилась. Адреса приписаны на месте сборки сообщений - см.
+    # with_folder_prefix.
     for line in notices:
         print(line)
     for line in warnings:

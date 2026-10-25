@@ -171,9 +171,10 @@ MUTATIONS = [
      '            "L2 %s не упомянут ни в одном индексе - агент его не увидит%s%s. "\n'
      '            "Добавьте в %s строку `- [Заголовок](%s) - крючок`; если файл вне "\n'
      '            "индекса намеренно - `orphan: true` в его шапку"\n'
-     "            % (rel, hint, head_note, index_name, rel))",
+     "            % (with_folder_prefix(rel, folder), hint, head_note,\n"
+     "               with_folder_prefix(index_name, folder), rel))",
      '            "L2 %s не упомянут ни в одном индексе - агент его не увидит%s%s"\n'
-     "            % (rel, hint, head_note))"),
+     "            % (with_folder_prefix(rel, folder), hint, head_note))"),
     ("файл из недочитанного индекса снова объявляют забытым", LINTER,
      "        cut_at = behind_unclosed(rel)\n        if cut_at:",
      "        cut_at = None\n        if cut_at:"),
@@ -182,21 +183,36 @@ MUTATIONS = [
      "                                      rel, unique)),",
      "             if True),"),
     ("сироту за недостижимым индексом шлют чинить не туда", LINTER,
-     "                % (rel, stranded[rel], index_name, index_name, stranded[rel])",
-     "                % (rel, stranded[rel], index_name, index_name, rel)"),
+     "                % (with_folder_prefix(rel, folder),\n"
+     "                   with_folder_prefix(stranded[rel], folder),\n"
+     "                   with_folder_prefix(index_name, folder), stranded[rel])",
+     "                % (with_folder_prefix(rel, folder),\n"
+     "                   with_folder_prefix(stranded[rel], folder),\n"
+     "                   with_folder_prefix(index_name, folder), rel)"),
 
     ("адреса в выводе снова не дописываются папкой памяти", LINTER,
-     "    errors = [with_memory_folder(line, folder, known) for line in errors]",
-     "    errors = list(errors)"),
-    ("приписка ставится и там, где ведущий токен не путь", LINTER,
-     "    if not match or match.group(2) not in known:\n        return line",
-     "    if not match:\n        return line"),
+     "    return \"%s/%s\" % (printable_name(folder), printable_name(rel))",
+     "    return printable_name(rel)"),
+    ("папка в адресе снова без экранирования", LINTER,
+     "    return \"%s/%s\" % (printable_name(folder), printable_name(rel))",
+     "    return \"%s/%s\" % (folder, printable_name(rel))"),
+    ("адрес из середины фразы снова без приписки", LINTER,
+     "                   with_folder_prefix(guess, folder),",
+     "                   guess,"),
+    ("слову фразы снова приписывают папку памяти", LINTER,
+     "                \"Индекс пуст: строк формата `- [Заголовок](файл.md) - крючок` в нём нет. \"\n"
+     "                \"Для новой памяти это нормально\"",
+     "                \"%s/Индекс пуст: строк формата `- [Заголовок](файл.md) - крючок` в нём нет. \"\n"
+     "                \"Для новой памяти это нормально\" % folder"),
+    ("абсолютному пути снова приписывают папку", LINTER,
+     "    if not folder or os.path.isabs(rel):",
+     "    if not folder:"),
 
     # --- L4: ссылки [[...]] между фактами ---
     ("битые ссылки [[...]] не сообщаются", LINTER,
      "    dangling = dangling_wiki_links(exact, cache, allow_globs)", "    dangling = []"),
     ("имена каталогов правилу не подчиняются", LINTER,
-     "            if not MEMORY_FILE_NAME.match(folder) or is_closed_name(folder):",
+     "            if not MEMORY_FILE_NAME.match(folder_stem) or is_closed_name(folder_stem):",
      "            if False:"),
     ("плохой каталог называется на каждом файле внутри", LINTER,
      "            if where in seen_dirs:\n                continue",
@@ -208,8 +224,8 @@ MUTATIONS = [
      "    low = closed_stem(stem)\n    return low == \"claude\" or low in DOS_RESERVED_NAMES",
      "    return False"),
     ("закрытое имя каталога снова проходит правило", LINTER,
-     "            if not MEMORY_FILE_NAME.match(folder) or is_closed_name(folder):",
-     "            if not MEMORY_FILE_NAME.match(folder):"),
+     "            if not MEMORY_FILE_NAME.match(folder_stem) or is_closed_name(folder_stem):",
+     "            if not MEMORY_FILE_NAME.match(folder_stem):"),
     ("закрытое имя файла снова проходит правило", LINTER,
      "        if not MEMORY_FILE_NAME.match(stem) or is_closed_name(stem):",
      "        if not MEMORY_FILE_NAME.match(stem):"),
@@ -231,7 +247,7 @@ MUTATIONS = [
      "                 else \"поправьте ссылки (в индексе и в [[связях]])\")",
      "        links = \"поправьте ссылки (в индексе и в [[связях]])\""),
     ("закрытое имя папки памяти снова проходит", LINTER,
-     "        if is_closed_name(root_name):\n", "        if False:\n"),
+     "        if is_closed_name(root_stem):\n", "        if False:\n"),
     ("закрытый сегмент в пути индекса снова проходит", LINTER,
      "        index_closed = closed_segment(index_stem)\n",
      "        index_closed = None\n"),
@@ -292,27 +308,32 @@ MUTATIONS = [
      '                errors.append(\n'
      '                    "L1 %s:%d строка без адреса: «%s». Допишите путь к файлу в "\n'
      '                    "круглых скобках: `- [%s](имя-файла.md) - крючок`"\n'
-     "                    % (where, lineno, title, title))",
+     "                    % (with_folder_prefix(where, folder), lineno, title, title))",
      "                pass"),
     ("сообщения L1 снова без действия", LINTER,
      '                    "L1 %s:%d ссылка в никуда: %s. Создайте этот файл либо "\n'
      '                    "поправьте путь в строке индекса; если файл больше не нужен "\n'
-     '                    "- уберите строку" % (where, lineno, target))',
-     '                    "L1 %s:%d ссылка в никуда: %s" % (where, lineno, target))'),
+     '                    "- уберите строку"\n'
+     "                    % (with_folder_prefix(where, folder), lineno,\n"
+     "                       with_folder_prefix(rel, folder)))",
+     '                    "L1 %s:%d ссылка в никуда: %s"\n'
+     "                    % (with_folder_prefix(where, folder), lineno,\n"
+     "                       with_folder_prefix(rel, folder)))"),
     # Обе мутации прежде вклеивали `pass or errors.append(...)`. `pass` -
     # оператор, а не выражение, поэтому мутант не компилировался: тестовый
     # файл импортирует линтер на уровне модуля, загрузка падала, unittest
     # отдавал ненулевой код, и инструмент печатал «поймана», не запустив ни
     # одного теста. Три года такой отчётности стоят ровно ничего.
     ("расхождение регистра в ссылке не ошибка", LINTER,
-     "            if twin is not None:\n                errors.append(",
-     "            if False:\n                errors.append("),
+     "            if twin is not None:",
+     "            if False:"),
     ("ссылка за пределы папки памяти не ошибка", LINTER,
      '                errors.append(\n'
      '                    "L1 %s:%d ссылка выходит за папку памяти: %s "\n'
      '                    "(такой путь разрешается по-разному в зависимости от того, "\n'
      '                    "откуда открыли файл). Перенесите файл внутрь папки памяти "\n'
-     '                    "и сошлитесь на него оттуда" % (where, lineno, target)\n'
+     '                    "и сошлитесь на него оттуда"\n'
+     "                    % (with_folder_prefix(where, folder), lineno, target)\n"
      "                )",
      "                pass"),
     ("файл объявляется источником самого себя", LINTER,
@@ -1082,9 +1103,12 @@ def build_parser():
 
 
 def main(argv=None):
+    # errors= обязателен, а не украшение: без него остаётся `strict`, и печать
+    # имени с суррогатом падает UnicodeEncodeError. Та же строка, что в
+    # force_utf8_output линтера, - копии не должны расходиться.
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8")
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
         except Exception:
             pass
 

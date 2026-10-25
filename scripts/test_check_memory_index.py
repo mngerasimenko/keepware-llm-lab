@@ -37,6 +37,7 @@
 сведены к одной, причины перенесены в её докстринг.
 """
 
+import ast
 import hashlib
 import io
 import os
@@ -257,6 +258,24 @@ class IndexLinksToFiles(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
 
+    def test_the_case_fix_is_spelled_from_the_index_not_from_the_memory_root(self):
+        """Литерал в бэктиках вставляют в строку ИНДЕКСА, а не в корень.
+
+        Его отсчитывали от корня памяти: под-индекс `sub/MEMORY.md` получал
+        задание вписать `sub/user.md`, а такая ссылка из `sub/` ведёт в
+        `sub/sub/user.md`. Человек чинил по заданию и ломал дальше - то есть
+        инструмент давал вредную правку, а не просто неточный адрес.
+        """
+        self.write({
+            "MEMORY.md": "- [Под](sub/MEMORY.md) - под-индекс\n",
+            "sub/MEMORY.md": "- [Профиль](User.md) - кто\n",
+            "sub/user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("Приведите ссылку к тому, что на диске: `user.md`", output)
+        self.assertNotIn(": `sub/user.md`", output)
+
     def test_anchor_in_link_is_ignored(self):
         self.write({
             "MEMORY.md": "- [Профиль](user.md#раздел) - кто пользователь\n",
@@ -404,6 +423,11 @@ class IndexLinksToFiles(MemoryFixture):
         Ветка сообщения существовала, но ни один из тестов на неё не попадал:
         мутация «отключить ветку» переживала весь набор. Диагноз «ссылка в
         никуда» вместо «это каталог» отправляет чинить не то.
+
+        Утверждение здесь обязано называть саму ветку: слово «каталог» есть
+        ещё и в итоговом пояснении про L6, и мягкое `assertIn("каталог")`
+        проходило даже тогда, когда ветка была отключена, - мутация снова
+        выжила в мутационной пробе.
         """
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n- [Инфра](infra) - раздел\n",
@@ -413,7 +437,8 @@ class IndexLinksToFiles(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        self.assertIn("каталог", output)
+        self.assertIn("ссылка на каталог, а не на файл", output)
+        self.assertNotIn("ссылка в никуда", output)
 
 
 class MemoryFileNameIsASlug(MemoryFixture):
@@ -664,6 +689,18 @@ class MemoryFileNameIsASlug(MemoryFixture):
         named = {stem for _, stem, kind in found if kind == "файла"}
         self.assertEqual(named, set(dos), found)
 
+    def test_dos_list_edges_are_not_closed(self):
+        """Границы DOS-списка: `com0` и `lpt10` устройствами НЕ являются.
+
+        Список зарезервированных имён конечен (`com1`-`com9`, `lpt1`-`lpt9`),
+        и правило обязано кончаться там же, где кончается система. Тест на
+        `com1`/`com9` этого не показывает: он пройдёт и на реализации, где
+        закрыто ВСЁ, начинающееся с `com` - а такая реализация запретила бы
+        законное имя `com10.md`. Граница зафиксирована с обеих сторон.
+        """
+        for name in ("com0", "com10", "lpt0", "lpt10", "com", "lpt"):
+            self.assertFalse(linter.is_closed_name(name), name)
+
     def test_closed_names_are_recognised_regardless_of_case(self):
         """`Con.md` - то же устройство: NTFS регистр не различает.
 
@@ -727,6 +764,27 @@ class MemoryFileNameIsASlug(MemoryFixture):
         dirs = {name for _, name, kind in found if kind == "каталога"}
         self.assertEqual(dirs, {"claude", "con"}, found)
 
+    def test_a_directory_with_an_extension_still_names_the_closed_reason(self):
+        """Каталог `claude.md/` - закрытое имя, а не «не по правилу».
+
+        Файлы в этом же куске проверяются по стему (`stem = splitext(base)`),
+        а каталоги шли полным именем: точка в имени каталога прятала
+        закрытость за формой слага, и задание агенту называло не ту причину
+        - тот же класс, что и у корневой папки с расширением, только носитель
+        остался.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Прод](claude.md/prod.md) - имя\n",
+            "user.md": "факт\n",
+            "claude.md/prod.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        lines = [line for line in findings(output, "L6") if "каталога" in line]
+        self.assertTrue(lines, output)
+        self.assertIn("закрыто", lines[0], output)
+        self.assertNotIn("не по правилу", lines[0], output)
+
     def test_the_message_for_a_closed_directory_does_not_advise_the_name_field(self):
         """Каталогу не советуют поле `name` и [[связи]]: их у него нет.
 
@@ -773,7 +831,7 @@ class MemoryFileNameIsASlug(MemoryFixture):
         """
         errors, notices, warnings, _rows, _bad = linter.check(
             self.root, ["MEMORY.md"], (), "MEMORY.md",
-            ({"MEMORY.md": "x", "claude\n.md": "x"}, {}, [], []))
+            ({"MEMORY.md": "x", "claude\n.md": "x"}, {}, [], []), "")
         lines = list(errors) + list(notices) + list(warnings)
         self.assertTrue(lines, "ни одной находки - проверять нечего")
         for line in lines:
@@ -787,11 +845,11 @@ class MemoryFileNameIsASlug(MemoryFixture):
         проекта (`output.splitlines()`) делит строку, - и находка с `\\x0b` в
         имени рвалась натрое под собственным разбором инструмента.
         """
-        for ch in ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85",
+        for ch in ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\r", "\t",
                    " ", " "):
             errors, notices, warnings, _rows, _bad = linter.check(
                 self.root, ["MEMORY.md"], (), "MEMORY.md",
-                ({"MEMORY.md": "x", "user%s.md" % ch: "x"}, {}, [], []))
+                ({"MEMORY.md": "x", "user%s.md" % ch: "x"}, {}, [], []), "")
             lines = list(errors) + list(notices) + list(warnings)
             self.assertTrue(lines, repr(ch))
             for line in lines:
@@ -806,6 +864,24 @@ class MemoryFileNameIsASlug(MemoryFixture):
         _code, output = self.run_linter("--index", "claude\n.md")
         self.assertIn("claude\\n", output, output)
         self.assertNotIn("claude\n.md", output, output)
+
+    def test_the_program_name_is_printed_on_one_line_too(self):
+        """В отказе argparse экранируется и `prog` - он тоже имя.
+
+        `message` проходил через `printable_name`, а `prog` - нет, и обе
+        строки отказа (`usage: ...` и `...: error: ...`) рвались именем
+        скрипта с символом разрыва. Отказ argparse уходит `SystemExit` - в
+        отличие от ранних отказов `main`, которые возвращают код.
+        """
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(sys, "argv", ["check\x0bmemory.py"]):
+            with redirect_stdout(out), redirect_stderr(err):
+                with self.assertRaises(SystemExit) as caught:
+                    linter.main(["--not-a-flag"])
+        output = out.getvalue() + err.getvalue()
+        self.assertEqual(caught.exception.code, 2, output)
+        self.assertIn("\\x0b", output, output)
+        self.assertNotIn("\x0b", output, output)
 
     def test_unicode_space_does_not_make_a_name_closed(self):
         """`claude\\u00a0` - не закрытое имя, а имя не по правилу слага.
@@ -852,11 +928,35 @@ class MemoryFileNameIsASlug(MemoryFixture):
         self.assertEqual(code, 2, output)
         self.assertIn("закрыт", output.lower())
 
-    def test_a_closed_segment_in_the_index_path_is_refused(self):
-        """`--index claude/MEMORY.md` - закрытый сегмент в пути индекса.
+    def test_a_closed_memory_folder_name_with_an_extension_is_refused(self):
+        """`claude.md` как имя папки - то же закрытое имя, что `claude`.
 
-        Путь индекса - это адрес ВНУТРИ памяти (как `infra/MEMORY.md`), и
-        закрытый каталог в нём - имя памяти, а не раскладка машины.
+        Контракт `is_closed_name` - СТЕМ, и для `--index` расширение снимают
+        (`splitext`), а имя папки уходило в проверку целиком: `con.md`,
+        `claude.md`, `nul.md` закрытыми не считались, проверка доезжала до
+        конца и на согласованной памяти отвечала нулём. Обход реален на
+        Linux, где такие каталоги существуют; DOS-имя с расширением на
+        Windows создать нельзя, поэтому вход - `claude.md`.
+        """
+        self.write({
+            "claude.md/MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "claude.md/user.md": "факт\n",
+        })
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = linter.main([os.path.join(self.root, "claude.md")])
+        output = out.getvalue() + err.getvalue()
+        self.assertEqual(code, 2, output)
+        self.assertIn("закрыт", output.lower())
+
+    def test_a_closed_segment_in_the_index_path_is_refused(self):
+        """`--index claude/MEMORY.md` - закрытый сегмент в имени с сепаратором.
+
+        Имя может содержать сепаратор (такое имя отвергается ниже как путь),
+        но сегменты его проверяются наравне: закрытый каталог - имя памяти,
+        а не раскладка машины, и причина «закрыто» называется раньше, чем
+        «принимается имя».
         """
         self.write({
             "claude/MEMORY.md": "- [Профиль](user.md) - кто\n",
@@ -865,6 +965,58 @@ class MemoryFileNameIsASlug(MemoryFixture):
         code, output = self.run_linter("--index", "claude/MEMORY.md")
         self.assertEqual(code, 2, output)
         self.assertIn("закрыт", output.lower())
+
+    def test_a_closed_segment_keeps_the_closed_verdict_with_an_extension(self):
+        """`--index "aux.md/x"` - закрытый сегмент, а не просто путь.
+
+        Причина «закрыто» специфичнее и называется первой, но сегмент
+        проверялся целиком, а `is_closed_name` принимает СТЕМ: `aux.md`
+        закрытым не считалось, и человек получал «а не путь» вместо
+        «закрытое имя» - верный по форме, но не по причине: DOS-имя с
+        расширением тот же отказ, что и без него.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter("--index", "aux.md/x")
+        self.assertEqual(code, 2, output)
+        self.assertIn("закрыт", output.lower())
+        self.assertNotIn("а не путь", output)
+
+    def test_the_closed_reason_names_claude_even_with_an_extension(self):
+        """`--index "claude.md/x"` - причина про `claude`, а не про DOS.
+
+        `closed_segment` возвращает сегмент как есть (`claude.md`), а
+        `closed_name_reason` принимает СТЕМ и прямо предупреждает: полное
+        имя дало бы для `claude.md` чужую (DOS) причину. Одно-компонентные
+        значения спасает предварительный `splitext`, многосегментные с
+        точкой в среднем сегменте - нет, и задание агенту называло не тот
+        класс имени.
+        """
+        code, output = self.run_linter("--index", "claude.md/x")
+        self.assertEqual(code, 2, output)
+        self.assertIn("не публикуют", output)
+        self.assertNotIn("DOS", output)
+
+    def test_a_path_valued_index_is_refused_as_a_name(self):
+        """`--index infra/MEMORY.md` - путь, а ключ принимает ИМЯ.
+
+        Файл на месте (`memory/infra/MEMORY.md` существует), и до правки
+        такой прогон давал ложное блокирующее «корневой индекс пропал»:
+        `find_indexes` сравнивает по basename, и путь-значение не совпадает
+        ни с чем. Под-индекс живёт в подпапке под ТЕМ ЖЕ именем
+        (`--index MEMORY.md` находит и `infra/MEMORY.md`), поэтому
+        путь-значение модели не нужно - оно отвергается вслух, как шаблон.
+        """
+        self.write({
+            "infra/MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "infra/user.md": "факт\n",
+        })
+        code, output = self.run_linter("--index", "infra/MEMORY.md")
+        self.assertEqual(code, 2, output)
+        self.assertIn("а не путь", output, output)
+        self.assertNotIn("пропал", output, output)
 
     def test_directory_names_obey_the_rule_too(self):
         """Каталог входит в адрес наравне с именем файла.
@@ -1707,6 +1859,25 @@ class FilesAppearInIndex(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
         self.assertIn("infra/MEMORY.md", output)
+
+    def test_the_root_index_is_named_once_in_the_unreachable_message(self):
+        """Корневой индекс в сообщении называется один раз - адресом.
+
+        «от корневого индекса (MEMORY.md) ... Добавьте в memory/MEMORY.md»
+        называл один файл двумя формами подряд: голым именем в скобках и
+        адресом. Остаётся адрес - он открывается из каталога запуска; имя
+        идёт внутри примера строки индекса, куда его и впишут.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("от корневого индекса (MEMORY.md)", output, output)
+        self.assertIn("от корневого индекса цепочки ссылок", output, output)
 
 
     def test_a_sub_index_behind_an_unclosed_fence_is_named_not_blamed(self):
@@ -3113,6 +3284,25 @@ class RootIndexLost(MemoryFixture):
         self.assertEqual(forgotten_one, 1)
         self.assertEqual(lost_index, 1, output)
 
+    def test_an_index_name_in_another_case_is_a_usage_error(self):
+        """`--index memory.md` при файле `MEMORY.md` - про регистр, не про пропажу.
+
+        Имя индекса сравнивается точно: на Windows сравнение без учёта
+        регистра прошло бы, в CI на Linux набор файлов разъехался бы. Зато
+        человек с именем в другом регистре получал ложное блокирующее
+        «корневой индекс пропал» при памяти, где индекс лежит на месте: хук
+        останавливал коммит, а причина была не в пропаже. Регистровый двойник
+        в корне - это отказ кода 2 с тем, что лежит на деле.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": self.FACT % "user",
+        })
+        code, output = self.run_linter("--index", "memory.md")
+        self.assertEqual(code, 2, output)
+        self.assertNotIn("пропал", output)
+        self.assertIn("MEMORY.md", output)
+
 
 class AddressesAreClickable(MemoryFixture):
     """Адрес в выводе должен указывать туда, откуда проверку запустили.
@@ -3144,7 +3334,7 @@ class AddressesAreClickable(MemoryFixture):
         """
         errors, notices, hints, _rows, _bad = linter.check(
             self.root, ["MEMORY.md"], (), "MEMORY.md",
-            ({"MEMORY.md": "x", "draft\x0b.md": "x"}, {}, [], []))
+            ({"MEMORY.md": "x", "draft\x0b.md": "x"}, {}, [], []), "")
         lines = list(errors) + list(notices) + list(hints)
         self.assertTrue(lines, "ни одной находки - проверять нечего")
         for line in lines:
@@ -3202,6 +3392,86 @@ class AddressesAreClickable(MemoryFixture):
         self.assertIn("%s/chuzhaya" % name, output,
                       "заметка про каталог осталась без приписки папки")
 
+    def test_a_guess_in_the_middle_of_a_phrase_gets_the_prefix(self):
+        """Догадка «имелся в виду X» - адрес из середины фразы.
+
+        Приписка ставилась по началу строки, а догадка стоит после «Похоже,
+        имелся в виду» - по такой строке из каталога запуска файл не найти,
+        то есть ровно то, ради чего приписка написана. Вход класса:
+        [[draft-note]] при файле draft_note.md - `loose` сводит дефис к
+        подчёркиванию, догадка однозначна.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "см. [[draft-note]]\n",
+            "draft_note.md": "черновик\n",
+        })
+        name = os.path.basename(self.root)
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = linter.main([name])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertEqual(code, 1, output)
+        self.assertIn("Похоже, имелся в виду %s/draft_note.md" % name, output)
+
+    def test_title_collisions_list_paths_with_the_prefix(self):
+        """L3 «ведёт на разные файлы: a.md, b.md» - адреса из середины фразы.
+
+        Список идёт после двоеточия, и ни один из путей в нём приписки не
+        получал. Два файла с одним заголовком в индексе - самостоятельный
+        вход того же класса, что и догадка выше: место сборки сообщения
+        другое (L3 в `check`, догадка в `check_files_alone`).
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Профиль](admin.md) - кто\n",
+            "user.md": "факт\n",
+            "admin.md": "факт\n",
+        })
+        name = os.path.basename(self.root)
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            linter.main([name])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertIn("ведёт на разные файлы: %s/admin.md, %s/user.md"
+                      % (name, name), output)
+
+    def test_a_referring_file_name_gets_the_prefix(self):
+        """«На него ссылается X» - третий самостоятельный вход класса.
+
+        Имя источника стоит в середине фразы. Файл-список со своим именем
+        (`spisok.md`) - тот случай, ради которого эта ветка написана: его
+        строки не разбираются как индекс, и подсказка должна указать на
+        него адресом, по которому его можно открыть.
+        """
+        self.write({
+            "MEMORY.md": "пока пусто\n",
+            "spisok.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        name = os.path.basename(self.root)
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = linter.main([name])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertEqual(code, 1, output)
+        self.assertIn("На него ссылается %s/spisok.md" % name, output)
+
     def test_prefix_does_not_touch_lines_that_start_with_a_word(self):
         """Третья сторона: приписка ставится только там, где ведущий токен - путь.
 
@@ -3211,6 +3481,33 @@ class AddressesAreClickable(MemoryFixture):
         собственные сообщения, хуже, чем проверка с неудобными адресами.
         """
         self.write({"MEMORY.md": "Пока пусто, ни одной строки формата\n"})
+        name = os.path.basename(self.root)
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = linter.main([name])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertEqual(code, 0, output)
+        self.assertIn("Индекс пуст", output)
+        self.assertNotIn("%s/Индекс" % name, output)
+
+    def test_phrase_word_does_not_get_the_prefix_when_it_collides(self):
+        """Та же фраза, но слово совпало с реальным файлом - приписки нет.
+
+        Тест выше держит случай «слова нет среди путей». Класс шире: разбор
+        шёл по совпадению с картой файлов, и файл по имени `Индекс` (в обходе
+        он есть, в фактах - нет: не .md) превращал «Индекс пуст» в
+        «memory/Индекс пуст». Проверка, коверкающая собственные сообщения,
+        хуже, чем проверка с неудобными адресами - вот её второй вход.
+        """
+        self.write({
+            "MEMORY.md": "Пока пусто, ни одной строки формата\n",
+            "Индекс": "не файл памяти\n",
+        })
         name = os.path.basename(self.root)
         previous = os.getcwd()
         os.chdir(os.path.dirname(self.root))
@@ -3237,6 +3534,299 @@ class AddressesAreClickable(MemoryFixture):
         self.assertEqual(code, 1, output)
         self.assertIn("L2 draft.md", output)
         self.assertNotIn(self.root, output)
+
+    def test_prefix_joins_the_folder_and_leaves_absolute_paths_bare(self):
+        """Обе ветки хелпера приписки: свойством, а не только в составе вывода.
+
+        Хелпер стал местом, где собирается каждый адрес в выводе, и ветка
+        `printable_name(rel)` (пустая папка либо абсолютный путь) обязана
+        экранировать имя так же, как ветка с припиской, - и не дублировать
+        папку туда, где её нет смысла писать. Пустая папка отдельно от
+        абсолютного пути не держалась ничем.
+        """
+        self.assertEqual(linter.with_folder_prefix("draft.md", "mem"),
+                         "mem/draft.md")
+        self.assertEqual(linter.with_folder_prefix("draft.md", ""),
+                         "draft.md")
+        self.assertEqual(linter.with_folder_prefix("draft\x0b.md", ""),
+                         "draft\\x0b.md")
+        absolute = os.path.abspath("draft.md")
+        self.assertEqual(linter.with_folder_prefix(absolute, "mem"), absolute)
+
+    def test_the_folder_part_is_escaped_inside_the_join(self):
+        """Папка в адресе экранируется так же, как имя файла.
+
+        End-to-end теста на это нет и быть не может: `escaped_findings`
+        прогоняет `printable_name` по всей строке уже после сборки сообщения и
+        компенсирует сырое имя папки в любом случае - замер 25.10: откат
+        `printable_name(folder)` в join не краснит ни один тест, который ходит
+        через `main`. Свойство держит только прямая проверка сборки адреса.
+        """
+        self.assertEqual(linter.with_folder_prefix("draft.md", "mem\x0bory"),
+                         "mem\\x0bory/draft.md")
+
+    def test_escaped_name_still_gets_the_prefix(self):
+        """Приписка доходит и до адреса, чьё имя экранировано в выводе.
+
+        Экранирование (`escaped_findings`) превращает имя с `\\x0b` в
+        литеральное `draft\\x0b.md`, а список известных путей собирался из
+        СЫРЫХ имён. Для такого адреса совпадения не было, и приписка папки
+        не ставилась - то есть ровно тот дефект, ради которого приписка
+        написана: по строке `L6 draft\\x0b.md` из каталога запуска файла не
+        найти. Имя с `\\x0b` законно на Linux, а на Windows такой файл не
+        создать - поэтому карту подделываем, как в тесте выше.
+        """
+        self.write(self.FILES)
+        name = os.path.basename(self.root)
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+        real = linter.build_file_map
+
+        def with_a_bad_name(root, *args, **kwargs):
+            exact, folded, unreadable, linked = real(root, *args, **kwargs)
+            exact = dict(exact)
+            exact["draft\x0b.md"] = os.path.join(root, "draft\x0b.md")
+            return (exact, folded, unreadable, linked)
+
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(linter, "build_file_map",
+                                        with_a_bad_name):
+            with redirect_stdout(out), redirect_stderr(err):
+                code = linter.main([name])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertEqual(code, 1, output)
+        self.assertIn("L6 %s/draft\\x0b.md" % name, output,
+                      "адрес с экранированным именем остался без приписки")
+
+    def test_a_folder_with_a_line_break_does_not_tear_the_line(self):
+        """Папка памяти - часть адреса, и экранируется она так же, как имя файла.
+
+        `with_folder_prefix` собирает адрес и прогоняет обе части через
+        `printable_name`, а `display_folder` отдаёт имя папки сырым. Имя
+        папки с символом разрыва (законно на Linux; правило слага на имя
+        папки не распространяется) без экранирования рвало бы каждую
+        строку с припиской - тот самый инвариант, который держит тест
+        выше. На Windows такую папку не создать, поэтому подделываем
+        `display_folder`.
+        """
+        self.write(self.FILES)
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(linter, "display_folder",
+                                        lambda _dir: "mem\x0bory"):
+            with redirect_stdout(out), redirect_stderr(err):
+                code = linter.main([os.path.basename(self.root)])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertEqual(code, 1, output)
+        self.assertIn("L2 mem\\x0bory/draft.md", output,
+                      "адрес потерял папку вместо того, чтобы получить её "
+                      "экранированной")
+        self.assertNotIn("mem\x0bory", output,
+                         "имя папки ушло в вывод сырым и рвёт строку надвое")
+
+    def test_the_lost_index_message_escapes_the_folder_too(self):
+        """«Пропал» собирает адреса сирот с припиской - и папку экранирует так же.
+
+        E2e-тест выше шёл через L2-строку из `check`, а сообщение о
+        пропавшем корне `main` собирает само: список сирот печатается через
+        `with_folder_prefix`, и сырое имя папки с символом разрыва рвало бы
+        каждую строку списка - ветка с той же обязанностью, другим
+        сборщиком.
+        """
+        self.write({"draft.md": "---\nname: draft\n---\nфакт\n"})
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(linter, "display_folder",
+                                        lambda _dir: "sub\x0bdir"):
+            with redirect_stdout(out), redirect_stderr(err):
+                code = linter.main([os.path.basename(self.root)])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertEqual(code, 1, output)
+        self.assertIn("sub\\x0bdir/draft.md", output,
+                      "адрес сироты потерял папку вместо экранированной формы")
+        self.assertNotIn("sub\x0bdir", output,
+                         "имя папки ушло в сообщение сырым и рвёт строку")
+
+    def test_early_refusals_escape_the_names_they_print(self):
+        """Ранние выходы `main` печатают имена - и тоже обязаны их экранировать.
+
+        Три ветки: папки памяти нет, ключ `--index` дан шаблоном, корневой
+        индекс пропал. Первые две достижимы и на Windows, третью подделываем:
+        файл с `\\x0b` в имени здесь не создать. Соседние ранние печати
+        (закрытое имя в `--index`, закрытое имя папки) экранирование
+        применяют - в этих трёх оно было забыто, и строка рвалась надвое.
+        """
+        bad = "mem\x0bory"
+        for argv in ([bad], [self.root, "--index", "bad\x0b*"]):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = linter.main(argv)
+            output = out.getvalue() + err.getvalue()
+            self.assertEqual(code, 2, output)
+            self.assertIn("\\x0b", output, argv)
+            self.assertNotIn("\x0b", output, argv)
+
+        self.write({"draft.md": "черновик\n"})
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(linter, "memory_files_without_index",
+                                        lambda _exact, _name: (["draft\x0b.md"], [])):
+            with redirect_stdout(out), redirect_stderr(err):
+                code = linter.main([self.root, "--index", "idx\x0b.md"])
+        output = out.getvalue() + err.getvalue()
+        self.assertEqual(code, 1, output)
+        self.assertIn("draft\\x0b.md", output,
+                      "имя сироты ушло в вывод сырым")
+        self.assertIn("idx\\x0b.md", output,
+                      "имя пропавшего индекса ушло в вывод сырым")
+        self.assertNotIn("\x0b", output, "строка о пропавшем индексе рвётся")
+
+    def test_two_other_early_refusals_escape_the_names_they_print(self):
+        """Ещё две ранние печати - «Корневой не найден» и «Индекс не найден».
+
+        Тест выше держит три ветки из пяти, а правило «ранние отказы
+        экранируют имена» про все пять. «Индекс не найден» достижима без
+        моков: папка без единого индекса с ключом, несущим символ разрыва.
+        «Корневой индекс не найден» печатает сам ключ и `where` - пути
+        найденных глубже индексов; файл с `\\x0b` в имени на Windows не
+        создать, поэтому путь подделываем, а ключ берём с разрывом.
+        """
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = linter.main([self.root, "--index", "idx\x0b.md"])
+        output = out.getvalue() + err.getvalue()
+        self.assertEqual(code, 2, output)
+        self.assertIn("Индекс не найден", output, output)
+        self.assertIn("idx\\x0b.md", output, "имя индекса ушло в вывод сырым")
+        self.assertNotIn("\x0b", output, "строка «Индекс не найден» рвётся")
+
+        out, err = io.StringIO(), io.StringIO()
+        deep = os.path.join(self.root, "sub\x0bdir", "MEMORY.md")
+        with unittest.mock.patch.object(linter, "find_indexes",
+                                        lambda _exact, _name: [deep]):
+            with redirect_stdout(out), redirect_stderr(err):
+                code = linter.main([self.root, "--index", "idx\x0b.md"])
+        output = out.getvalue() + err.getvalue()
+        self.assertEqual(code, 2, output)
+        self.assertIn("Корневой индекс не найден", output, output)
+        self.assertIn("sub\\x0bdir", output, "путь из where ушёл сырым")
+        self.assertIn("idx\\x0b.md", output, "имя индекса ушло в вывод сырым")
+        self.assertNotIn("\x0b", output, "строка «Корневой не найден» рвётся")
+
+    def test_early_refusal_prefixes_the_orphans_it_lists(self):
+        """Список сирот вшит в середину фразы - приписка ему нужна своя.
+
+        `shown` в `L2 ... агент не увидит ни одного (...)` вшит в середину
+        фразы. Прежний рычаг разбирал ВЕДУЩИЙ адрес строки и до середины не
+        доставал, а `folder` считался после ранних выходов. Хук зовёт
+        проверку как `check_memory_index.py memory` - агент получал
+        `draft.md` вместо `memory/draft.md` и шёл по пути, которого нет.
+        Теперь приписка ставится на месте сборки `shown`.
+        """
+        self.write({"draft.md": "---\nname: draft\n---\nчерновик\n"})
+        name = os.path.basename(self.root)
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = linter.main([name])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertEqual(code, 1, output)
+        self.assertIn("L2 корневой индекс", output, output)
+        self.assertIn("(%s/draft.md)" % name, output,
+                      "сирота названа без приписки папки")
+        self.assertNotIn("(draft.md)", output,
+                         "имя сироты осталось без приписки")
+
+    def test_early_refusal_prefixes_the_deep_index_it_lists(self):
+        """То же для `where` в «Корневой индекс не найден»: адрес обязан вести
+        из каталога запуска."""
+        self.write({"sub/MEMORY.md": "- [Профиль](../user.md) - кто\n"})
+        name = os.path.basename(self.root)
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = linter.main([name])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertEqual(code, 2, output)
+        self.assertIn("Корневой индекс не найден", output, output)
+        self.assertIn("%s/sub/MEMORY.md" % name, output,
+                      "найденный глубже индекс назван без приписки папки")
+        self.assertNotIn("глубже: sub/MEMORY.md", output,
+                         "адрес остался без приписки")
+
+    def test_argparse_errors_escape_the_names_they_print(self):
+        """Отказ argparse печатает аргументы сырыми - и рвёт строку до `try`.
+
+        Инвариант «ни одна строка вывода не рвётся» про весь вывод, а не
+        только про находки: `error: unrecognized arguments: foo\nbar.md`
+        уходит в stderr как две строки ещё до первого `except` - и ровно
+        мимо `escaped_findings`.
+        """
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                linter.main([self.root, "--bogus\nfoo"])
+        output = out.getvalue() + err.getvalue()
+        self.assertEqual(ctx.exception.code, 2, output)
+        self.assertIn("bogus\\nfoo", output, "аргумент ушёл в вывод сырым")
+        self.assertNotIn("bogus\nfoo", output, "сообщение argparse рвёт строку")
+
+    def test_a_name_with_a_space_gets_the_prefix(self):
+        """Имя с пробелом законно на Linux и обязано получить приписку.
+
+        `LEADING_ADDRESS` брал в путь `[^\\s:]+` - до пробела, и `Моя
+        Папка.md` из `known` не совпадала ни с чем. Агент получал
+        `L6 Моя Папка.md` без `memory/` - адрес, по которому файла нет, -
+        то есть ровно ту же беду, ради которой приписка написана.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "Моя Папка.md": "черновик\n",
+        })
+        name = os.path.basename(self.root)
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = linter.main([name])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertEqual(code, 1, output)
+        self.assertIn("L6 %s/Моя Папка.md" % name, output,
+                      "имя с пробелом осталось без приписки")
+        self.assertNotIn("L6 Моя Папка.md", output,
+                         "адрес с пробелом назван без папки")
+
+    def test_a_name_with_a_colon_gets_the_prefix(self):
+        """Двоеточие в имени законно на Linux (кроме самой Windows).
+
+        Раньше имя резалось по двоеточию разбором ведущего токена, и приписка
+        не ставилась вовсе. Теперь разбора нет: путь подставляется целиком,
+        и пробел с двоеточием в имени получают приписку одинаково. Файл с
+        двоеточием на Windows не создать - проверяем сборку адреса напрямую.
+        """
+        self.assertEqual(linter.with_folder_prefix("a:b.md", "mem"),
+                         "mem/a:b.md")
 
 
 class LinkedSubtrees(MemoryFixture):
@@ -3595,6 +4185,30 @@ class ExitCodeContract(MemoryFixture):
             code, output = self.run_linter()
         self.assertEqual(code, 2, output)
 
+    def test_internal_failure_escapes_the_name_in_its_own_message(self):
+        """Ветка исключения печатает `str(exc)` - и обязана его экранировать.
+
+        `OSError.__str__` экранирует имя через `repr` сам (замер: строка
+        цела), но класс шире: любое исключение, чьё сообщение несёт сырой
+        символ разрыва, рвёт строку. Тест поэтому бросает НЕ `OSError` - с
+        ним он остался бы зелёным и без починки, и это уже случалось в
+        соседнем замере.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+
+        def boom(*_args, **_kwargs):
+            raise ValueError("не разобрал имя draft\x0b.md в карте файлов")
+
+        with unittest.mock.patch.object(linter, "prune_non_memory_dirs", boom):
+            code, output = self.run_linter()
+        self.assertEqual(code, 2, output)
+        self.assertIn("ValueError", output, output)
+        self.assertIn("draft\\x0b.md", output, "имя ушло в вывод сырым")
+        self.assertNotIn("\x0b", output, "сообщение исключения рвёт строку")
+
 
 class UnreadableEntries(MemoryFixture):
     """Один нечитаемый файл не должен отменять весь прогон."""
@@ -3796,6 +4410,41 @@ class UnreadableEntries(MemoryFixture):
         # всего прогона из-за того, что её не удалось прочитать.
         self.assertEqual(code, 1, output)
         self.assertIn("bitaya.md", output)
+
+    def test_an_unreadable_fact_is_named_when_the_index_is_missing(self):
+        """Пропал индекс, а прочитать, память ли это, не удалось - и молча.
+
+        `looks_like_memory_file` глотала `OSError` и возвращала False:
+        нечитаемый `.md` с шапкой памяти не считался файлом памяти, список
+        сирот пустел, и проверка отвечала «Индекс не найден» с кодом 2 - ни
+        слова о том, что файлов-то и не открывали. Человек шёл проверять
+        путь, а путь был верный: верной была папка, а прочитать её не
+        вышло.
+        """
+        self.write({"zanyatyi.md": "---\nname: zanyatyi\n---\nфакт\n"})
+        self.unreadable("zanyatyi.md")
+        code, output = self.run_linter()
+        self.assertEqual(code, 2, output)
+        self.assertIn("zanyatyi.md", output)
+        self.assertIn("не читается", output)
+
+    def test_an_unreadable_fact_is_named_even_when_the_index_loss_blocks(self):
+        """Та же дыра на входе, где пропажа индекса - уже нарушение.
+
+        Список сирот собирали из читаемых файлов, и нечитаемый сосед
+        пропадал из выдачи: прогон блокировал по одним и молчал про другие.
+        Правило «о невыполненной работе говорим вслух» здесь не должно
+        зависеть от того, нашлись ли сироты.
+        """
+        self.write({
+            "chestnyi.md": "---\nname: chestnyi\n---\nфакт\n",
+            "zanyatyi.md": "---\nname: zanyatyi\n---\nфакт\n",
+        })
+        self.unreadable("zanyatyi.md")
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("zanyatyi.md", output)
+        self.assertIn("не читается", output)
 
 
 class DuplicateTitles(MemoryFixture):
@@ -4481,6 +5130,73 @@ class OutputEncoding(MemoryFixture):
         text = result.stdout.decode("utf-8")
         self.assertIn("ссылка", text.lower())
 
+    def test_a_surrogate_in_a_name_does_not_crash_the_print(self):
+        """`reconfigure(encoding="utf-8")` без `errors=` оставляет `strict`.
+
+        Имя с байтом вне UTF-8 приходит в строку через `surrogateescape`
+        (Linux). Печать такого имени в поток с `errors="strict"` падает
+        `UnicodeEncodeError` - и агент получает трейсбек и exit 1 вместо
+        находки. `printable_name` суррогат не экранирует: в `_LINE_BREAKS`
+        его нет, и чинится это на уровне потока.
+        """
+        buf = io.BytesIO()
+        stream = io.TextIOWrapper(buf, encoding="utf-8", errors="strict")
+        crash = None
+        with unittest.mock.patch.object(sys, "stdout", stream), \
+                unittest.mock.patch.object(sys, "stderr", stream):
+            linter.force_utf8_output()
+            try:
+                sys.stdout.write("L1 draft\udcff.md: текст\n")
+                sys.stdout.flush()
+            except UnicodeEncodeError as exc:
+                crash = exc
+        self.assertIsNone(crash, "печать имени с суррогатом упала: %s" % crash)
+        self.assertIn(b"draft", buf.getvalue())
+
+
+class ToolStreamsSetAnErrorMode(unittest.TestCase):
+    """`force_utf8_output` живёт в скриптах тремя копиями, и копии расходятся.
+
+    Линтер обязан оставаться самодостаточным - его копируют к себе в проект
+    одним файлом, - поэтому общей функции здесь нет по построению. Правка,
+    добавившая `errors="backslashreplace"` линтеру, в `mutation_check.py` и
+    `revert_check.py` не дошла: оба инструмента печатают агенту то же
+    задание и падали бы на имени с суррогатом тем же `UnicodeEncodeError`.
+    """
+
+    def test_every_reconfigure_call_sets_an_error_mode(self):
+        """Каждый вызов `reconfigure` в скриптах обязан задавать `errors=`.
+
+        Ищем вызов, а не строку в исходнике: реестры мутаций и откатов
+        намеренно держат сломанную форму (`reconfigure(encoding="utf-8")`)
+        как данные, - текстовая проверка краснела бы на них и заодно
+        проходила бы мимо настоящего вызова. Разбор дерева видит только
+        вызовы. Тестовые файлы сознательно вне обхода: тест вправе собрать
+        поток с каким угодно режимом ошибок, это его фикстура, а не вывод
+        инструмента.
+        """
+        offenders = []
+        for name in sorted(os.listdir(SCRIPTS_DIR)):
+            if not name.endswith(".py") or name.startswith("test_"):
+                continue
+            path = os.path.join(SCRIPTS_DIR, name)
+            with io.open(path, encoding="utf-8") as stream:
+                tree = ast.parse(stream.read(), filename=path)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not (isinstance(func, ast.Attribute)
+                        and func.attr == "reconfigure"):
+                    continue
+                if not any(kw.arg == "errors" for kw in node.keywords):
+                    offenders.append("%s:%d" % (name, node.lineno))
+        self.assertEqual(
+            offenders, [],
+            "перекодировка без режима ошибок: печать имени с суррогатом "
+            "упадёт, и агент получит трейсбек вместо находки - "
+            + ", ".join(offenders))
+
 
 class DocumentationMatchesReality(unittest.TestCase):
     """README - часть инструмента: неверная строка оттуда попадает людям в конфиг."""
@@ -4524,6 +5240,26 @@ class DocumentationMatchesReality(unittest.TestCase):
     def test_readme_does_not_teach_the_destructive_unset(self):
         """Тот же разрушительный совет не должен переехать из хука в документацию."""
         self.assertNotIn("--unset core.hooksPath", self.readme())
+
+    def test_readme_teaches_the_index_is_a_name_not_a_path(self):
+        """Ключ `--index` принимает ИМЯ; путь-значение - отказ кода 2.
+
+        README - носитель нормы для человека, и его строки расходятся с
+        кодом: скобка «проверяется весь путь индекса - он адрес внутри
+        памяти» учила, что путь - допустимая форма значения, а
+        `find_indexes` сравнивает по basename, и путь-значение давало ложное
+        блокирующее «корневой индекс пропал» при файле, который лежит на
+        месте. Перечни причин кода 2 путь-значение тоже не называли.
+        """
+        text = self.readme()
+        self.assertIn("не шаблон и не путь",
+                      text, "форма значения `--index` в README не названа")
+        self.assertNotIn("проверяется весь путь индекса",
+                         text, "README снова учит, что путь - форма `--index`")
+        self.assertIn("шаблон или путь вместо имени",
+                      text, "перечень причин кода 2 не называет путь-значение")
+        self.assertIn("шаблон, путь или закрытое имя",
+                      text, "второй перечень причин кода 2 тоже без пути")
 
     def test_section_the_hook_points_at_exists(self):
         """Хук отсылает к разделу README - раздел обязан существовать.
@@ -4959,6 +5695,26 @@ class PreCommitHook(unittest.TestCase):
         printed = result.stdout.decode("utf-8", "replace")
         self.assertIn("не смог измерить длину аргументов", printed)
 
+    def test_a_failing_tr_does_not_abort_the_closed_name_check(self):
+        """Второе место, где `tr` звали без `set +e`.
+
+        Блок проверки формы `--index` приводит имя к сравнимому виду через
+        `tr`, и его падение под `set -e` обрывало хук ровно так же, как
+        когда-то замер длины: человек получал отклонённый коммит с ПУСТЫМ
+        выводом. Класс один - «падающий `tr` не роняет хук», - а входа у
+        него два, и первый держал лишь замер длины.
+        """
+        self.write_config("CLAUDE.md", "# Проект\n\nОбычные инструкции.\n")
+        self.git("config", "memorycheck.args", "--index con")
+        self.git("add", "-A")
+        fake = self.with_fake_tool("tr", "echo 42\nexit 3\n")
+        if not self.substitution_reaches_the_shell(fake, "tr"):
+            self.skipTest("подмена tr не доходит до этого sh")
+        result = self.run_hook_with_path(fake)
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertIn("строку импорта", printed)
+        self.assertNotIn("@memory/con", printed)
+
     def test_a_failing_wc_does_not_switch_the_budget_off_silently(self):
         """Упавший `wc` не виден по статусу - его прячет следующий `tr`.
 
@@ -5328,6 +6084,57 @@ class PreCommitHook(unittest.TestCase):
         text = result.stdout.decode("utf-8", "replace")
         self.assertEqual(result.returncode, 0, text)
         self.assertNotIn("НИ ОДНОГО факта", text)
+
+    def run_hook_with_index_key(self, value):
+        """Кладёт `--index ЗНАЧЕНИЕ` в memorycheck.args и прогоняет хук."""
+        self.write_config("CLAUDE.md", "# Проект\n\nОбычные инструкции.\n")
+        self.git("config", "memorycheck.args", "--index %s" % value)
+        self.git("add", "-A")
+        result = self.run_hook()
+        return result.stdout.decode("utf-8", "replace")
+
+    def test_the_hook_does_not_advise_an_import_line_for_a_path_index(self):
+        """Путь вместо имени не должен превращаться в совет испортить конфиг.
+
+        Хук строил строку импорта из сырого значения memorycheck.args: при
+        `--index infra/MEMORY.md` он требовал вписать @memory/infra/MEMORY.md,
+        а такое значение проверка не принимает - она ждёт ИМЯ, а не путь
+        (под-индекс ищется в подпапке под тем же именем). Человек получал
+        задание, за которым следовал код 2 на каждом запуске.
+        """
+        text = self.run_hook_with_index_key("infra/MEMORY.md")
+        self.assertNotIn("@memory/infra/MEMORY.md", text)
+        self.assertIn("строку импорта", text)
+
+    def test_the_hook_does_not_advise_an_import_line_for_a_glob_index(self):
+        """Шаблон вместо имени - та же вредная строка, другой вход класса."""
+        text = self.run_hook_with_index_key("*.md")
+        self.assertNotIn("@memory/*.md", text)
+        self.assertIn("строку импорта", text)
+
+    def test_the_hook_does_not_advise_an_import_line_for_a_closed_index(self):
+        """Закрытое имя в --index проверка тоже отвергает - совета быть не должно."""
+        text = self.run_hook_with_index_key("claude.md")
+        self.assertNotIn("@memory/claude.md", text)
+        self.assertIn("строку импорта", text)
+
+    def test_the_hook_refuses_every_closed_name_the_checker_refuses(self):
+        """Копия списка закрытых имён в хуке держится сверкой с его источником.
+
+        Список живёт в check_memory_index.py (DOS_RESERVED_NAMES плюс claude),
+        а совет строки импорта строит хук - значит у хука своя копия, и она
+        обязана расходиться с источником при любой его правке. Дрейф ловится
+        здесь: имя, которое проверка отвергает, а хук пропускает, снова даёт
+        вредный совет. Проверяются и стем, и имя с расширением - проверка
+        снимает расширение, и `aux.md` закрыто наравне с `aux`.
+        """
+        names = ["claude"] + sorted(linter.DOS_RESERVED_NAMES)
+        for name in names:
+            for value in (name, "%s.md" % name):
+                with self.subTest(value=value):
+                    text = self.run_hook_with_index_key(value)
+                    self.assertNotIn("@memory/%s" % value, text)
+                    self.assertIn("строку импорта", text)
 
     def fake_python3(self, body):
         """Кладёт в PATH подставной python3 и возвращает окружение с ним."""

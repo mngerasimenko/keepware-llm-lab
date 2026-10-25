@@ -56,8 +56,10 @@ from mutation_check import run_apart  # noqa: E402
 
 REPO = os.path.dirname(SCRIPTS_DIR)
 LINTER = os.path.join("scripts", "check_memory_index.py")
+README_DOC = "README.md"
 HOOK = os.path.join(".githooks", "pre-commit")
 TOOL = os.path.join("scripts", "mutation_check.py")
+SELF = os.path.join("scripts", "revert_check.py")
 # Потолок на один тест. Прогон здесь адресный - один именованный тест, а не
 # весь набор, - поэтому и запас нужен другой, чем у мутационной проверки.
 # Тесты хука поднимают свой репозиторий и на Windows доходят до полуминуты.
@@ -146,15 +148,92 @@ REVERTS = [
      "test_a_closed_index_name_is_refused"),
 
     ("закрытое имя папки памяти снова проходит", LINTER,
-     "        if is_closed_name(root_name):\n", "        if False:\n",
+     "        if is_closed_name(root_stem):\n", "        if False:\n",
      "test_check_memory_index.MemoryFileNameIsASlug."
      "test_a_closed_memory_folder_name_is_refused"),
+
+    ("имя папки с расширением снова не считается закрытым", LINTER,
+     "        root_stem = os.path.splitext(root_name)[0]\n",
+     "        root_stem = root_name\n",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_a_closed_memory_folder_name_with_an_extension_is_refused"),
+
+    ("регистровый двойник --index снова даёт ложное «пропал»", LINTER,
+     "            # Имя сравнивается точно - и здесь же точность ломала вход:\n"
+     "            # `--index memory.md` при файле `MEMORY.md` находило ничего, и\n"
+     "            # человек получал блокирующее «корневой индекс пропал» при\n"
+     "            # индексе, который лежит на месте. Регистровый двойник в корне -\n"
+     "            # это не пропажа, а имя в другом регистре: код 2 и то, что лежит\n"
+     "            # на деле. Глубже не смотрим: под-индекс - это отдельная память,\n"
+     "            # и её регистр к имени корневого не относится.\n"
+     "            for rel in sorted(file_map[0]):\n"
+     "                if \"/\" in rel:\n"
+     "                    continue\n"
+     "                if rel != args.index and rel.casefold() == args.index.casefold():\n"
+     "                    print(\"Ключ --index называет %s, а в корне памяти лежит \"\n"
+     "                          \"%s: имя индекса сравнивается точно и файл не \"\n"
+     "                          \"нашёлся. На Windows оба имени - один файл, в CI на \"\n"
+     "                          \"Linux - два разных. Укажите имя как лежит: --index \"\n"
+     "                          \"%s\" % (printable_name(args.index),\n"
+     "                                  printable_name(rel), printable_name(rel)),\n"
+     "                          file=sys.stderr)\n"
+     "                    return EXIT_USAGE\n",
+     "",
+     "test_check_memory_index.RootIndexLost."
+     "test_an_index_name_in_another_case_is_a_usage_error"),
+
+    ("README снова учит, что путь - форма значения --index", README_DOC,
+     "- именно **имя**, не шаблон и не путь: `--index INDEX.md`. Значение с "
+     "разделителем (`--index infra/MEMORY.md`) отклоняется с кодом 2: корневой "
+     "индекс лежит в самой папке памяти, под-индекс - в подпапке под тем же "
+     "именем, путь для их поиска не нужен. Само имя под правило слага не "
+     "попадает (оно задаётся отдельно), но закрытое имя не годится и здесь: "
+     "`--index claude.md` или `--index con.md` отклоняется с кодом 2 "
+     "(закрытыми считаются все сегменты переданного значения).",
+     "- именно **имя**, не шаблон: `--index INDEX.md`. Само имя под правило "
+     "слага не попадает (оно задаётся отдельно), но закрытое имя не годится и "
+     "здесь: `--index claude.md` или `--index con.md` отклоняется с кодом 2 "
+     "(проверяется весь путь индекса - он адрес внутри памяти).",
+     "test_check_memory_index.DocumentationMatchesReality."
+     "test_readme_teaches_the_index_is_a_name_not_a_path"),
+
+    ("README снова учит, что шаблон - единственная причина --index", README_DOC,
+     "шаблон или путь вместо имени в `--index`",
+     "шаблон вместо имени в `--index`",
+     "test_check_memory_index.DocumentationMatchesReality."
+     "test_readme_teaches_the_index_is_a_name_not_a_path"),
+
+    ("README снова умалчивает путь в перечне кода 2", README_DOC,
+     "шаблон, путь или закрытое имя в `--index`",
+     "шаблон или закрытое имя в `--index`",
+     "test_check_memory_index.DocumentationMatchesReality."
+     "test_readme_teaches_the_index_is_a_name_not_a_path"),
 
     ("предок пути снова считается именем памяти", LINTER,
      "        root_name = os.path.basename(os.path.normpath(args.memory_dir))\n",
      "        root_name = closed_segment(args.memory_dir) or \"\"\n",
      "test_check_memory_index.MemoryFileNameIsASlug."
      "test_a_closed_segment_above_the_memory_folder_is_not_our_business"),
+
+    ("сегмент --index с расширением снова прячет закрытое имя", LINTER,
+     "        if part and is_closed_name(os.path.splitext(part)[0]):\n",
+     "        if part and is_closed_name(part):\n",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_a_closed_segment_keeps_the_closed_verdict_with_an_extension"),
+
+    ("причина закрытого сегмента снова по сырой форме", LINTER,
+     "                     closed_name_reason(os.path.splitext(index_closed)[0])),\n",
+     "                     closed_name_reason(index_closed)),\n",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_the_closed_reason_names_claude_even_with_an_extension"),
+
+    ("каталог с расширением снова не стемится в L6", LINTER,
+     "            if not MEMORY_FILE_NAME.match(folder_stem) or is_closed_name(folder_stem):\n"
+     "                found.append((where, folder_stem, \"каталога\"))\n",
+     "            if not MEMORY_FILE_NAME.match(folder) or is_closed_name(folder):\n"
+     "                found.append((where, folder, \"каталога\"))\n",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_a_directory_with_an_extension_still_names_the_closed_reason"),
 
     ("законное имя снова считается закрытым", LINTER,
      "    return low == \"claude\" or low in DOS_RESERVED_NAMES",
@@ -182,8 +261,8 @@ REVERTS = [
      "test_no_output_line_is_torn_apart_by_a_name"),
 
     ("закрытое имя каталога снова проходит правило", LINTER,
-     "            if not MEMORY_FILE_NAME.match(folder) or is_closed_name(folder):",
-     "            if not MEMORY_FILE_NAME.match(folder):",
+     "            if not MEMORY_FILE_NAME.match(folder_stem) or is_closed_name(folder_stem):",
+     "            if not MEMORY_FILE_NAME.match(folder_stem):",
      "test_check_memory_index.MemoryFileNameIsASlug."
      "test_a_closed_directory_name_is_an_error"),
 
@@ -271,6 +350,247 @@ REVERTS = [
      "fi",
      "test_check_memory_index.PreCommitHook."
      "test_drafts_named_in_quotes_do_not_fake_a_failure"),
+
+    ("адрес с экранированным именем снова без приписки папки", LINTER,
+     "    return \"%s/%s\" % (printable_name(folder), printable_name(rel))",
+     "    return printable_name(rel)",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_escaped_name_still_gets_the_prefix"),
+
+    ("папка памяти снова подставляется в строку сырой", LINTER,
+     "    return \"%s/%s\" % (printable_name(folder), printable_name(rel))",
+     "    return \"%s/%s\" % (folder, printable_name(rel))",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_the_folder_part_is_escaped_inside_the_join"),
+
+    ("адрес сироты в L2 снова без приписки папки", LINTER,
+     "            % (with_folder_prefix(rel, folder), hint, head_note,\n"
+     "               with_folder_prefix(index_name, folder), rel))",
+     "            % (rel, hint, head_note,\n"
+     "               with_folder_prefix(index_name, folder), rel))",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_a_folder_with_a_line_break_does_not_tear_the_line"),
+
+    ("ранние отказы снова печатают имена сырыми", LINTER,
+     "            print(\"Папка памяти не найдена: %s\" % printable_name(args.memory_dir),\n"
+     "                  file=sys.stderr)",
+     "            print(\"Папка памяти не найдена: %s\" % args.memory_dir,\n"
+     "                  file=sys.stderr)",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_early_refusals_escape_the_names_they_print"),
+
+    ("отказ по шаблону --index снова печатает ключ сырым", LINTER,
+     "            print(\"Ключ --index принимает ИМЯ файла индекса, а не шаблон: %s. \"\n"
+     "                  \"Например: --index MEMORY.md\" % printable_name(args.index),\n"
+     "                  file=sys.stderr)",
+     "            print(\"Ключ --index принимает ИМЯ файла индекса, а не шаблон: %s. \"\n"
+     "                  \"Например: --index MEMORY.md\" % args.index,\n"
+     "                  file=sys.stderr)",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_early_refusals_escape_the_names_they_print"),
+
+    ("L2 о пропавшем индексе снова печатает его имя сырым", LINTER,
+     "                      % (printable_name(args.index),\n"
+     "                         files_count(len(orphaned)), shown, more))",
+     "                      % (args.index,\n"
+     "                         files_count(len(orphaned)), shown, more))",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_early_refusals_escape_the_names_they_print"),
+
+    ("«Корневой индекс не найден» снова печатает имена сырыми", LINTER,
+     "                      % (printable_name(args.index),\n"
+     "                         printable_name(args.memory_dir), where),",
+     "                      % (args.index,\n"
+     "                         args.memory_dir, where),",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_two_other_early_refusals_escape_the_names_they_print"),
+
+    ("«Индекс не найден» снова печатает имена сырыми", LINTER,
+     "                print(\"Индекс не найден: %s/%s\"\n"
+     "                      % (printable_name(args.memory_dir.replace(os.sep, \"/\").rstrip(\"/\")),\n"
+     "                         printable_name(args.index)), file=sys.stderr)",
+     "                print(\"Индекс не найден: %s/%s\"\n"
+     "                      % (args.memory_dir.replace(os.sep, \"/\").rstrip(\"/\"),\n"
+     "                         args.index), file=sys.stderr)",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_two_other_early_refusals_escape_the_names_they_print"),
+
+    ("адреса без приписки папки снова печатаются сырыми", LINTER,
+     "    if not folder or os.path.isabs(rel):\n"
+     "        return printable_name(rel)",
+     "    if not folder or os.path.isabs(rel):\n"
+     "        return rel",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_two_other_early_refusals_escape_the_names_they_print"),
+
+    ("сироты в L2 снова без приписки папки", LINTER,
+     "                shown = \", \".join(with_folder_prefix(rel, folder)\n"
+     "                                  for rel in orphaned[:5])",
+     "                shown = \", \".join(printable_name(rel) for rel in orphaned[:5])",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_early_refusal_prefixes_the_orphans_it_lists"),
+
+    ("найденный глубже индекс снова без приписки папки", LINTER,
+     "                where = \", \".join(sorted(with_folder_prefix(\n"
+     "                    relative_to_root(root, p) or p, folder)\n"
+     "                    for p in index_paths))",
+     "                where = \", \".join(sorted(printable_name(relative_to_root(root, p) or p)\n"
+     "                                         for p in index_paths))",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_early_refusal_prefixes_the_deep_index_it_lists"),
+
+    ("сообщение исключения снова печатается сырым", LINTER,
+     "              % (type(exc).__name__, printable_name(str(exc))), file=sys.stderr)",
+     "              % (type(exc).__name__, exc), file=sys.stderr)",
+     "test_check_memory_index.ExitCodeContract."
+     "test_internal_failure_escapes_the_name_in_its_own_message"),
+
+    ("поток снова перекодируется без режима ошибок", LINTER,
+     "            stream.reconfigure(encoding=\"utf-8\", errors=\"backslashreplace\")",
+     "            stream.reconfigure(encoding=\"utf-8\")",
+     "test_check_memory_index.OutputEncoding."
+     "test_a_surrogate_in_a_name_does_not_crash_the_print"),
+
+    ("отказ argparse снова печатает аргумент сырым", LINTER,
+     "        self.exit(2, \"%s: error: %s\\n\" % (self.prog, printable_name(message)))",
+     "        self.exit(2, \"%s: error: %s\\n\" % (self.prog, message))",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_argparse_errors_escape_the_names_they_print"),
+
+    ("адреса в выводе снова не дописываются папкой памяти", LINTER,
+     "    return \"%s/%s\" % (printable_name(folder), printable_name(rel))",
+     "    return printable_name(rel)",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_a_name_with_a_space_gets_the_prefix"),
+
+    ("адрес из середины фразы снова без приписки", LINTER,
+     "                   with_folder_prefix(guess, folder),",
+     "                   guess,",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_a_guess_in_the_middle_of_a_phrase_gets_the_prefix"),
+
+    ("слову фразы снова приписывают папку памяти", LINTER,
+     "                \"Индекс пуст: строк формата `- [Заголовок](файл.md) - крючок` в нём нет. \"\n"
+     "                \"Для новой памяти это нормально\"",
+     "                \"%s/Индекс пуст: строк формата `- [Заголовок](файл.md) - крючок` в нём нет. \"\n"
+     "                \"Для новой памяти это нормально\" % folder",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_phrase_word_does_not_get_the_prefix_when_it_collides"),
+
+    ("абсолютному пути снова приписывают папку", LINTER,
+     "    if not folder or os.path.isabs(rel):",
+     "    if not folder:",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_prefix_joins_the_folder_and_leaves_absolute_paths_bare"),
+
+    ("потоки инструмента мутаций снова без режима ошибок", TOOL,
+     "            stream.reconfigure(encoding=\"utf-8\", errors=\"backslashreplace\")",
+     "            stream.reconfigure(encoding=\"utf-8\")",
+     "test_check_memory_index.ToolStreamsSetAnErrorMode."
+     "test_every_reconfigure_call_sets_an_error_mode"),
+
+    ("потоки собственного инструмента снова без режима ошибок", SELF,
+     "            stream.reconfigure(encoding=\"utf-8\", errors=\"backslashreplace\")",
+     "            stream.reconfigure(encoding=\"utf-8\")",
+     "test_check_memory_index.ToolStreamsSetAnErrorMode."
+     "test_every_reconfigure_call_sets_an_error_mode"),
+
+    ("путь в --index снова принимается и даёт ложный отказ", LINTER,
+     "        if \"/\" in args.index or \"\\\\\" in args.index:\n"
+     "            print(\"Ключ --index принимает ИМЯ файла индекса, а не путь: %s. \"\n"
+     "                  \"Корневой лежит в самой папке памяти, под-индекс - в \"\n"
+     "                  \"подпапке под тем же именем. Например: --index MEMORY.md\"\n"
+     "                  % printable_name(args.index),\n"
+     "                  file=sys.stderr)\n"
+     "            return EXIT_USAGE",
+     "",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_a_path_valued_index_is_refused_as_a_name"),
+
+    ("имя программы в отказе argparse снова сыро", LINTER,
+     "    parser.prog = printable_name(parser.prog)",
+     "",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_the_program_name_is_printed_on_one_line_too"),
+
+    ("корневой индекс в сообщении снова назван дважды", LINTER,
+     "                \"L2 %s - под-индекс, до которого неоткуда дойти: "
+     "от корневого \"\n"
+     "                \"индекса цепочки ссылок на него нет%s. Добавьте в %s \"\n",
+     "                \"L2 %s - под-индекс, до которого неоткуда дойти: "
+     "от корневого \"\n"
+     "                \"индекса (MEMORY.md) цепочки ссылок на него нет%s. "
+     "Добавьте в %s \"\n",
+     "test_check_memory_index.FilesAppearInIndex."
+     "test_the_root_index_is_named_once_in_the_unreachable_message"),
+
+    ("совет импорта снова не отвергает шаблон в --index", HOOK,
+     '        IMPORT_INDEX_INVALID="шаблон, а не имя"\n',
+     "        :\n",
+     "test_check_memory_index.PreCommitHook."
+     "test_the_hook_does_not_advise_an_import_line_for_a_glob_index"),
+
+    ("совет импорта снова не отвергает закрытое имя в --index", HOOK,
+     '            IMPORT_INDEX_INVALID="закрытое имя"\n',
+     "            :\n",
+     "test_check_memory_index.PreCommitHook."
+     "test_the_hook_refuses_every_closed_name_the_checker_refuses"),
+
+    ("совет импорта снова не отвергает путь в --index", HOOK,
+     '            IMPORT_INDEX_INVALID="путь, а не имя"\n',
+     "            :\n",
+     "test_check_memory_index.PreCommitHook."
+     "test_the_hook_does_not_advise_an_import_line_for_a_path_index"),
+
+    ("отказ по форме --index снова не гасит совет импорта", HOOK,
+     '    IMPORT_INDEX=""\n    IMPORT_PATTERN=""\n',
+     "    :\n    :\n",
+     "test_check_memory_index.PreCommitHook."
+     "test_the_hook_does_not_advise_an_import_line_for_a_closed_index"),
+
+    ("нечитаемый файл снова неотличим от непамяти", LINTER,
+     "        return None\n    return any(MEMORY_FIELD.match(line) for line in head)\n",
+     "        return False\n    return any(MEMORY_FIELD.match(line) for line in head)\n",
+     "test_check_memory_index.UnreadableEntries."
+     "test_an_unreadable_fact_is_named_when_the_index_is_missing"),
+
+    ("нечитаемый рядом с сиротами снова молчит", LINTER,
+     "                for rel in sorted(unreadable_orphans):\n"
+     "                    print(\"%s: файл не читается - проверить его не удалось. \"\n"
+     "                          \"Проверьте, что файл на месте и доступен: закройте \"\n"
+     "                          \"редактор, снимите блокировку или почините ссылку\"\n"
+     "                          % with_folder_prefix(rel, folder))\n"
+     "                print(\"\\nНарушений: 1 (строк в индексе: 0)\")\n",
+     "                print(\"\\nНарушений: 1 (строк в индексе: 0)\")\n",
+     "test_check_memory_index.UnreadableEntries."
+     "test_an_unreadable_fact_is_named_even_when_the_index_loss_blocks"),
+
+    ("нечитаемый при пропавшем индексе снова молчит", LINTER,
+     "            for rel in sorted(unreadable_orphans):\n"
+     "                print(\"%s: файл не читается - проверить его не удалось. \"\n"
+     "                      \"Проверьте, что файл на месте и доступен: закройте \"\n"
+     "                      \"редактор, снимите блокировку или почините ссылку\"\n"
+     "                      % with_folder_prefix(rel, folder))\n"
+     "            return EXIT_USAGE\n",
+     "            return EXIT_USAGE\n",
+     "test_check_memory_index.UnreadableEntries."
+     "test_an_unreadable_fact_is_named_when_the_index_is_missing"),
+
+    ("литерал правки регистра снова отсчитан от корня памяти", LINTER,
+     "                       os.path.relpath(twin, os.path.dirname(index_path))\n"
+     "                       .replace(os.sep, \"/\"))\n",
+     "                       relative_to_root(root, twin))\n",
+     "test_check_memory_index.IndexLinksToFiles."
+     "test_the_case_fix_is_spelled_from_the_index_not_from_the_memory_root"),
+
+    ("падающий tr снова рвёт проверку формы --index", HOOK,
+     "    set +e\n"
+     "    IMPORT_STEM=$(printf '%s' \"$IMPORT_STEM\" | tr '[:upper:]' '[:lower:]' | tr -d ' \\t\\r\\n')\n"
+     "    STEM_STATUS=$?\n"
+     "    set -e\n",
+     "    IMPORT_STEM=$(printf '%s' \"$IMPORT_STEM\" | tr '[:upper:]' '[:lower:]' | tr -d ' \\t\\r\\n')\n",
+     "test_check_memory_index.PreCommitHook."
+     "test_a_failing_tr_does_not_abort_the_closed_name_check"),
 ]
 # Ограничитель обратного прохода (`floor`) сюда намеренно НЕ занесён: его
 # держит мутация в `mutation_check.py`, а единственный тест, который на его
@@ -438,9 +758,12 @@ def build_parser():
 
 
 def main(argv=None):
+    # errors= обязателен, а не украшение: без него остаётся `strict`, и печать
+    # имени с суррогатом падает UnicodeEncodeError. Та же строка, что в
+    # force_utf8_output линтера, - копии не должны расходиться.
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8")
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
         except Exception:
             pass
 
