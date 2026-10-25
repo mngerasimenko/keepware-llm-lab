@@ -883,6 +883,28 @@ class MemoryFileNameIsASlug(MemoryFixture):
         self.assertEqual(code, 2, output)
         self.assertIn("закрыт", output.lower())
 
+    def test_a_closed_memory_folder_name_with_an_extension_is_refused(self):
+        """`claude.md` как имя папки - то же закрытое имя, что `claude`.
+
+        Контракт `is_closed_name` - СТЕМ, и для `--index` расширение снимают
+        (`splitext`), а имя папки уходило в проверку целиком: `con.md`,
+        `claude.md`, `nul.md` закрытыми не считались, проверка доезжала до
+        конца и на согласованной памяти отвечала нулём. Обход реален на
+        Linux, где такие каталоги существуют; DOS-имя с расширением на
+        Windows создать нельзя, поэтому вход - `claude.md`.
+        """
+        self.write({
+            "claude.md/MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "claude.md/user.md": "факт\n",
+        })
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = linter.main([os.path.join(self.root, "claude.md")])
+        output = out.getvalue() + err.getvalue()
+        self.assertEqual(code, 2, output)
+        self.assertIn("закрыт", output.lower())
+
     def test_a_closed_segment_in_the_index_path_is_refused(self):
         """`--index claude/MEMORY.md` - закрытый сегмент в имени с сепаратором.
 
@@ -898,6 +920,24 @@ class MemoryFileNameIsASlug(MemoryFixture):
         code, output = self.run_linter("--index", "claude/MEMORY.md")
         self.assertEqual(code, 2, output)
         self.assertIn("закрыт", output.lower())
+
+    def test_a_closed_segment_keeps_the_closed_verdict_with_an_extension(self):
+        """`--index "aux.md/x"` - закрытый сегмент, а не просто путь.
+
+        Причина «закрыто» специфичнее и называется первой, но сегмент
+        проверялся целиком, а `is_closed_name` принимает СТЕМ: `aux.md`
+        закрытым не считалось, и человек получал «а не путь» вместо
+        «закрытое имя» - верный по форме, но не по причине: DOS-имя с
+        расширением тот же отказ, что и без него.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+        })
+        code, output = self.run_linter("--index", "aux.md/x")
+        self.assertEqual(code, 2, output)
+        self.assertIn("закрыт", output.lower())
+        self.assertNotIn("а не путь", output)
 
     def test_a_path_valued_index_is_refused_as_a_name(self):
         """`--index infra/MEMORY.md` - путь, а ключ принимает ИМЯ.
@@ -3184,6 +3224,25 @@ class RootIndexLost(MemoryFixture):
         self.assertEqual(forgotten_one, 1)
         self.assertEqual(lost_index, 1, output)
 
+    def test_an_index_name_in_another_case_is_a_usage_error(self):
+        """`--index memory.md` при файле `MEMORY.md` - про регистр, не про пропажу.
+
+        Имя индекса сравнивается точно: на Windows сравнение без учёта
+        регистра прошло бы, в CI на Linux набор файлов разъехался бы. Зато
+        человек с именем в другом регистре получал ложное блокирующее
+        «корневой индекс пропал» при памяти, где индекс лежит на месте: хук
+        останавливал коммит, а причина была не в пропаже. Регистровый двойник
+        в корне - это отказ кода 2 с тем, что лежит на деле.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": self.FACT % "user",
+        })
+        code, output = self.run_linter("--index", "memory.md")
+        self.assertEqual(code, 2, output)
+        self.assertNotIn("пропал", output)
+        self.assertIn("MEMORY.md", output)
+
 
 class AddressesAreClickable(MemoryFixture):
     """Адрес в выводе должен указывать туда, откуда проверку запустили.
@@ -3510,6 +3569,33 @@ class AddressesAreClickable(MemoryFixture):
                       "экранированной")
         self.assertNotIn("mem\x0bory", output,
                          "имя папки ушло в вывод сырым и рвёт строку надвое")
+
+    def test_the_lost_index_message_escapes_the_folder_too(self):
+        """«Пропал» собирает адреса сирот с припиской - и папку экранирует так же.
+
+        E2e-тест выше шёл через L2-строку из `check`, а сообщение о
+        пропавшем корне `main` собирает само: список сирот печатается через
+        `with_folder_prefix`, и сырое имя папки с символом разрыва рвало бы
+        каждую строку списка - ветка с той же обязанностью, другим
+        сборщиком.
+        """
+        self.write({"draft.md": "---\nname: draft\n---\nфакт\n"})
+        previous = os.getcwd()
+        os.chdir(os.path.dirname(self.root))
+        self.addCleanup(os.chdir, previous)
+
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(linter, "display_folder",
+                                        lambda _dir: "sub\x0bdir"):
+            with redirect_stdout(out), redirect_stderr(err):
+                code = linter.main([os.path.basename(self.root)])
+        output = out.getvalue() + err.getvalue()
+
+        self.assertEqual(code, 1, output)
+        self.assertIn("sub\\x0bdir/draft.md", output,
+                      "адрес сироты потерял папку вместо экранированной формы")
+        self.assertNotIn("sub\x0bdir", output,
+                         "имя папки ушло в сообщение сырым и рвёт строку")
 
     def test_early_refusals_escape_the_names_they_print(self):
         """Ранние выходы `main` печатают имена - и тоже обязаны их экранировать.
@@ -5059,6 +5145,26 @@ class DocumentationMatchesReality(unittest.TestCase):
     def test_readme_does_not_teach_the_destructive_unset(self):
         """Тот же разрушительный совет не должен переехать из хука в документацию."""
         self.assertNotIn("--unset core.hooksPath", self.readme())
+
+    def test_readme_teaches_the_index_is_a_name_not_a_path(self):
+        """Ключ `--index` принимает ИМЯ; путь-значение - отказ кода 2.
+
+        README - носитель нормы для человека, и его строки расходятся с
+        кодом: скобка «проверяется весь путь индекса - он адрес внутри
+        памяти» учила, что путь - допустимая форма значения, а
+        `find_indexes` сравнивает по basename, и путь-значение давало ложное
+        блокирующее «корневой индекс пропал» при файле, который лежит на
+        месте. Перечни причин кода 2 путь-значение тоже не называли.
+        """
+        text = self.readme()
+        self.assertIn("не шаблон и не путь",
+                      text, "форма значения `--index` в README не названа")
+        self.assertNotIn("проверяется весь путь индекса",
+                         text, "README снова учит, что путь - форма `--index`")
+        self.assertIn("шаблон или путь вместо имени",
+                      text, "перечень причин кода 2 не называет путь-значение")
+        self.assertIn("шаблон, путь или закрытое имя",
+                      text, "второй перечень причин кода 2 тоже без пути")
 
     def test_section_the_hook_points_at_exists(self):
         """Хук отсылает к разделу README - раздел обязан существовать.

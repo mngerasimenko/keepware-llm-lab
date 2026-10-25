@@ -56,6 +56,7 @@ from mutation_check import run_apart  # noqa: E402
 
 REPO = os.path.dirname(SCRIPTS_DIR)
 LINTER = os.path.join("scripts", "check_memory_index.py")
+README_DOC = "README.md"
 HOOK = os.path.join(".githooks", "pre-commit")
 TOOL = os.path.join("scripts", "mutation_check.py")
 SELF = os.path.join("scripts", "revert_check.py")
@@ -147,15 +148,78 @@ REVERTS = [
      "test_a_closed_index_name_is_refused"),
 
     ("закрытое имя папки памяти снова проходит", LINTER,
-     "        if is_closed_name(root_name):\n", "        if False:\n",
+     "        if is_closed_name(root_stem):\n", "        if False:\n",
      "test_check_memory_index.MemoryFileNameIsASlug."
      "test_a_closed_memory_folder_name_is_refused"),
+
+    ("имя папки с расширением снова не считается закрытым", LINTER,
+     "        root_stem = os.path.splitext(root_name)[0]\n",
+     "        root_stem = root_name\n",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_a_closed_memory_folder_name_with_an_extension_is_refused"),
+
+    ("регистровый двойник --index снова даёт ложное «пропал»", LINTER,
+     "            # Имя сравнивается точно - и здесь же точность ломала вход:\n"
+     "            # `--index memory.md` при файле `MEMORY.md` находило ничего, и\n"
+     "            # человек получал блокирующее «корневой индекс пропал» при\n"
+     "            # индексе, который лежит на месте. Регистровый двойник в корне -\n"
+     "            # это не пропажа, а имя в другом регистре: код 2 и то, что лежит\n"
+     "            # на деле. Глубже не смотрим: под-индекс - это отдельная память,\n"
+     "            # и её регистр к имени корневого не относится.\n"
+     "            for rel in sorted(file_map[0]):\n"
+     "                if \"/\" in rel:\n"
+     "                    continue\n"
+     "                if rel != args.index and rel.casefold() == args.index.casefold():\n"
+     "                    print(\"Ключ --index называет %s, а в корне памяти лежит \"\n"
+     "                          \"%s: имя индекса сравнивается точно и файл не \"\n"
+     "                          \"нашёлся. На Windows оба имени - один файл, в CI на \"\n"
+     "                          \"Linux - два разных. Укажите имя как лежит: --index \"\n"
+     "                          \"%s\" % (printable_name(args.index),\n"
+     "                                  printable_name(rel), printable_name(rel)),\n"
+     "                          file=sys.stderr)\n"
+     "                    return EXIT_USAGE\n",
+     "",
+     "test_check_memory_index.RootIndexLost."
+     "test_an_index_name_in_another_case_is_a_usage_error"),
+
+    ("README снова учит, что путь - форма значения --index", README_DOC,
+     "- именно **имя**, не шаблон и не путь: `--index INDEX.md`. Значение с "
+     "разделителем (`--index infra/MEMORY.md`) отклоняется с кодом 2: корневой "
+     "индекс лежит в самой папке памяти, под-индекс - в подпапке под тем же "
+     "именем, путь для их поиска не нужен. Само имя под правило слага не "
+     "попадает (оно задаётся отдельно), но закрытое имя не годится и здесь: "
+     "`--index claude.md` или `--index con.md` отклоняется с кодом 2 "
+     "(закрытыми считаются все сегменты переданного значения).",
+     "- именно **имя**, не шаблон: `--index INDEX.md`. Само имя под правило "
+     "слага не попадает (оно задаётся отдельно), но закрытое имя не годится и "
+     "здесь: `--index claude.md` или `--index con.md` отклоняется с кодом 2 "
+     "(проверяется весь путь индекса - он адрес внутри памяти).",
+     "test_check_memory_index.DocumentationMatchesReality."
+     "test_readme_teaches_the_index_is_a_name_not_a_path"),
+
+    ("README снова учит, что шаблон - единственная причина --index", README_DOC,
+     "шаблон или путь вместо имени в `--index`",
+     "шаблон вместо имени в `--index`",
+     "test_check_memory_index.DocumentationMatchesReality."
+     "test_readme_teaches_the_index_is_a_name_not_a_path"),
+
+    ("README снова умалчивает путь в перечне кода 2", README_DOC,
+     "шаблон, путь или закрытое имя в `--index`",
+     "шаблон или закрытое имя в `--index`",
+     "test_check_memory_index.DocumentationMatchesReality."
+     "test_readme_teaches_the_index_is_a_name_not_a_path"),
 
     ("предок пути снова считается именем памяти", LINTER,
      "        root_name = os.path.basename(os.path.normpath(args.memory_dir))\n",
      "        root_name = closed_segment(args.memory_dir) or \"\"\n",
      "test_check_memory_index.MemoryFileNameIsASlug."
      "test_a_closed_segment_above_the_memory_folder_is_not_our_business"),
+
+    ("сегмент --index с расширением снова прячет закрытое имя", LINTER,
+     "        if part and is_closed_name(os.path.splitext(part)[0]):\n",
+     "        if part and is_closed_name(part):\n",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_a_closed_segment_keeps_the_closed_verdict_with_an_extension"),
 
     ("законное имя снова считается закрытым", LINTER,
      "    return low == \"claude\" or low in DOS_RESERVED_NAMES",

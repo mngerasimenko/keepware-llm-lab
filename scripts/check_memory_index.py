@@ -855,12 +855,14 @@ def closed_segment(path):
     Для `--index`: значение - ИМЯ файла индекса, а не путь (`infra/MEMORY.md`
     отвергается ниже, «принимается имя»). Проверяется всё значение, а не
     только имя: закрытый сегмент в любом куске - более специфичный отказ
-    («закрыто»), и он называется первым. Имя САМОЙ папки памяти так не
-    проверяется - там только basename (сегменты выше это раскладка машины,
-    `~/.claude/...` и `/home/aux/memory`).
+    («закрыто»), и он называется первым. Сегмент проверяется по СТЕМУ, как
+    L6: `aux.md` закрыто наравне с `aux`, иначе расширение прятало причину
+    за «а не путь». Имя САМОЙ папки памяти так не проверяется - там только
+    basename (сегменты выше это раскладка машины, `~/.claude/...` и
+    `/home/aux/memory`).
     """
     for part in path.replace("\\", "/").split("/"):
-        if part and is_closed_name(part):
+        if part and is_closed_name(os.path.splitext(part)[0]):
             return part
     return None
 
@@ -2048,11 +2050,16 @@ def main(argv=None):
         # сегменты выше - раскладка машины (`/home/aux/memory`, `~/.claude/...`),
         # и отказ по ним был бы ложным (замер: `aux` - обычное имя каталога).
         root_name = os.path.basename(os.path.normpath(args.memory_dir))
-        if is_closed_name(root_name):
+        # `is_closed_name` принимает СТЕМ: `claude.md` - то же закрытое имя,
+        # что `claude`. Ветка `--index` расширение снимает, а имя папки уходило
+        # в проверку целиком, и `con.md`/`claude.md`/`nul.md` закрытыми не
+        # считались - обход того же класса с той же причиной.
+        root_stem = os.path.splitext(root_name)[0]
+        if is_closed_name(root_stem):
             print("Папка памяти названа закрытым именем: %s. Такое имя не "
                   "годится: %s; переименуйте папку"
                   % (printable_name(root_name),
-                     closed_name_reason(root_name)),
+                     closed_name_reason(root_stem)),
                   file=sys.stderr)
             return EXIT_USAGE
 
@@ -2074,6 +2081,25 @@ def main(argv=None):
         # проходил молча, а забытый черновик рядом - блокировался. Градиент
         # был обратный ущербу.
         if not any(os.path.dirname(p) == root for p in index_paths):
+            # Имя сравнивается точно - и здесь же точность ломала вход:
+            # `--index memory.md` при файле `MEMORY.md` находило ничего, и
+            # человек получал блокирующее «корневой индекс пропал» при
+            # индексе, который лежит на месте. Регистровый двойник в корне -
+            # это не пропажа, а имя в другом регистре: код 2 и то, что лежит
+            # на деле. Глубже не смотрим: под-индекс - это отдельная память,
+            # и её регистр к имени корневого не относится.
+            for rel in sorted(file_map[0]):
+                if "/" in rel:
+                    continue
+                if rel != args.index and rel.casefold() == args.index.casefold():
+                    print("Ключ --index называет %s, а в корне памяти лежит "
+                          "%s: имя индекса сравнивается точно и файл не "
+                          "нашёлся. На Windows оба имени - один файл, в CI на "
+                          "Linux - два разных. Укажите имя как лежит: --index "
+                          "%s" % (printable_name(args.index),
+                                  printable_name(rel), printable_name(rel)),
+                          file=sys.stderr)
+                    return EXIT_USAGE
             orphaned = memory_files_without_index(file_map[0], args.index)
             if orphaned:
                 shown = ", ".join(with_folder_prefix(rel, folder)

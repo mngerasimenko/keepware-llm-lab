@@ -247,7 +247,7 @@ MUTATIONS = [
      "                 else \"поправьте ссылки (в индексе и в [[связях]])\")",
      "        links = \"поправьте ссылки (в индексе и в [[связях]])\""),
     ("закрытое имя папки памяти снова проходит", LINTER,
-     "        if is_closed_name(root_name):\n", "        if False:\n"),
+     "        if is_closed_name(root_stem):\n", "        if False:\n"),
     ("закрытый сегмент в пути индекса снова проходит", LINTER,
      "        index_closed = closed_segment(index_stem)\n",
      "        index_closed = None\n"),
