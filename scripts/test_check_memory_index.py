@@ -423,6 +423,11 @@ class IndexLinksToFiles(MemoryFixture):
         Ветка сообщения существовала, но ни один из тестов на неё не попадал:
         мутация «отключить ветку» переживала весь набор. Диагноз «ссылка в
         никуда» вместо «это каталог» отправляет чинить не то.
+
+        Утверждение здесь обязано называть саму ветку: слово «каталог» есть
+        ещё и в итоговом пояснении про L6, и мягкое `assertIn("каталог")`
+        проходило даже тогда, когда ветка была отключена, - мутация снова
+        выжила в мутационной пробе.
         """
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n- [Инфра](infra) - раздел\n",
@@ -432,7 +437,8 @@ class IndexLinksToFiles(MemoryFixture):
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
-        self.assertIn("каталог", output)
+        self.assertIn("ссылка на каталог, а не на файл", output)
+        self.assertNotIn("ссылка в никуда", output)
 
 
 class MemoryFileNameIsASlug(MemoryFixture):
