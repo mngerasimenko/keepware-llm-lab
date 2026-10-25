@@ -58,6 +58,7 @@ REPO = os.path.dirname(SCRIPTS_DIR)
 LINTER = os.path.join("scripts", "check_memory_index.py")
 HOOK = os.path.join(".githooks", "pre-commit")
 TOOL = os.path.join("scripts", "mutation_check.py")
+SELF = os.path.join("scripts", "revert_check.py")
 # Потолок на один тест. Прогон здесь адресный - один именованный тест, а не
 # весь набор, - поэтому и запас нужен другой, чем у мутационной проверки.
 # Тесты хука поднимают свой репозиторий и на Windows доходят до полуминуты.
@@ -272,14 +273,23 @@ REVERTS = [
      "test_check_memory_index.PreCommitHook."
      "test_drafts_named_in_quotes_do_not_fake_a_failure"),
 
-    ("список известных путей снова не знает экранированной формы", LINTER,
-     "    known |= {printable_name(rel) for rel in known}\n", "    \n",
+    ("адрес с экранированным именем снова без приписки папки", LINTER,
+     "    return \"%s/%s\" % (printable_name(folder), printable_name(rel))",
+     "    return printable_name(rel)",
      "test_check_memory_index.AddressesAreClickable."
      "test_escaped_name_still_gets_the_prefix"),
 
     ("папка памяти снова подставляется в строку сырой", LINTER,
-     "    return \"%s%s/%s\" % (code, printable_name(folder), rest)",
-     "    return \"%s%s/%s\" % (code, folder, rest)",
+     "    return \"%s/%s\" % (printable_name(folder), printable_name(rel))",
+     "    return \"%s/%s\" % (folder, printable_name(rel))",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_the_folder_part_is_escaped_inside_the_join"),
+
+    ("адрес сироты в L2 снова без приписки папки", LINTER,
+     "            % (with_folder_prefix(rel, folder), hint, head_note,\n"
+     "               with_folder_prefix(index_name, folder), rel))",
+     "            % (rel, hint, head_note,\n"
+     "               with_folder_prefix(index_name, folder), rel))",
      "test_check_memory_index.AddressesAreClickable."
      "test_a_folder_with_a_line_break_does_not_tear_the_line"),
 
@@ -369,15 +379,43 @@ REVERTS = [
      "test_check_memory_index.AddressesAreClickable."
      "test_argparse_errors_escape_the_names_they_print"),
 
-    ("разбор ведущего адреса снова до пробела и двоеточия", LINTER,
-     "    for path in sorted(known, key=len, reverse=True):\n"
-     "        if rest.startswith(path) and ADDRESS_TAIL.match(rest, len(path)):\n"
-     "            return True\n"
-     "    return False",
-     "    match = re.match(r\"([^\\s:]+)(:\\d+)?(:?)(\\s|$)\", rest)\n"
-     "    return bool(match and match.group(1) in known)",
+    ("адреса в выводе снова не дописываются папкой памяти", LINTER,
+     "    return \"%s/%s\" % (printable_name(folder), printable_name(rel))",
+     "    return printable_name(rel)",
      "test_check_memory_index.AddressesAreClickable."
      "test_a_name_with_a_space_gets_the_prefix"),
+
+    ("адрес из середины фразы снова без приписки", LINTER,
+     "                   with_folder_prefix(guess, folder),",
+     "                   guess,",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_a_guess_in_the_middle_of_a_phrase_gets_the_prefix"),
+
+    ("слову фразы снова приписывают папку памяти", LINTER,
+     "                \"Индекс пуст: строк формата `- [Заголовок](файл.md) - крючок` в нём нет. \"\n"
+     "                \"Для новой памяти это нормально\"",
+     "                \"%s/Индекс пуст: строк формата `- [Заголовок](файл.md) - крючок` в нём нет. \"\n"
+     "                \"Для новой памяти это нормально\" % folder",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_phrase_word_does_not_get_the_prefix_when_it_collides"),
+
+    ("абсолютному пути снова приписывают папку", LINTER,
+     "    if not folder or os.path.isabs(rel):",
+     "    if not folder:",
+     "test_check_memory_index.AddressesAreClickable."
+     "test_prefix_joins_the_folder_and_leaves_absolute_paths_bare"),
+
+    ("потоки инструмента мутаций снова без режима ошибок", TOOL,
+     "            stream.reconfigure(encoding=\"utf-8\", errors=\"backslashreplace\")",
+     "            stream.reconfigure(encoding=\"utf-8\")",
+     "test_check_memory_index.ToolStreamsSetAnErrorMode."
+     "test_every_reconfigure_call_sets_an_error_mode"),
+
+    ("потоки собственного инструмента снова без режима ошибок", SELF,
+     "            stream.reconfigure(encoding=\"utf-8\", errors=\"backslashreplace\")",
+     "            stream.reconfigure(encoding=\"utf-8\")",
+     "test_check_memory_index.ToolStreamsSetAnErrorMode."
+     "test_every_reconfigure_call_sets_an_error_mode"),
 ]
 # Ограничитель обратного прохода (`floor`) сюда намеренно НЕ занесён: его
 # держит мутация в `mutation_check.py`, а единственный тест, который на его
@@ -545,9 +583,12 @@ def build_parser():
 
 
 def main(argv=None):
+    # errors= обязателен, а не украшение: без него остаётся `strict`, и печать
+    # имени с суррогатом падает UnicodeEncodeError. Та же строка, что в
+    # force_utf8_output линтера, - копии не должны расходиться.
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8")
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
         except Exception:
             pass
 
