@@ -337,7 +337,7 @@ REVERTS = [
      "test_check_memory_index.AddressesAreClickable."
      "test_two_other_early_refusals_escape_the_names_they_print"),
 
-    ("адреса из середины фразы снова печатаются сырыми", LINTER,
+    ("адреса без приписки папки снова печатаются сырыми", LINTER,
      "    if not folder or os.path.isabs(rel):\n"
      "        return printable_name(rel)",
      "    if not folder or os.path.isabs(rel):\n"
@@ -416,6 +416,35 @@ REVERTS = [
      "            stream.reconfigure(encoding=\"utf-8\")",
      "test_check_memory_index.ToolStreamsSetAnErrorMode."
      "test_every_reconfigure_call_sets_an_error_mode"),
+
+    ("путь в --index снова принимается и даёт ложный отказ", LINTER,
+     "        if \"/\" in args.index or \"\\\\\" in args.index:\n"
+     "            print(\"Ключ --index принимает ИМЯ файла индекса, а не путь: %s. \"\n"
+     "                  \"Корневой лежит в самой папке памяти, под-индекс - в \"\n"
+     "                  \"подпапке под тем же именем. Например: --index MEMORY.md\"\n"
+     "                  % printable_name(args.index),\n"
+     "                  file=sys.stderr)\n"
+     "            return EXIT_USAGE",
+     "",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_a_path_valued_index_is_refused_as_a_name"),
+
+    ("имя программы в отказе argparse снова сыро", LINTER,
+     "    parser.prog = printable_name(parser.prog)",
+     "",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_the_program_name_is_printed_on_one_line_too"),
+
+    ("корневой индекс в сообщении снова назван дважды", LINTER,
+     "                \"L2 %s - под-индекс, до которого неоткуда дойти: "
+     "от корневого \"\n"
+     "                \"индекса цепочки ссылок на него нет%s. Добавьте в %s \"\n",
+     "                \"L2 %s - под-индекс, до которого неоткуда дойти: "
+     "от корневого \"\n"
+     "                \"индекса (MEMORY.md) цепочки ссылок на него нет%s. "
+     "Добавьте в %s \"\n",
+     "test_check_memory_index.FilesAppearInIndex."
+     "test_the_root_index_is_named_once_in_the_unreachable_message"),
 ]
 # Ограничитель обратного прохода (`floor`) сюда намеренно НЕ занесён: его
 # держит мутация в `mutation_check.py`, а единственный тест, который на его

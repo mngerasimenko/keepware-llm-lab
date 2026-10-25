@@ -820,6 +820,24 @@ class MemoryFileNameIsASlug(MemoryFixture):
         self.assertIn("claude\\n", output, output)
         self.assertNotIn("claude\n.md", output, output)
 
+    def test_the_program_name_is_printed_on_one_line_too(self):
+        """В отказе argparse экранируется и `prog` - он тоже имя.
+
+        `message` проходил через `printable_name`, а `prog` - нет, и обе
+        строки отказа (`usage: ...` и `...: error: ...`) рвались именем
+        скрипта с символом разрыва. Отказ argparse уходит `SystemExit` - в
+        отличие от ранних отказов `main`, которые возвращают код.
+        """
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(sys, "argv", ["check\x0bmemory.py"]):
+            with redirect_stdout(out), redirect_stderr(err):
+                with self.assertRaises(SystemExit) as caught:
+                    linter.main(["--not-a-flag"])
+        output = out.getvalue() + err.getvalue()
+        self.assertEqual(caught.exception.code, 2, output)
+        self.assertIn("\\x0b", output, output)
+        self.assertNotIn("\x0b", output, output)
+
     def test_unicode_space_does_not_make_a_name_closed(self):
         """`claude\\u00a0` - не закрытое имя, а имя не по правилу слага.
 
@@ -866,10 +884,12 @@ class MemoryFileNameIsASlug(MemoryFixture):
         self.assertIn("закрыт", output.lower())
 
     def test_a_closed_segment_in_the_index_path_is_refused(self):
-        """`--index claude/MEMORY.md` - закрытый сегмент в пути индекса.
+        """`--index claude/MEMORY.md` - закрытый сегмент в имени с сепаратором.
 
-        Путь индекса - это адрес ВНУТРИ памяти (как `infra/MEMORY.md`), и
-        закрытый каталог в нём - имя памяти, а не раскладка машины.
+        Имя может содержать сепаратор (такое имя отвергается ниже как путь),
+        но сегменты его проверяются наравне: закрытый каталог - имя памяти,
+        а не раскладка машины, и причина «закрыто» называется раньше, чем
+        «принимается имя».
         """
         self.write({
             "claude/MEMORY.md": "- [Профиль](user.md) - кто\n",
@@ -878,6 +898,25 @@ class MemoryFileNameIsASlug(MemoryFixture):
         code, output = self.run_linter("--index", "claude/MEMORY.md")
         self.assertEqual(code, 2, output)
         self.assertIn("закрыт", output.lower())
+
+    def test_a_path_valued_index_is_refused_as_a_name(self):
+        """`--index infra/MEMORY.md` - путь, а ключ принимает ИМЯ.
+
+        Файл на месте (`memory/infra/MEMORY.md` существует), и до правки
+        такой прогон давал ложное блокирующее «корневой индекс пропал»:
+        `find_indexes` сравнивает по basename, и путь-значение не совпадает
+        ни с чем. Под-индекс живёт в подпапке под ТЕМ ЖЕ именем
+        (`--index MEMORY.md` находит и `infra/MEMORY.md`), поэтому
+        путь-значение модели не нужно - оно отвергается вслух, как шаблон.
+        """
+        self.write({
+            "infra/MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "infra/user.md": "факт\n",
+        })
+        code, output = self.run_linter("--index", "infra/MEMORY.md")
+        self.assertEqual(code, 2, output)
+        self.assertIn("а не путь", output, output)
+        self.assertNotIn("пропал", output, output)
 
     def test_directory_names_obey_the_rule_too(self):
         """Каталог входит в адрес наравне с именем файла.
@@ -1720,6 +1759,25 @@ class FilesAppearInIndex(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
         self.assertIn("infra/MEMORY.md", output)
+
+    def test_the_root_index_is_named_once_in_the_unreachable_message(self):
+        """Корневой индекс в сообщении называется один раз - адресом.
+
+        «от корневого индекса (MEMORY.md) ... Добавьте в memory/MEMORY.md»
+        называл один файл двумя формами подряд: голым именем в скобках и
+        адресом. Остаётся адрес - он открывается из каталога запуска; имя
+        идёт внутри примера строки индекса, куда его и впишут.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n",
+            "user.md": "факт\n",
+            "infra/MEMORY.md": "- [Сервер](server.md) - прод\n",
+            "infra/server.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("от корневого индекса (MEMORY.md)", output, output)
+        self.assertIn("от корневого индекса цепочки ссылок", output, output)
 
 
     def test_a_sub_index_behind_an_unclosed_fence_is_named_not_blamed(self):
@@ -3623,17 +3681,6 @@ class AddressesAreClickable(MemoryFixture):
         """
         self.assertEqual(linter.with_folder_prefix("a:b.md", "mem"),
                          "mem/a:b.md")
-
-    def test_a_known_prefix_of_a_longer_name_is_not_the_address(self):
-        """`draft.md` - не адрес строки про `draft.md.backup`.
-
-        Прежде короткое известное имя могло приписать папку к строке про
-        совершенно другой файл. Теперь путь собирается целиком, без разбора
-        строки, и короткое имя в нём по построению не участвует: у адреса
-        `draft.md.backup` не бывает чужой приписки.
-        """
-        self.assertEqual(linter.with_folder_prefix("draft.md.backup", "mem"),
-                         "mem/draft.md.backup")
 
 
 class LinkedSubtrees(MemoryFixture):

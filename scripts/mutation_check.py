@@ -184,10 +184,10 @@ MUTATIONS = [
      "             if True),"),
     ("сироту за недостижимым индексом шлют чинить не туда", LINTER,
      "                % (with_folder_prefix(rel, folder),\n"
-     "                   with_folder_prefix(stranded[rel], folder), index_name,\n"
+     "                   with_folder_prefix(stranded[rel], folder),\n"
      "                   with_folder_prefix(index_name, folder), stranded[rel])",
      "                % (with_folder_prefix(rel, folder),\n"
-     "                   with_folder_prefix(stranded[rel], folder), index_name,\n"
+     "                   with_folder_prefix(stranded[rel], folder),\n"
      "                   with_folder_prefix(index_name, folder), rel)"),
 
     ("адреса в выводе снова не дописываются папкой памяти", LINTER,
