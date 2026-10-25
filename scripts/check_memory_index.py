@@ -578,33 +578,48 @@ MEMORY_FIELD = re.compile(r"^(name|description)\s*:\s*\S", re.I)
 
 
 def looks_like_memory_file(path):
-    """Файл несёт шапку формата памяти."""
+    """Файл несёт шапку формата памяти.
+
+    `None` - файл не открылся: решить, память ли это, не удалось, и
+    вызывающий обязан сказать об этом вслух. Раньше отказ превращался в
+    `False`, нечитаемый `.md` пропадал из выдачи молча, и прогон отвечал
+    «Индекс не найден» с кодом 2 - будто путь указан неверно.
+    """
     try:
         head, _unclosed = frontmatter_lines(read_text(path))
     except OSError:
-        return False
+        return None
     return any(MEMORY_FIELD.match(line) for line in head)
 
 
 def memory_files_without_index(exact, index_name):
     """Файлы памяти в папке, где корневого индекса не нашлось.
 
-    Пусто - папка памятью не является: код 2 и совет проверить путь.
-    Непусто - память есть, а входа в неё нет: агент не увидит ни одного
-    файла, и это нарушение, а не невыполнимая проверка.
+    Возвращает (файлы памяти, нечитаемые). Нечитаемые - отдельным списком,
+    а не молча мимо: проверяющий не знает, память ли это, и обязан сказать
+    об этом, а не подменить ответом «проверьте путь».
+
+    Пустой первый список и пустой второй - папка памятью не является: код 2
+    и совет проверить путь. Непустой первый - память есть, а входа в неё
+    нет: агент не увидит ни одного файла, и это нарушение, а не
+    невыполнимая проверка.
 
     Читает файлы только в этой ветке, то есть когда корневого индекса уже
     нет. На горячий путь ничего не добавляется.
     """
     found = []
+    unreadable = []
     for rel in sorted(exact):
         if not rel.lower().endswith(".md"):
             continue
         if os.path.basename(rel) == index_name:
             continue
-        if looks_like_memory_file(exact[rel]):
+        verdict = looks_like_memory_file(exact[rel])
+        if verdict is None:
+            unreadable.append(rel)
+        elif verdict:
             found.append(rel)
-    return found
+    return found, unreadable
 
 
 def find_indexes(exact, index_name):
@@ -926,8 +941,13 @@ def badly_named_files(exact, index_name, allow_globs=()):
             if where in seen_dirs:
                 continue
             seen_dirs.add(where)
-            if not MEMORY_FILE_NAME.match(folder) or is_closed_name(folder):
-                found.append((where, folder, "каталога"))
+            # Каталог проверяется по СТЕМУ, как файл ниже: `claude.md` -
+            # то же закрытое имя, что `claude`, и полное имя прятало
+            # закрытость за формой слага (точка), а задание агенту называло
+            # не ту причину.
+            folder_stem = os.path.splitext(folder)[0]
+            if not MEMORY_FILE_NAME.match(folder_stem) or is_closed_name(folder_stem):
+                found.append((where, folder_stem, "каталога"))
         base = parts[-1]
         if base == index_name:
             continue
@@ -1517,14 +1537,18 @@ def check(root, index_paths, allow_globs, index_name, file_map, folder):
             if twin is not None:
                 # «На диске» - адрес файла, его открывают; повтор того же пути
                 # после «Приведите ссылку» - литерал для строки индекса, он
-                # отсчитывается от индекса и остаётся голым.
+                # отсчитывается от КАТАЛОГА ИНДЕКСА и остаётся голым. От корня
+                # памяти он был бы вредным: под-индекс `sub/MEMORY.md` получал
+                # задание вписать `sub/user.md`, и такая ссылка из `sub/`
+                # вела бы в `sub/sub/user.md`.
                 errors.append(
                     "L1 %s:%d регистр не совпадает: в индексе «%s», на диске «%s» "
                     "(на Windows пройдёт, в CI на Linux упадёт). Приведите ссылку "
                     "к тому, что на диске: `%s`"
                     % (with_folder_prefix(where, folder), lineno, rel,
                        with_folder_prefix(relative_to_root(root, twin), folder),
-                       relative_to_root(root, twin))
+                       os.path.relpath(twin, os.path.dirname(index_path))
+                       .replace(os.sep, "/"))
                 )
             elif os.path.isdir(absolute):
                 errors.append(
@@ -2022,10 +2046,15 @@ def main(argv=None):
         index_stem = os.path.splitext(args.index)[0]
         index_closed = closed_segment(index_stem)
         if index_closed:
+            # Причина - по СТЕМУ сегмента, не по его сырой форме:
+            # `closed_segment` возвращает `claude.md` как есть, а
+            # `closed_name_reason` для полного имени дал бы чужую (DOS)
+            # причину. Одно-компонентные значения спасал предварительный
+            # `splitext`, многосегментные с точкой в среднем сегменте - нет.
             print("Ключ --index называет закрытое имя: %s. Такое имя не годится: "
                   "%s; возьмите другое, например MEMORY.md"
                   % (printable_name(args.index),
-                     closed_name_reason(index_closed)),
+                     closed_name_reason(os.path.splitext(index_closed)[0])),
                   file=sys.stderr)
             return EXIT_USAGE
 
@@ -2100,7 +2129,8 @@ def main(argv=None):
                                   printable_name(rel), printable_name(rel)),
                           file=sys.stderr)
                     return EXIT_USAGE
-            orphaned = memory_files_without_index(file_map[0], args.index)
+            orphaned, unreadable_orphans = memory_files_without_index(
+                file_map[0], args.index)
             if orphaned:
                 shown = ", ".join(with_folder_prefix(rel, folder)
                                   for rel in orphaned[:5])
@@ -2111,6 +2141,11 @@ def main(argv=None):
                       "памятей, проверяйте каждую отдельно"
                       % (printable_name(args.index),
                          files_count(len(orphaned)), shown, more))
+                for rel in sorted(unreadable_orphans):
+                    print("%s: файл не читается - проверить его не удалось. "
+                          "Проверьте, что файл на месте и доступен: закройте "
+                          "редактор, снимите блокировку или почините ссылку"
+                          % with_folder_prefix(rel, folder))
                 print("\nНарушений: 1 (строк в индексе: 0)")
                 return EXIT_VIOLATION
             if index_paths:
@@ -2131,6 +2166,11 @@ def main(argv=None):
                 print("Индекс не найден: %s/%s"
                       % (printable_name(args.memory_dir.replace(os.sep, "/").rstrip("/")),
                          printable_name(args.index)), file=sys.stderr)
+            for rel in sorted(unreadable_orphans):
+                print("%s: файл не читается - проверить его не удалось. "
+                      "Проверьте, что файл на месте и доступен: закройте "
+                      "редактор, снимите блокировку или почините ссылку"
+                      % with_folder_prefix(rel, folder))
             return EXIT_USAGE
 
         errors, notices, warnings, row_count, unverifiable = check(

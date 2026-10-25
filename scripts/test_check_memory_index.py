@@ -258,6 +258,24 @@ class IndexLinksToFiles(MemoryFixture):
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
 
+    def test_the_case_fix_is_spelled_from_the_index_not_from_the_memory_root(self):
+        """Литерал в бэктиках вставляют в строку ИНДЕКСА, а не в корень.
+
+        Его отсчитывали от корня памяти: под-индекс `sub/MEMORY.md` получал
+        задание вписать `sub/user.md`, а такая ссылка из `sub/` ведёт в
+        `sub/sub/user.md`. Человек чинил по заданию и ломал дальше - то есть
+        инструмент давал вредную правку, а не просто неточный адрес.
+        """
+        self.write({
+            "MEMORY.md": "- [Под](sub/MEMORY.md) - под-индекс\n",
+            "sub/MEMORY.md": "- [Профиль](User.md) - кто\n",
+            "sub/user.md": "факт\n",
+        })
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("Приведите ссылку к тому, что на диске: `user.md`", output)
+        self.assertNotIn(": `sub/user.md`", output)
+
     def test_anchor_in_link_is_ignored(self):
         self.write({
             "MEMORY.md": "- [Профиль](user.md#раздел) - кто пользователь\n",
@@ -740,6 +758,27 @@ class MemoryFileNameIsASlug(MemoryFixture):
         dirs = {name for _, name, kind in found if kind == "каталога"}
         self.assertEqual(dirs, {"claude", "con"}, found)
 
+    def test_a_directory_with_an_extension_still_names_the_closed_reason(self):
+        """Каталог `claude.md/` - закрытое имя, а не «не по правилу».
+
+        Файлы в этом же куске проверяются по стему (`stem = splitext(base)`),
+        а каталоги шли полным именем: точка в имени каталога прятала
+        закрытость за формой слага, и задание агенту называло не ту причину
+        - тот же класс, что и у корневой папки с расширением, только носитель
+        остался.
+        """
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n"
+                         "- [Прод](claude.md/prod.md) - имя\n",
+            "user.md": "факт\n",
+            "claude.md/prod.md": "факт\n",
+        })
+        _code, output = self.run_linter()
+        lines = [line for line in findings(output, "L6") if "каталога" in line]
+        self.assertTrue(lines, output)
+        self.assertIn("закрыто", lines[0], output)
+        self.assertNotIn("не по правилу", lines[0], output)
+
     def test_the_message_for_a_closed_directory_does_not_advise_the_name_field(self):
         """Каталогу не советуют поле `name` и [[связи]]: их у него нет.
 
@@ -938,6 +977,21 @@ class MemoryFileNameIsASlug(MemoryFixture):
         self.assertEqual(code, 2, output)
         self.assertIn("закрыт", output.lower())
         self.assertNotIn("а не путь", output)
+
+    def test_the_closed_reason_names_claude_even_with_an_extension(self):
+        """`--index "claude.md/x"` - причина про `claude`, а не про DOS.
+
+        `closed_segment` возвращает сегмент как есть (`claude.md`), а
+        `closed_name_reason` принимает СТЕМ и прямо предупреждает: полное
+        имя дало бы для `claude.md` чужую (DOS) причину. Одно-компонентные
+        значения спасает предварительный `splitext`, многосегментные с
+        точкой в среднем сегменте - нет, и задание агенту называло не тот
+        класс имени.
+        """
+        code, output = self.run_linter("--index", "claude.md/x")
+        self.assertEqual(code, 2, output)
+        self.assertIn("не публикуют", output)
+        self.assertNotIn("DOS", output)
 
     def test_a_path_valued_index_is_refused_as_a_name(self):
         """`--index infra/MEMORY.md` - путь, а ключ принимает ИМЯ.
@@ -3619,7 +3673,7 @@ class AddressesAreClickable(MemoryFixture):
         self.write({"draft.md": "черновик\n"})
         out, err = io.StringIO(), io.StringIO()
         with unittest.mock.patch.object(linter, "memory_files_without_index",
-                                        lambda _exact, _name: ["draft\x0b.md"]):
+                                        lambda _exact, _name: (["draft\x0b.md"], [])):
             with redirect_stdout(out), redirect_stderr(err):
                 code = linter.main([self.root, "--index", "idx\x0b.md"])
         output = out.getvalue() + err.getvalue()
@@ -4350,6 +4404,41 @@ class UnreadableEntries(MemoryFixture):
         # всего прогона из-за того, что её не удалось прочитать.
         self.assertEqual(code, 1, output)
         self.assertIn("bitaya.md", output)
+
+    def test_an_unreadable_fact_is_named_when_the_index_is_missing(self):
+        """Пропал индекс, а прочитать, память ли это, не удалось - и молча.
+
+        `looks_like_memory_file` глотала `OSError` и возвращала False:
+        нечитаемый `.md` с шапкой памяти не считался файлом памяти, список
+        сирот пустел, и проверка отвечала «Индекс не найден» с кодом 2 - ни
+        слова о том, что файлов-то и не открывали. Человек шёл проверять
+        путь, а путь был верный: верной была папка, а прочитать её не
+        вышло.
+        """
+        self.write({"zanyatyi.md": "---\nname: zanyatyi\n---\nфакт\n"})
+        self.unreadable("zanyatyi.md")
+        code, output = self.run_linter()
+        self.assertEqual(code, 2, output)
+        self.assertIn("zanyatyi.md", output)
+        self.assertIn("не читается", output)
+
+    def test_an_unreadable_fact_is_named_even_when_the_index_loss_blocks(self):
+        """Та же дыра на входе, где пропажа индекса - уже нарушение.
+
+        Список сирот собирали из читаемых файлов, и нечитаемый сосед
+        пропадал из выдачи: прогон блокировал по одним и молчал про другие.
+        Правило «о невыполненной работе говорим вслух» здесь не должно
+        зависеть от того, нашлись ли сироты.
+        """
+        self.write({
+            "chestnyi.md": "---\nname: chestnyi\n---\nфакт\n",
+            "zanyatyi.md": "---\nname: zanyatyi\n---\nфакт\n",
+        })
+        self.unreadable("zanyatyi.md")
+        code, output = self.run_linter()
+        self.assertEqual(code, 1, output)
+        self.assertIn("zanyatyi.md", output)
+        self.assertIn("не читается", output)
 
 
 class DuplicateTitles(MemoryFixture):
@@ -5600,6 +5689,26 @@ class PreCommitHook(unittest.TestCase):
         printed = result.stdout.decode("utf-8", "replace")
         self.assertIn("не смог измерить длину аргументов", printed)
 
+    def test_a_failing_tr_does_not_abort_the_closed_name_check(self):
+        """Второе место, где `tr` звали без `set +e`.
+
+        Блок проверки формы `--index` приводит имя к сравнимому виду через
+        `tr`, и его падение под `set -e` обрывало хук ровно так же, как
+        когда-то замер длины: человек получал отклонённый коммит с ПУСТЫМ
+        выводом. Класс один - «падающий `tr` не роняет хук», - а входа у
+        него два, и первый держал лишь замер длины.
+        """
+        self.write_config("CLAUDE.md", "# Проект\n\nОбычные инструкции.\n")
+        self.git("config", "memorycheck.args", "--index con")
+        self.git("add", "-A")
+        fake = self.with_fake_tool("tr", "echo 42\nexit 3\n")
+        if not self.substitution_reaches_the_shell(fake, "tr"):
+            self.skipTest("подмена tr не доходит до этого sh")
+        result = self.run_hook_with_path(fake)
+        printed = result.stdout.decode("utf-8", "replace")
+        self.assertIn("строку импорта", printed)
+        self.assertNotIn("@memory/con", printed)
+
     def test_a_failing_wc_does_not_switch_the_budget_off_silently(self):
         """Упавший `wc` не виден по статусу - его прячет следующий `tr`.
 
@@ -5969,6 +6078,57 @@ class PreCommitHook(unittest.TestCase):
         text = result.stdout.decode("utf-8", "replace")
         self.assertEqual(result.returncode, 0, text)
         self.assertNotIn("НИ ОДНОГО факта", text)
+
+    def run_hook_with_index_key(self, value):
+        """Кладёт `--index ЗНАЧЕНИЕ` в memorycheck.args и прогоняет хук."""
+        self.write_config("CLAUDE.md", "# Проект\n\nОбычные инструкции.\n")
+        self.git("config", "memorycheck.args", "--index %s" % value)
+        self.git("add", "-A")
+        result = self.run_hook()
+        return result.stdout.decode("utf-8", "replace")
+
+    def test_the_hook_does_not_advise_an_import_line_for_a_path_index(self):
+        """Путь вместо имени не должен превращаться в совет испортить конфиг.
+
+        Хук строил строку импорта из сырого значения memorycheck.args: при
+        `--index infra/MEMORY.md` он требовал вписать @memory/infra/MEMORY.md,
+        а такое значение проверка не принимает - она ждёт ИМЯ, а не путь
+        (под-индекс ищется в подпапке под тем же именем). Человек получал
+        задание, за которым следовал код 2 на каждом запуске.
+        """
+        text = self.run_hook_with_index_key("infra/MEMORY.md")
+        self.assertNotIn("@memory/infra/MEMORY.md", text)
+        self.assertIn("строку импорта", text)
+
+    def test_the_hook_does_not_advise_an_import_line_for_a_glob_index(self):
+        """Шаблон вместо имени - та же вредная строка, другой вход класса."""
+        text = self.run_hook_with_index_key("*.md")
+        self.assertNotIn("@memory/*.md", text)
+        self.assertIn("строку импорта", text)
+
+    def test_the_hook_does_not_advise_an_import_line_for_a_closed_index(self):
+        """Закрытое имя в --index проверка тоже отвергает - совета быть не должно."""
+        text = self.run_hook_with_index_key("claude.md")
+        self.assertNotIn("@memory/claude.md", text)
+        self.assertIn("строку импорта", text)
+
+    def test_the_hook_refuses_every_closed_name_the_checker_refuses(self):
+        """Копия списка закрытых имён в хуке держится сверкой с его источником.
+
+        Список живёт в check_memory_index.py (DOS_RESERVED_NAMES плюс claude),
+        а совет строки импорта строит хук - значит у хука своя копия, и она
+        обязана расходиться с источником при любой его правке. Дрейф ловится
+        здесь: имя, которое проверка отвергает, а хук пропускает, снова даёт
+        вредный совет. Проверяются и стем, и имя с расширением - проверка
+        снимает расширение, и `aux.md` закрыто наравне с `aux`.
+        """
+        names = ["claude"] + sorted(linter.DOS_RESERVED_NAMES)
+        for name in names:
+            for value in (name, "%s.md" % name):
+                with self.subTest(value=value):
+                    text = self.run_hook_with_index_key(value)
+                    self.assertNotIn("@memory/%s" % value, text)
+                    self.assertIn("строку импорта", text)
 
     def fake_python3(self, body):
         """Кладёт в PATH подставной python3 и возвращает окружение с ним."""

@@ -221,6 +221,20 @@ REVERTS = [
      "test_check_memory_index.MemoryFileNameIsASlug."
      "test_a_closed_segment_keeps_the_closed_verdict_with_an_extension"),
 
+    ("причина закрытого сегмента снова по сырой форме", LINTER,
+     "                     closed_name_reason(os.path.splitext(index_closed)[0])),\n",
+     "                     closed_name_reason(index_closed)),\n",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_the_closed_reason_names_claude_even_with_an_extension"),
+
+    ("каталог с расширением снова не стемится в L6", LINTER,
+     "            if not MEMORY_FILE_NAME.match(folder_stem) or is_closed_name(folder_stem):\n"
+     "                found.append((where, folder_stem, \"каталога\"))\n",
+     "            if not MEMORY_FILE_NAME.match(folder) or is_closed_name(folder):\n"
+     "                found.append((where, folder, \"каталога\"))\n",
+     "test_check_memory_index.MemoryFileNameIsASlug."
+     "test_a_directory_with_an_extension_still_names_the_closed_reason"),
+
     ("законное имя снова считается закрытым", LINTER,
      "    return low == \"claude\" or low in DOS_RESERVED_NAMES",
      "    return \"claude\" in low or low in DOS_RESERVED_NAMES",
@@ -247,8 +261,8 @@ REVERTS = [
      "test_no_output_line_is_torn_apart_by_a_name"),
 
     ("закрытое имя каталога снова проходит правило", LINTER,
-     "            if not MEMORY_FILE_NAME.match(folder) or is_closed_name(folder):",
-     "            if not MEMORY_FILE_NAME.match(folder):",
+     "            if not MEMORY_FILE_NAME.match(folder_stem) or is_closed_name(folder_stem):",
+     "            if not MEMORY_FILE_NAME.match(folder_stem):",
      "test_check_memory_index.MemoryFileNameIsASlug."
      "test_a_closed_directory_name_is_an_error"),
 
@@ -509,6 +523,74 @@ REVERTS = [
      "Добавьте в %s \"\n",
      "test_check_memory_index.FilesAppearInIndex."
      "test_the_root_index_is_named_once_in_the_unreachable_message"),
+
+    ("совет импорта снова не отвергает шаблон в --index", HOOK,
+     '        IMPORT_INDEX_INVALID="шаблон, а не имя"\n',
+     "        :\n",
+     "test_check_memory_index.PreCommitHook."
+     "test_the_hook_does_not_advise_an_import_line_for_a_glob_index"),
+
+    ("совет импорта снова не отвергает закрытое имя в --index", HOOK,
+     '            IMPORT_INDEX_INVALID="закрытое имя"\n',
+     "            :\n",
+     "test_check_memory_index.PreCommitHook."
+     "test_the_hook_refuses_every_closed_name_the_checker_refuses"),
+
+    ("совет импорта снова не отвергает путь в --index", HOOK,
+     '            IMPORT_INDEX_INVALID="путь, а не имя"\n',
+     "            :\n",
+     "test_check_memory_index.PreCommitHook."
+     "test_the_hook_does_not_advise_an_import_line_for_a_path_index"),
+
+    ("отказ по форме --index снова не гасит совет импорта", HOOK,
+     '    IMPORT_INDEX=""\n    IMPORT_PATTERN=""\n',
+     "    :\n    :\n",
+     "test_check_memory_index.PreCommitHook."
+     "test_the_hook_does_not_advise_an_import_line_for_a_closed_index"),
+
+    ("нечитаемый файл снова неотличим от непамяти", LINTER,
+     "        return None\n    return any(MEMORY_FIELD.match(line) for line in head)\n",
+     "        return False\n    return any(MEMORY_FIELD.match(line) for line in head)\n",
+     "test_check_memory_index.UnreadableEntries."
+     "test_an_unreadable_fact_is_named_when_the_index_is_missing"),
+
+    ("нечитаемый рядом с сиротами снова молчит", LINTER,
+     "                for rel in sorted(unreadable_orphans):\n"
+     "                    print(\"%s: файл не читается - проверить его не удалось. \"\n"
+     "                          \"Проверьте, что файл на месте и доступен: закройте \"\n"
+     "                          \"редактор, снимите блокировку или почините ссылку\"\n"
+     "                          % with_folder_prefix(rel, folder))\n"
+     "                print(\"\\nНарушений: 1 (строк в индексе: 0)\")\n",
+     "                print(\"\\nНарушений: 1 (строк в индексе: 0)\")\n",
+     "test_check_memory_index.UnreadableEntries."
+     "test_an_unreadable_fact_is_named_even_when_the_index_loss_blocks"),
+
+    ("нечитаемый при пропавшем индексе снова молчит", LINTER,
+     "            for rel in sorted(unreadable_orphans):\n"
+     "                print(\"%s: файл не читается - проверить его не удалось. \"\n"
+     "                      \"Проверьте, что файл на месте и доступен: закройте \"\n"
+     "                      \"редактор, снимите блокировку или почините ссылку\"\n"
+     "                      % with_folder_prefix(rel, folder))\n"
+     "            return EXIT_USAGE\n",
+     "            return EXIT_USAGE\n",
+     "test_check_memory_index.UnreadableEntries."
+     "test_an_unreadable_fact_is_named_when_the_index_is_missing"),
+
+    ("литерал правки регистра снова отсчитан от корня памяти", LINTER,
+     "                       os.path.relpath(twin, os.path.dirname(index_path))\n"
+     "                       .replace(os.sep, \"/\"))\n",
+     "                       relative_to_root(root, twin))\n",
+     "test_check_memory_index.IndexLinksToFiles."
+     "test_the_case_fix_is_spelled_from_the_index_not_from_the_memory_root"),
+
+    ("падающий tr снова рвёт проверку формы --index", HOOK,
+     "    set +e\n"
+     "    IMPORT_STEM=$(printf '%s' \"$IMPORT_STEM\" | tr '[:upper:]' '[:lower:]' | tr -d ' \\t\\r\\n')\n"
+     "    STEM_STATUS=$?\n"
+     "    set -e\n",
+     "    IMPORT_STEM=$(printf '%s' \"$IMPORT_STEM\" | tr '[:upper:]' '[:lower:]' | tr -d ' \\t\\r\\n')\n",
+     "test_check_memory_index.PreCommitHook."
+     "test_a_failing_tr_does_not_abort_the_closed_name_check"),
 ]
 # Ограничитель обратного прохода (`floor`) сюда намеренно НЕ занесён: его
 # держит мутация в `mutation_check.py`, а единственный тест, который на его
