@@ -2363,21 +2363,34 @@ class CiGuards(unittest.TestCase):
         Матрица из двух систем - вторая половина того же: бит исполняемости
         и регистровые двойники видны только на Linux, и на одной Windows CI
         зеленел бы на памяти, которая там красная.
+
+        Ярлык остаётся ubuntu-latest: номер Ubuntu не закрепляем. Точная
+        3.9 на новом образе не ставится, пол пакета — >=3.9. Смотрим блок
+        matrix, а не весь файл: комментарий с теми же словами проверку
+        не удовлетворяет.
         """
         text = self.workflow()
         env_block = re.search(r"\n    env:\n((?:      .*\n|\n)+)", text)
         self.assertIsNotNone(env_block, "в workflow не найден блок env")
         self.assertIn("MEMCHECK_REQUIRE_SH", env_block.group(1),
                       "без неё тесты хука в CI пропускаются молча")
-        self.assertIn("ubuntu", text)
-        self.assertIn("windows", text)
+        matrix = re.search(r"\n      matrix:\n((?:        .*\n)+)", text)
+        self.assertIsNotNone(matrix, "блок matrix не найден")
+        body = matrix.group(1)
+        self.assertIn("os: [ubuntu-latest, windows-latest]", body)
+        self.assertIn('python-version: [">=3.9"]', body)
+        self.assertNotIn("ubuntu-24.04", body)
+        self.assertNotIn("ubuntu-26.04", body)
+        self.assertNotIn("3.13", body)
+        self.assertNotRegex(body, r"""['"]3\.9(?:\.\d+)?['"]""")
 
 
     def test_ci_checks_that_tests_were_actually_collected(self):
         """На Python 3.9 сломанный discover даёт зелёную галочку при нуле тестов.
 
         Свой возврат 5 «ни одного теста не собрано» unittest получил только в
-        3.12, а в матрице есть 3.9. Тот же класс, что MEMCHECK_REQUIRE_SH: без
+        3.12. Пол пакета — 3.9+, и ниже 3.12 сломанный discover молчит.
+        Тот же класс, что MEMCHECK_REQUIRE_SH: без
         гарда галочка зелёная, а проверка не выполнялась.
 
         Гард ЗАПУСКАЕТСЯ, а не грепается. Прежняя редакция искала слово
@@ -3921,8 +3934,7 @@ class LinkedSubtrees(MemoryFixture):
     def test_linked_subtree_is_pruned_without_isjunction(self):
         """os.path.isjunction есть только с 3.12, а islink не видит junction с 3.8.
 
-        Значит на 3.8-3.11 под Windows защита не работала бы вовсе - в том
-        числе в ячейке CI windows-latest / 3.9.
+        Значит на 3.8-3.11 под Windows защита не работала бы вовсе.
         """
         outside = tempfile.mkdtemp(prefix="memcheck-outside-")
         self.addCleanup(shutil.rmtree, outside, True)

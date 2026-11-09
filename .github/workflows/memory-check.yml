@@ -37,7 +37,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.9", "3.13"]
+        python-version: [">=3.9"]
 
     steps:
       - uses: actions/checkout@v4
@@ -47,8 +47,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       # Свой возврат 5 «ни одного теста не собрано» unittest получил только в
-      # 3.12, а в матрице есть 3.9: там сломанный discover дал бы зелёную
-      # галочку при невыполненных тестах. Тот же класс, что MEMCHECK_REQUIRE_SH.
+      # 3.12. Пол пакета — 3.9+, и на интерпретаторе ниже 3.12 сломанный
+      # discover дал бы зелёную галочку при невыполненных тестах. Тот же
+      # класс, что MEMCHECK_REQUIRE_SH.
       - name: Тесты вообще собрались
         run: python -c "import unittest, sys; n = unittest.defaultTestLoader.discover('scripts', 'test_*.py').countTestCases(); print('собрано тестов:', n); sys.exit(0 if n >= 250 else 1)"
 
