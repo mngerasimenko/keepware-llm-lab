@@ -1,6 +1,7 @@
 ---
 name: user_example
 description: "Пользователь - senior backend-разработчик, TypeScript/Node, ценит явные типы и краткость"
+updated: 2026-11-20
 metadata:
   type: user
 ---

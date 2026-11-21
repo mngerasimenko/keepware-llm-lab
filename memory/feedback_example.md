@@ -1,6 +1,7 @@
 ---
 name: feedback_example
 description: "Коммиты - Conventional Commits, одна логическая правка на коммит, без эмодзи в заголовке"
+updated: 2026-11-20
 metadata:
   type: feedback
 ---

@@ -18,11 +18,16 @@
                проходят, но запрещены отдельно. Имя САМОЙ папки памяти под
                правило слага не попадает - у неё проверяются только закрытые
                имена (см. main).
+  L7 (мягко)   у факта есть дата `updated: ГГГГ-ММ-ДД` не старше порога, а
+               замена объявлена с двух сторон: `supersedes` в новом файле и
+               `status: superseded` в старом.
 
-Нарушение L1, L2, L5 или L6 - выход с кодом 1. L3 и L4 печатаются предупреждениями,
-код 0: индекс намеренно не уникальный ключ, а связи [[...]] проверка застаёт
-в памяти, где они уже накопились, и блокировать первый же коммит из-за них
-значит научить человека жать --no-verify.
+Нарушение L1, L2, L5 или L6 - выход с кодом 1. L3, L4 и L7 печатаются
+предупреждениями, код 0: индекс намеренно не уникальный ключ, а связи [[...]]
+проверка застаёт в памяти, где они уже накопились, и блокировать первый же
+коммит из-за них значит научить человека жать --no-verify. Поля жизненного
+цикла появились позже самой памяти - сотни файлов написаны без них, - и
+красный на них покрасил бы всю живую память сразу.
 
 Код 2 - проверку не удалось выполнить (нет папки, указана не та папка, сбой):
 это НЕ нарушение, и тот, кто вызывает скрипт, не должен путать одно с другим.
@@ -48,6 +53,7 @@
 """
 
 import argparse
+import datetime
 import fnmatch
 import os
 import re
@@ -126,6 +132,37 @@ def closes_fence(mark, opened):
 FRONTMATTER_ORPHAN = re.compile(r"^orphan\s*:\s*true\s*$", re.I)
 # Признак, отличающий незакрытую YAML-шапку от горизонтальной линейки.
 YAML_PAIR = re.compile(r"^\s*[\w.\-]+\s*:\s*\S")
+
+# Поля жизненного цикла факта - формат v2. Нулевой отступ по той же причине,
+# что и у `orphan`: ключи формата верхнего уровня, а `metadata.updated` из
+# пользовательской структуры - не наш ключ.
+#
+# Имена взяты те, которые человек и так пишет в шапке, когда заводит файл:
+# `updated` и `status` - те же слова, что в задаче и в нарядах портфеля, а
+# `supersedes` - единственное из трёх, которое приходится объявлять заново.
+# Изобретать `last_reviewed` или `lifecycle` значило бы завести третье
+# написание того, что уже называется своим словом.
+UPDATED_FIELD = re.compile(r"^updated\s*:\s*(.*?)\s*$", re.I)
+STATUS_FIELD = re.compile(r"^status\s*:\s*(.*?)\s*$", re.I)
+SUPERSEDES_FIELD = re.compile(r"^supersedes\s*:\s*(.*?)\s*$", re.I)
+# Дата одна и в одном виде: `2026-11-20`. Точки и слэши не принимаем - по ним
+# нельзя сравнивать строкой, и «21.11.2026» рядом с «2026-11-21» даёт две
+# сортировки одного дня.
+ISO_DATE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
+# Набор объявлен целиком, а не «активен и всё остальное»: неизвестное слово
+# в `status` означает, что автор имел в виду что-то своё, и догадываться за
+# него нельзя - иначе факт молча выпадает из жизни памяти.
+FACT_STATUSES = ("active", "deprecated", "superseded")
+# Порог устаревания в днях. Число - предложение, а не догма: у портфеля
+# факты живут годами, у быстрого проекта месяц уже много. Полгода выбраны
+# как «два раза в год факт перечитывают» - этого хватает, чтобы поймать
+# память, которую не открывали с прошлой смены контекста, и не хватает,
+# чтобы бурчать на каждый живой файл.
+STALE_DAYS = 180
+# Сколько имён перечислять в сводной строке про отсутствующую дату. Имена
+# дальше пятого ничего не добавляют: их всё равно не читают по одному, а
+# строка на сотню файлов превращается в стену.
+STALE_LISTED = 5
 
 EXIT_OK = 0
 EXIT_VIOLATION = 1
@@ -1205,9 +1242,224 @@ def mentioned_in_raw_text(index_texts, *names):
                for text in index_texts.values() for pattern in patterns)
 
 
+def frontmatter_field(head, pattern):
+    """Значение поля шапки по первой подходящей строке, или None.
+
+    Первая, а не последняя: два `status` в одной шапке - это уже не наш
+    случай, и брать из них «более поздний» значило бы гадать.
+    """
+    for line in head:
+        match = pattern.match(line)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def parse_iso_date(value):
+    """Дата из строки `ГГГГ-ММ-ДД` или None, если это не дата."""
+    if not ISO_DATE.match(value):
+        return None
+    try:
+        return datetime.date(*(int(part) for part in value.split("-")))
+    except ValueError:
+        # Форма верная, дня такого нет: 2026-02-31 и 2026-13-01.
+        return None
+
+
+def parse_stale_after(value):
+    """Число дней из ключа или None, если это не целое >= 0.
+
+    Отдельная функция, а не `int()` на месте: `int` молча съедает пробелы и
+    знаки, а `--stale-after -1` должен быть отказом в ключе, а не порогом
+    «минус день», при котором устаревает всё, включая сегодняшние записи.
+    """
+    text = value.strip()
+    if not text or not text.isascii() or not text.isdigit():
+        return None
+    return int(text)
+
+
+def lifecycle_findings(exact, index_name, cache, allow_globs, folder, warnings,
+                       today=None, stale_after=STALE_DAYS):
+    """L7: возраст факта и его замена. Ни одного нарушения, только советы.
+
+    Формат v2 - `updated`, `status`, `supersedes` - появился после того, как
+    память уже стояла у агентов портфеля: сотни файлов написаны без этих
+    полей. Поэтому здесь нет ни одной ошибки. Файл без даты это «возраст
+    неизвестен», а не поломка, и красный на нём покрасил бы всю живую память
+    сразу - а красный, который горит всегда, перестаёт различать что-либо.
+    Ровно эта беда и заставила L3 и L4 сделать предупреждениями.
+
+    Порог устаревания - предложение, а не лимит: он говорит «перечитай
+    факт», а не «факт неверен». Дата ставится тогда, когда факт перечитали,
+    поэтому свежая дата у старого текста законна и обязательна. Ноль
+    отключает проверку возраста целиком - и вместе с ней совет про
+    отсутствующую дату: «возраст мне не важен» относится к обоим.
+
+    У выключенного факта возраст не спрашивают. `deprecated` и `superseded`
+    - это уже решение автора: перечитывать нечего, а совет «перечитай и
+    обнови дату» на таком файле ведёт к правке, которая ничего не чинит.
+
+    Отсутствие даты называется ОДНОЙ строкой на прогон. Строка на каждый
+    файл печатается хуком на каждом коммите и приучает пролистывать вывод -
+    та же беда однажды заставила предупреждения замолчать под --quiet, и
+    сотня находок L4 не попалась человеку на глаза ни разу.
+    """
+    if today is None:
+        today = datetime.date.today()
+    unreadable = cache.get(UNREADABLE_KEY, ())
+    names, similar = known_memory_names(exact)
+    facts = []
+    for rel in sorted(exact):
+        if not rel.lower().endswith(".md"):
+            continue
+        if os.path.basename(rel) == index_name:
+            continue
+        if is_excluded(rel, allow_globs) or rel in unreadable:
+            continue
+        head, _unclosed = frontmatter_lines(cached_text(exact[rel], rel, cache))
+        facts.append({
+            "rel": rel,
+            "stem": os.path.splitext(os.path.basename(rel))[0],
+            "updated": frontmatter_field(head, UPDATED_FIELD),
+            "status": (frontmatter_field(head, STATUS_FIELD) or "").lower(),
+            "supersedes": frontmatter_field(head, SUPERSEDES_FIELD),
+        })
+
+    by_rel = {fact["rel"]: fact for fact in facts}
+    stems = defaultdict(list)
+    for fact in facts:
+        stems[fact["stem"]].append(fact["rel"])
+
+    # Первый проход: шапка каждого файла сама по себе. Порядок обхода
+    # отсортирован, поэтому вывод одного прогона не зависит от того, в каком
+    # порядке файловая система отдала имена.
+    undated = []
+    claimed = set()
+    for fact in facts:
+        rel = fact["rel"]
+        status = fact["status"]
+        if status and status not in FACT_STATUSES:
+            warnings.append(
+                "L7 %s: `status: %s` - не из набора. Допустимо: %s. "
+                "`active` - факт в работе, `deprecated` - устарел, но ещё "
+                "объясняет прошлое, `superseded` - заменён другим файлом"
+                % (with_folder_prefix(rel, folder), fact["status"],
+                   ", ".join(FACT_STATUSES)))
+            # Слово не наше - и судить по нему нельзя: дальше файл считается
+            # действующим, потому что так его и написали.
+            fact["status"] = status = ""
+        retired = status in ("deprecated", "superseded")
+
+        if stale_after and not retired:
+            if not fact["updated"]:
+                undated.append(rel)
+            else:
+                when = parse_iso_date(fact["updated"])
+                if when is None:
+                    warnings.append(
+                        "L7 %s: `updated: %s` - не дата. Формат один: "
+                        "`updated: ГГГГ-ММ-ДД` (например, `2026-11-20`). По "
+                        "нему проверка считает возраст, а человек - порядок "
+                        "фактов"
+                        % (with_folder_prefix(rel, folder), fact["updated"]))
+                elif when > today:
+                    warnings.append(
+                        "L7 %s: `updated: %s` - дата в будущем. Возраст по "
+                        "ней отрицательный, и устаревание такого факта не "
+                        "заметит никто. Поставьте дату, когда факт "
+                        "перечитали, - не позже сегодняшней"
+                        % (with_folder_prefix(rel, folder), fact["updated"]))
+                else:
+                    age = (today - when).days
+                    if age > stale_after:
+                        warnings.append(
+                            "L7 %s: факт не перечитывали %d дней "
+                            "(`updated: %s`, порог %d). Перечитайте и "
+                            "поставьте свежую дату либо пометьте "
+                            "`status: deprecated`, если он больше не в "
+                            "работе. Порог меняется ключом `--stale-after`"
+                            % (with_folder_prefix(rel, folder), age,
+                               fact["updated"], stale_after))
+
+        if fact["supersedes"]:
+            target = fact["supersedes"]
+            target_stem = (target[:-3] if target.lower().endswith(".md")
+                           else target)
+            if target_stem == fact["stem"]:
+                warnings.append(
+                    "L7 %s: `supersedes: %s` называет сам файл - факт не "
+                    "может заменять себя. Уберите строку: замена "
+                    "объявляется в НОВОМ файле и ссылается на старый"
+                    % (with_folder_prefix(rel, folder), target))
+            elif target not in names:
+                guess = similar.get(loose(target), set()) - {rel}
+                if len(guess) == 1:
+                    only = guess.pop()
+                    warnings.append(
+                        "L7 %s: `supersedes: %s` - такого файла в памяти "
+                        "нет. Похоже, имелся в виду %s: исправьте на "
+                        "`supersedes: %s`"
+                        % (with_folder_prefix(rel, folder), target,
+                           with_folder_prefix(only, folder),
+                           os.path.splitext(os.path.basename(only))[0]))
+                else:
+                    warnings.append(
+                        "L7 %s: `supersedes: %s` - такого файла в памяти "
+                        "нет. Назовите заменяемый файл его именем без `.md`"
+                        % (with_folder_prefix(rel, folder), target))
+            else:
+                claimed.add(target_stem)
+
+    # Второй проход: пара «замена объявлена / старый помечен». Одной стороны
+    # мало: новый файл, назвавший предшественника, без метки в старом
+    # оставляет оба факта в работе, и агент читает их как два разных мнения.
+    for fact in facts:
+        if not fact["supersedes"] or fact["status"] == "superseded":
+            continue
+        target_stem = (fact["supersedes"][:-3]
+                       if fact["supersedes"].lower().endswith(".md")
+                       else fact["supersedes"])
+        if target_stem == fact["stem"]:
+            # Самозамена уже названа выше, отдельной строкой. Вторая строка
+            # про неё же была бы повтором одной причины двумя находками.
+            continue
+        targets = stems.get(target_stem, [])
+        if len(targets) != 1:
+            continue
+        old = by_rel[targets[0]]
+        if old["status"] != "superseded":
+            warnings.append(
+                "L7 %s: объявлен заменой %s, а тот не помечен "
+                "`status: superseded`. Пометьте старый файл - иначе он "
+                "остаётся в работе рядом с новым"
+                % (with_folder_prefix(fact["rel"], folder),
+                   with_folder_prefix(old["rel"], folder)))
+
+    for fact in facts:
+        if fact["status"] == "superseded" and fact["stem"] not in claimed:
+            warnings.append(
+                "L7 %s: `status: superseded`, но ни один файл не объявляет "
+                "его своей заменой - факт выключен молча. Либо допишите в "
+                "новый файл `supersedes: %s`, либо уберите `status`, если "
+                "замены нет"
+                % (with_folder_prefix(fact["rel"], folder), fact["stem"]))
+
+    if undated:
+        shown = ", ".join(with_folder_prefix(rel, folder)
+                          for rel in undated[:STALE_LISTED])
+        more = (", и ещё %d" % (len(undated) - STALE_LISTED)
+                if len(undated) > STALE_LISTED else "")
+        warnings.append(
+            "L7 память: без поля `updated` - %s: %s%s. Возраст такого факта "
+            "неизвестен, и «устарел ли он» проверить нельзя. Добавьте в "
+            "шапку `updated: ГГГГ-ММ-ДД` - дату последнего перечитывания"
+            % (files_count(len(undated)), shown, more))
+
+
 def check_files_alone(exact, index_name, cache, allow_globs, folder,
-                      errors, warnings, notices):
-    """L4, L5 и L6: всё, что проверяется по файлам, без участия индекса.
+                      errors, warnings, notices, stale_after=STALE_DAYS):
+    """L4, L5, L6 и L7: всё, что проверяется по файлам, без участия индекса.
 
     Вынесено отдельно не для красоты. Пока эти три проверки стояли ниже
     ветки «индекс не прочитан», нечитаемый индекс отменял и их - а
@@ -1294,6 +1546,13 @@ def check_files_alone(exact, index_name, cache, allow_globs, folder,
                 "нет. Поправьте имя в ссылке или заведите такой файл"
                 % (with_folder_prefix(rel, folder), lineno, target, target))
 
+    # L7: возраст факта и объявленная замена. Предупреждение и только оно:
+    # формат v2 моложе самой памяти, и красный на нём покрасил бы сотни живых
+    # файлов сразу. Стоит здесь, рядом с остальными проверками по файлам, по
+    # той же причине, что и L4-L6: от индекса они не зависят.
+    lifecycle_findings(exact, index_name, cache, allow_globs, folder, warnings,
+                       stale_after=stale_after)
+
     # Файлы, которые не открылись. По ним не проверены ни L4, ни L5, ни
     # намеренность сиротства - значит проверка выполнена не до конца, и это
     # код 2, а не «согласована».
@@ -1324,7 +1583,8 @@ def escaped_findings(errors, notices, warnings):
             [printable_name(line) for line in warnings])
 
 
-def check(root, index_paths, allow_globs, index_name, file_map, folder):
+def check(root, index_paths, allow_globs, index_name, file_map, folder,
+          stale_after=STALE_DAYS):
     """Возвращает (ошибки, структурные заметки, советы, строк, непроверяемо).
 
     Заметка структурная, если часть проверки не выполнилась: незакрытый блок
@@ -1597,11 +1857,11 @@ def check(root, index_paths, allow_globs, index_name, file_map, folder):
         notices.append(
             "L2 и L3 не проверялись: не прочитано индексов - %d. Пока их не "
             "прочесть, сказать, какие файлы забыты в индексе, невозможно. "
-            "L4, L5 и L6 от индекса не зависят и проверены"
+            "L4, L5, L6 и L7 от индекса не зависят и проверены"
             % len(unreadable)
         )
         check_files_alone(exact, index_name, cache, allow_globs, folder,
-                          errors, warnings, notices)
+                          errors, warnings, notices, stale_after)
         errors, notices, warnings = escaped_findings(errors, notices, warnings)
         return errors, notices, warnings, row_count, True
 
@@ -1905,7 +2165,7 @@ def check(root, index_paths, allow_globs, index_name, file_map, folder):
                                     for path in sorted(paths))))
 
     check_files_alone(exact, index_name, cache, allow_globs, folder,
-                      errors, warnings, notices)
+                      errors, warnings, notices, stale_after)
 
     errors, notices, warnings = escaped_findings(errors, notices, warnings)
 
@@ -1951,6 +2211,10 @@ def build_parser():
              "L6; можно повторять")
     parser.add_argument("--quiet", action="store_true",
                         help="молчать, когда нарушений нет")
+    parser.add_argument("--stale-after", default=str(STALE_DAYS), metavar="ДНИ",
+                        help="порог устаревания факта в днях: `updated` старше "
+                             "него - предупреждение L7 (по умолчанию: %d). "
+                             "0 отключает проверку возраста" % STALE_DAYS)
     return parser
 
 
@@ -2015,6 +2279,18 @@ def main(argv=None):
     # Считаем раньше, чтобы каждое сообщение печатало адрес, по которому файл
     # находится из каталога запуска, - а не голое имя.
     folder = display_folder(args.memory_dir)
+
+    # Порог устаревания разбираем до чтения файлов: кривое число - это отказ в
+    # ключе (код 2), а не «взяли умолчание». Молчаливая подстановка выдала бы
+    # «устаревания нет» за проверенный факт: человек уверен, что порог задал,
+    # а его никто не спросил.
+    stale_after = parse_stale_after(args.stale_after)
+    if stale_after is None:
+        print("Ключ --stale-after принимает целое число дней не меньше нуля: "
+              "%s. Ноль отключает проверку возраста, %d - значение по "
+              "умолчанию" % (printable_name(args.stale_after), STALE_DAYS),
+              file=sys.stderr)
+        return EXIT_USAGE
 
     try:
         # abspath внутри перехвата намеренно: на Linux он зовёт getcwd(), а тот
@@ -2174,7 +2450,8 @@ def main(argv=None):
             return EXIT_USAGE
 
         errors, notices, warnings, row_count, unverifiable = check(
-            root, index_paths, args.allow_orphan, args.index, file_map, folder)
+            root, index_paths, args.allow_orphan, args.index, file_map, folder,
+            stale_after)
     except Exception as exc:  # проверка сломалась - это не нарушение памяти
         # Сообщение исключения несёт имена файлов, и печатать его сырым -
         # та же дыра, что и в ранних отказах: `ValueError` с именем,
@@ -2229,7 +2506,8 @@ def main(argv=None):
         # строки, и легенда, начинающаяся с «L1», сама сошла бы за находку.
         print("Блокируют коммит L1 (битая ссылка), L2 (файл вне индекса), "
               "L5 (имя в шапке не равно имени файла) и L6 (имя файла или "
-              "каталога не по правилу либо закрыто); L3 и L4 - предупреждения.")
+              "каталога не по правилу либо закрыто); L3, L4 и L7 - "
+              "предупреждения.")
         return EXIT_VIOLATION
     if warnings:
         # Расшифровку букв даём, только если эти буквы в выводе есть. Прежде
@@ -2238,8 +2516,10 @@ def main(argv=None):
         # ни тем, ни другим. Итог, объясняющий не то, что напечатано, учит
         # не читать итог.
         seen = sorted({line.split(" ", 1)[0] for line in warnings
-                       if line.split(" ", 1)[0] in ("L3", "L4")})
-        names = {"L3": "L3 (дубль заголовка)", "L4": "L4 (битая связь [[имя]])"}
+                       if line.split(" ", 1)[0] in ("L3", "L4", "L7")})
+        names = {"L3": "L3 (дубль заголовка)",
+                 "L4": "L4 (битая связь [[имя]])",
+                 "L7": "L7 (возраст факта или объявленная замена)"}
         what = " - %s" % " и ".join(names[code] for code in seen) if seen else ""
         print("\nНарушений нет. Предупреждений: %d%s - коммит они не блокируют."
               % (len(warnings), what))

@@ -591,6 +591,20 @@ REVERTS = [
      "    IMPORT_STEM=$(printf '%s' \"$IMPORT_STEM\" | tr '[:upper:]' '[:lower:]' | tr -d ' \\t\\r\\n')\n",
      "test_check_memory_index.PreCommitHook."
      "test_a_failing_tr_does_not_abort_the_closed_name_check"),
+
+    # Найдено своим же тестом на L7, до всякого ревью: самозамена называлась
+    # ДВУМЯ находками - «не может заменять себя» из первого прохода и «объявлен
+    # заменой, а тот не помечен superseded» из второго. Одна причина, две
+    # строки: агент читает это как два разных дефекта и правит оба.
+    ("самозамена снова называется двумя находками", LINTER,
+     "        if target_stem == fact[\"stem\"]:\n"
+     "            # Самозамена уже названа выше, отдельной строкой. Вторая строка\n"
+     "            # про неё же была бы повтором одной причины двумя находками.\n"
+     "            continue\n",
+     "        if False:\n"
+     "            continue\n",
+     "test_check_memory_index.LifecycleFields."
+     "test_a_file_cannot_supersede_itself"),
 ]
 # Ограничитель обратного прохода (`floor`) сюда намеренно НЕ занесён: его
 # держит мутация в `mutation_check.py`, а единственный тест, который на его

@@ -1,6 +1,7 @@
 ---
 name: project_example
 description: "demo-api - учебный REST-сервис на Fastify + Postgres; цель - показать формат памяти"
+updated: 2026-11-20
 metadata:
   type: project
 ---
