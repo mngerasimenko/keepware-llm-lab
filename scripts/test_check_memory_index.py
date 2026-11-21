@@ -4904,8 +4904,16 @@ class LifecycleFields(MemoryFixture):
 
         Иначе у проекта с другим представлением о свежести не было бы способа
         сказать «возраст мне не важен», кроме правки кода проверки.
+
+        Выключатель гасит и совет про отсутствующую дату - он часть той же
+        проверки возраста. Поэтому в фикстуре оба случая, старый факт и факт
+        без даты: иначе мутация «ноль не выключает» осталась бы незамеченной
+        на втором из них.
         """
-        self.memory({"user.md": self.fact("user", "updated: %s\n" % self.ago(4000))})
+        self.memory({
+            "user.md": self.fact("user", "updated: %s\n" % self.ago(4000)),
+            "feedback_rule.md": self.fact("feedback_rule"),
+        })
         code, out = self.run_linter("--stale-after", "0")
         self.assertEqual(findings(out, "L7"), [], out)
         self.assertEqual(code, 0, out)
@@ -6984,6 +6992,47 @@ PROTOCOL_PIECES = (
 PIECE_OPEN = "<!-- кусок: %s -->"
 PIECE_CLOSE = "<!-- конец куска: %s -->"
 FENCE_LINE = re.compile(r"^\s*(?:`{3,}|~{3,})\s*[\w+-]*\s*$")
+ANY_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
+
+
+def fenced_blocks(text):
+    """Содержимое всех fenced-блоков файла, без обрамляющих заборов."""
+    blocks = []
+    current, fence = None, None
+    for line in text.splitlines():
+        match = ANY_FENCE.match(line)
+        if current is None:
+            if match:
+                current, fence = [], match.group(1)[0]
+            continue
+        if match and match.group(1)[0] == fence:
+            blocks.append(current)
+            current = None
+        else:
+            current.append(line)
+    return blocks
+
+
+def looks_like_piece(block, piece):
+    """Блок похож на кусок: знакома хотя бы половина его строк.
+
+    Похожесть, а не равенство, - потому что ловить надо именно РАЗОШЕДШУЮСЯ
+    копию: она отличается одной-двумя строками и при сравнении на равенство
+    выглядит чужим блоком, а не испорченным своим. Половина строк - порог
+    грубый намеренно: у чужого блока (пример шапки, снимок конфига) с куском
+    не совпадает почти ничего.
+
+    Строки сравниваются как МНОЖЕСТВА, а не списки: в примере шапки строка
+    `---` стоит дважды, и по списку четырёхстрочный блок набирал два
+    совпадения - ровно половину, - хотя на деле совпала одна строка из трёх
+    разных. Блок короче трёх строк кандидатом не считается: одинокое
+    `---` совпадает с куском всегда.
+    """
+    lines = {line for line in block if line.strip()}
+    if len(lines) < 3:
+        return False
+    known = set(piece.splitlines())
+    return len(lines & known) * 2 >= len(lines)
 
 
 def protocol_pieces(root):
@@ -7023,11 +7072,18 @@ def protocol_pieces(root):
 
 
 def protocol_divergences(root):
-    """Копии, где куска нет дословно: список (кусок, файл).
+    """Копии, где куска нет дословно и ровно одним блоком: список (кусок, файл).
 
-    Сравнение подстрокой, без меток в самих копиях. Метка в копии попала бы в
-    текст, который человек копирует себе в конфиг агента: комментарий там
-    безвреден, но это уже не тот протокол, который описан в README.
+    Сравниваются БЛОКИ, а не подстрока файла. Первая редакция искала кусок
+    подстрокой и находила ПЕРВОЕ вхождение - и пропустила настоящую поломку:
+    в `prompts/setup-memory.md` сошлись две копии правил, свежая в шаге 6 и
+    устаревшая в шаге 7, проверка смотрела на свежую и была зелёной, а
+    устаревшая уезжала в конфиг нового пользователя. Сравнение на равенство
+    тоже не спасло бы: разошедшаяся копия не равна куску, но и «чужого»
+    блока не образует - она просто перестаёт быть кандидатом, и проверка
+    молчит. Поэтому кандидат ищется по похожести (`looks_like_piece`), а
+    требуется ровно один: две похожие копии в одном файле - это всегда
+    остаток от неудачной правки.
     """
     pieces = protocol_pieces(root)
     diverged = []
@@ -7043,7 +7099,9 @@ def protocol_divergences(root):
             except OSError:
                 diverged.append((name, rel))
                 continue
-            if text not in copy_text:
+            candidates = [block for block in fenced_blocks(copy_text)
+                          if looks_like_piece(block, text)]
+            if len(candidates) != 1 or candidates[0] != text.splitlines():
                 diverged.append((name, rel))
     return diverged
 
@@ -7138,6 +7196,29 @@ class ProtocolHasOneSource(MemoryFixture):
         os.remove(os.path.join(self.root, "README.md"))
 
         self.assertEqual(protocol_divergences(self.root), [("формат", "README.md")])
+
+    def test_a_stale_second_copy_is_reported(self):
+        """Две копии одного куска в одном файле - остаток от неудачной правки.
+
+        Так и случилось по-настоящему: при переносе правил кусок встал в шаг
+        6 вместо шага 7, старая редакция осталась в шаге 7, и проверка была
+        зелёной - она искала вхождение и находила свежую копию. Устаревшая
+        уезжала в конфиг нового пользователя, а расхождения не видел никто.
+        Поэтому считается число вхождений: два - это уже поломка.
+        """
+        self.copies_from_source()
+        target = os.path.join(self.root, "prompts", "setup-memory.md")
+        with open(target, encoding="utf-8", newline="") as f:
+            text = f.read()
+        rules = protocol_pieces(REPO_DIR)["правила"]
+        # Устаревшая редакция того же куска - без строки про дату и замену.
+        stale = rules.replace(
+            "- **Дата и выключение факта.**", "- **Новые факты пиши в тело.**")
+        with open(target, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text + "\n```markdown\n%s\n```\n" % stale)
+
+        self.assertEqual(protocol_divergences(self.root),
+                         [("правила", os.path.join("prompts", "setup-memory.md"))])
 
 
 if __name__ == "__main__":

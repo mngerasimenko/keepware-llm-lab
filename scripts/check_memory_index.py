@@ -2208,7 +2208,7 @@ def build_parser():
                              "под-индекс - файл с тем же именем в подпапке")
     parser.add_argument("--allow-orphan", action="append", default=[], metavar="GLOB",
                         help="путь(и), которые проверка не аудирует: ни L2, ни L4, ни L5, ни "
-             "L6; можно повторять")
+             "L6, ни L7; можно повторять")
     parser.add_argument("--quiet", action="store_true",
                         help="молчать, когда нарушений нет")
     parser.add_argument("--stale-after", default=str(STALE_DAYS), metavar="ДНИ",
