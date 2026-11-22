@@ -553,6 +553,57 @@ MUTATIONS = [
     ("ключи читаются снова через --get", HOOK,
      "EXTRA_ARGS=$IMPORT_ARGS",
      "EXTRA_ARGS=$(git config --get memorycheck.args 2>/dev/null || true)"),
+
+    # --- формат v2: возраст факта и объявленная замена (L7) ---
+    # Все ветки здесь - предупреждения, и это не делает их необязательными:
+    # ветку, которую можно молча выключить, никто и не заметит. Каждая
+    # мутация ниже гасит одну находку (или один её вид), поэтому краснеет
+    # конкретный тест, а не «что-то про L7».
+    ("порог устаревания перестал действовать", LINTER,
+     "                    if age > stale_after:",
+     "                    if False:"),
+    # Выключенный факт снова просят перечитать - та самая правка, которую
+    # формат запрещает делать инструменту: у `superseded` перечитывать нечего.
+    ("выключенный факт снова просят перечитать", LINTER,
+     '        retired = status in ("deprecated", "superseded")',
+     "        retired = False"),
+    ("дата не в форме ISO считается датой", LINTER,
+     "                if when is None:",
+     "                if False:"),
+    ("вторая сторона замены не проверяется", LINTER,
+     '        if old["status"] != "superseded":',
+     "        if False:"),
+    ("факт, выключенный молча, проходит", LINTER,
+     '        if fact["status"] == "superseded" and fact["stem"] not in claimed:',
+     "        if False:"),
+    # Две мутации на замену: сам файл и чужое имя. Обе ветки называют разное
+    # действие, поэтому и сторожей две - иначе имя записи обещало бы больше,
+    # чем она мутирует.
+    ("самозамена проходит молча", LINTER,
+     '            if target_stem == fact["stem"]:\n'
+     "                warnings.append(",
+     "            if False:\n"
+     "                warnings.append("),
+    ("замена на несуществующий файл проходит молча", LINTER,
+     "            elif target not in names:",
+     "            elif False:"),
+    ("дата в будущем считается нормальной", LINTER,
+     "                elif when > today:",
+     "                elif False:"),
+    ("отсутствие даты больше не называется", LINTER,
+     "    if undated:",
+     "    if False:"),
+    # Ноль - выключатель проверки возраста. Гасим именно это: без него
+    # `--stale-after 0` означал бы «строже всех» и советовал перечитать всё.
+    ("ноль не выключает проверку возраста", LINTER,
+     "        if stale_after and not retired:",
+     "        if not retired:"),
+    ("незнакомый status принимается молча", LINTER,
+     "        if status and status not in FACT_STATUSES:",
+     "        if False:"),
+    ("итог не называет L7 предупреждением", LINTER,
+     '                       if line.split(" ", 1)[0] in ("L3", "L4", "L7")})',
+     '                       if line.split(" ", 1)[0] in ("L3", "L4")})'),
 ]
 
 

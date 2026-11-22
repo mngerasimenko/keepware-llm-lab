@@ -1,6 +1,7 @@
 ---
 name: reference_example
 description: "Куда смотреть: дашборд Grafana (метрики) и внутренняя страница статуса инцидентов"
+updated: 2026-11-20
 metadata:
   type: reference
 ---

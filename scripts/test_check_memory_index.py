@@ -17,7 +17,9 @@
   L3, дубли заголовков      DuplicateTitles
   L4, связи [[имя]]         WikiLinksBetweenFacts
   L5 и L6, имена            MemoryFileNameIsASlug
+  L7, дата и замена         LifecycleFields
   шапка файла               FrontmatterDiagnostics
+  текст протокола в доках   ProtocolHasOneSource
   коды возврата 0/1/2       ExitCodes, ExitCodeContract, SilentFailures
   качество сообщений        HintsDoNotOverclaim, SourceHintPointsAtTheRightFile,
                             SummaryTellsWhatBlocks, AddressesAreClickable
@@ -38,6 +40,7 @@
 """
 
 import ast
+import datetime
 import hashlib
 import io
 import os
@@ -77,6 +80,25 @@ def findings(output, code):
     """
     return [line for line in output.splitlines()
             if line.startswith(code + " ")]
+
+
+# Дата «сегодня» для фикстур формата v2. Считается один раз на прогон, а не
+# берётся константой: зашитое «2026-11-20» через полгода сделало бы L7
+# устаревшим - и тесты, которые к возрасту факта отношения не имеют,
+# покраснели бы по календарю. Тест, краснеющий от смены даты, ничего не
+# держит: его чинят правкой числа, не глядя на проверку.
+TODAY = datetime.date.today().isoformat()
+
+
+def dated(name, extra="", body="факт\n"):
+    """Файл памяти по формату v2: шапка с сегодняшней датой и тело.
+
+    Нужен там, где фикстура изображает ЗДОРОВУЮ память: без `updated` она
+    теперь даёт предупреждение L7, и тест про L1/L2/L4 краснел бы по чужой
+    причине - либо молча менял счёт предупреждений в итоге.
+    """
+    return ("---\nname: %s\ndescription: крючок\nupdated: %s\n%s---\n\n%s"
+            % (name, TODAY, extra, body))
 
 
 class HookPrerequisite(unittest.TestCase):
@@ -3862,7 +3884,7 @@ class LinkedSubtrees(MemoryFixture):
         """
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n",
-            "user.md": "факт\n",
+            "user.md": dated("user"),
         })
         real = linter.build_file_map
 
@@ -3882,7 +3904,7 @@ class LinkedSubtrees(MemoryFixture):
         """Вторая половина пары: без пропусков итог прежний."""
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n",
-            "user.md": "факт\n",
+            "user.md": dated("user"),
         })
         code, output = self.run_linter()
         self.assertEqual(code, 0, output)
@@ -4759,6 +4781,342 @@ class WikiLinksBetweenFacts(MemoryFixture):
         self.assertIn("net_24", output)
 
 
+class LifecycleFields(MemoryFixture):
+    """L7: возраст факта и его замена - поля `updated`, `status`, `supersedes`.
+
+    Формат v2 родился после того, как память уже стояла у агентов: сотни
+    файлов написаны без этих полей. Поэтому здесь нет ни одной ошибки -
+    файл без даты это «возраст неизвестен», а не поломка, - и код возврата
+    от L7 не меняется никогда. Иначе первое же обновление проверки покрасило
+    бы всю живую память сразу, и красный перестал бы что-либо различать:
+    ровно та беда, ради которой L3 и L4 сделаны предупреждениями.
+
+    Порог устаревания - не жёсткий лимит: он говорит «перечитай факт», а не
+    «факт неверен». Дата ставится тогда, когда факт перечитали, и потому
+    свежая дата у старого текста законна.
+    """
+
+    def ago(self, days):
+        """Дата `days` дней назад в том виде, в каком её пишут в шапку."""
+        return (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+
+    def fact(self, name, extra="", body="факт\n"):
+        """Файл памяти: шапка по формату плюс произвольные строки полей."""
+        return "---\nname: %s\ndescription: крючок\n%s---\n\n%s" % (
+            name, extra, body)
+
+    def memory(self, facts):
+        """Пишет память, где индекс перечисляет ровно эти файлы.
+
+        Иначе проверка нашла бы L1 и L2 в самой фикстуре, и тест про L7
+        краснел бы по чужой причине. Красный не по той причине хуже
+        зелёного: он подтверждает проверку, которую не трогал.
+        """
+        data = {"MEMORY.md": "".join("- [%s](%s) - крючок\n" % (name, name)
+                                     for name in sorted(facts))}
+        data.update(facts)
+        self.write(data)
+
+    def test_a_memory_without_a_date_is_named_once_per_run(self):
+        """Одна строка на прогон, а не по строке на файл.
+
+        Память портфеля - сотни файлов без `updated`. Строка на каждый из них
+        печатается хуком на каждом коммите и приучает пролистывать вывод; та
+        же беда однажды заставила предупреждения замолчать под --quiet, и
+        сотня находок L4 не попалась человеку на глаза ни разу. Поэтому имена
+        перечислены в одной строке и не все.
+        """
+        self.memory({
+            "user.md": self.fact("user"),
+            "feedback_rule.md": self.fact("feedback_rule"),
+        })
+        code, out = self.run_linter()
+        lines = findings(out, "L7")
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("user.md", lines[0])
+        self.assertIn("feedback_rule.md", lines[0])
+        self.assertEqual(code, 0, out)
+
+    def test_the_line_says_how_many_are_not_listed(self):
+        """Имена обрезаны, счёт - нет: иначе «сколько чинить» неоткуда взять."""
+        facts = {"f%02d.md" % i: self.fact("f%02d" % i) for i in range(9)}
+        self.memory(facts)
+        code, out = self.run_linter()
+        lines = findings(out, "L7")
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("9", lines[0])
+        self.assertEqual(code, 0, out)
+
+    def test_a_fresh_date_is_not_reported(self):
+        self.memory({
+            "user.md": self.fact("user", "updated: %s\n" % self.ago(1)),
+            "feedback_rule.md": self.fact(
+                "feedback_rule", "updated: %s\n" % self.ago(30)),
+        })
+        code, out = self.run_linter()
+        self.assertEqual(findings(out, "L7"), [], out)
+        self.assertEqual(code, 0, out)
+
+    def test_a_stale_date_is_reported_with_its_age(self):
+        """Возраст числом: «устарело» без срока не говорит, насколько."""
+        self.memory({
+            "user.md": self.fact("user", "updated: %s\n" % self.ago(400)),
+            "feedback_rule.md": self.fact(
+                "feedback_rule", "updated: %s\n" % self.ago(10)),
+        })
+        code, out = self.run_linter()
+        lines = findings(out, "L7")
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("user.md", lines[0])
+        self.assertIn("400", lines[0])
+        self.assertNotIn("feedback_rule.md", lines[0])
+        self.assertEqual(code, 0, out)
+
+    def test_the_threshold_itself_is_not_stale(self):
+        """Порог включительно: 180 дней ещё не устарело, 181 уже устарело.
+
+        Пара входов, а не один: проверка на границе ошибается в обе стороны,
+        и тест с одним входом оставляет половину этой ошибки живой.
+        """
+        self.memory({"user.md": self.fact("user", "updated: %s\n" % self.ago(180))})
+        code, out = self.run_linter()
+        self.assertEqual(findings(out, "L7"), [], out)
+
+        self.memory({"user.md": self.fact("user", "updated: %s\n" % self.ago(181))})
+        code, out = self.run_linter()
+        self.assertEqual(len(findings(out, "L7")), 1, out)
+        self.assertEqual(code, 0, out)
+
+    def test_the_threshold_moves_with_a_flag(self):
+        """Порог - предложение, а не догма: память бывает разной свежести."""
+        self.memory({"user.md": self.fact("user", "updated: %s\n" % self.ago(40))})
+        code, out = self.run_linter()
+        self.assertEqual(findings(out, "L7"), [], out)
+
+        code, out = self.run_linter("--stale-after", "30")
+        lines = findings(out, "L7")
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("user.md", lines[0])
+        self.assertEqual(code, 0, out)
+
+    def test_zero_turns_the_age_check_off(self):
+        """`--stale-after 0` - выключатель, а не «всё устарело».
+
+        Иначе у проекта с другим представлением о свежести не было бы способа
+        сказать «возраст мне не важен», кроме правки кода проверки.
+
+        Выключатель гасит и совет про отсутствующую дату - он часть той же
+        проверки возраста. Поэтому в фикстуре оба случая, старый факт и факт
+        без даты: иначе мутация «ноль не выключает» осталась бы незамеченной
+        на втором из них.
+        """
+        self.memory({
+            "user.md": self.fact("user", "updated: %s\n" % self.ago(4000)),
+            "feedback_rule.md": self.fact("feedback_rule"),
+        })
+        code, out = self.run_linter("--stale-after", "0")
+        self.assertEqual(findings(out, "L7"), [], out)
+        self.assertEqual(code, 0, out)
+
+    def test_a_threshold_that_is_not_a_number_is_a_usage_error(self):
+        """Кривой порог - код 2, а не тихая замена на 180.
+
+        Молчаливая подстановка умолчания выдала бы «устаревания нет» за
+        проверенный факт: человек думает, что задал порог, а его не спросили.
+        """
+        self.memory({"user.md": self.fact("user")})
+        for value in ("abc", "-1", "1.5", ""):
+            code, out = self.run_linter("--stale-after", value)
+            self.assertEqual(code, 2, "%s: %s" % (value, out))
+            self.assertIn("--stale-after", out)
+
+    def test_a_date_not_in_the_iso_form_is_reported(self):
+        """Формат даты один: иначе её не прочитает ни проверка, ни человек."""
+        self.memory({"user.md": self.fact("user", "updated: 21.11.2026\n")})
+        code, out = self.run_linter()
+        lines = findings(out, "L7")
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("ГГГГ-ММ-ДД", lines[0])
+        self.assertEqual(code, 0, out)
+
+    def test_a_date_in_the_future_is_reported(self):
+        """Будущая дата скрывает возраст: `сегодня - updated` уходит в минус."""
+        self.memory({"user.md": self.fact("user", "updated: %s\n" % self.ago(-30))})
+        code, out = self.run_linter()
+        lines = findings(out, "L7")
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("в будущем", lines[0])
+        self.assertEqual(code, 0, out)
+
+    def test_an_unknown_status_is_reported(self):
+        self.memory({
+            "user.md": self.fact("user",
+                                 "updated: %s\nstatus: old\n" % self.ago(1)),
+        })
+        code, out = self.run_linter()
+        lines = findings(out, "L7")
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("superseded", lines[0])
+        self.assertEqual(code, 0, out)
+
+    def test_every_status_from_the_set_is_accepted(self):
+        """Набор объявлен целиком: `deprecated` и `superseded` не «почти»."""
+        for status in ("active", "deprecated"):
+            self.memory({
+                "user.md": self.fact(
+                    "user", "updated: %s\nstatus: %s\n" % (self.ago(1), status)),
+            })
+            code, out = self.run_linter()
+            self.assertEqual(findings(out, "L7"), [], "%s: %s" % (status, out))
+            self.assertEqual(code, 0, out)
+
+    def test_supersedes_must_name_an_existing_memory(self):
+        self.memory({
+            "user.md": self.fact(
+                "user", "updated: %s\nsupersedes: net_takogo\n" % self.ago(1)),
+        })
+        code, out = self.run_linter()
+        lines = findings(out, "L7")
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("net_takogo", lines[0])
+        self.assertEqual(code, 0, out)
+
+    def test_a_dash_for_underscore_gets_a_concrete_instruction(self):
+        """Та же догадка, что у [[связей]]: иначе человек ищет файл глазами."""
+        self.memory({
+            "feedback_rule.md": self.fact(
+                "feedback_rule",
+                "updated: %s\nsupersedes: feedback-rule\n" % self.ago(1)),
+        })
+        code, out = self.run_linter()
+        lines = findings(out, "L7")
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("feedback_rule.md", lines[0])
+        self.assertEqual(code, 0, out)
+
+    def test_the_superseded_file_must_carry_the_status(self):
+        """Замена - пара строк. Одна из них без второй не работает."""
+        self.memory({
+            "old.md": self.fact("old", "updated: %s\n" % self.ago(20)),
+            "new.md": self.fact(
+                "new", "updated: %s\nsupersedes: old\n" % self.ago(1)),
+        })
+        code, out = self.run_linter()
+        lines = [line for line in findings(out, "L7") if "не помечен" in line]
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("old.md", lines[0])
+        self.assertEqual(code, 0, out)
+
+    def test_a_status_without_a_claimant_is_reported(self):
+        """`status: superseded` без пары выключает факт молча."""
+        self.memory({
+            "old.md": self.fact(
+                "old", "updated: %s\nstatus: superseded\n" % self.ago(1)),
+        })
+        code, out = self.run_linter()
+        lines = [line for line in findings(out, "L7") if "не объявляет" in line]
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("old.md", lines[0])
+        self.assertEqual(code, 0, out)
+
+    def test_a_complete_pair_is_quiet(self):
+        """Полная замена: старый выключен, новый назвал его - тишина."""
+        self.memory({
+            "old.md": self.fact(
+                "old", "updated: %s\nstatus: superseded\n" % self.ago(20)),
+            "new.md": self.fact(
+                "new", "updated: %s\nsupersedes: old\n" % self.ago(2)),
+        })
+        code, out = self.run_linter()
+        self.assertEqual(findings(out, "L7"), [], out)
+        self.assertEqual(code, 0, out)
+
+    def test_a_file_cannot_supersede_itself(self):
+        """Самозамена оставила бы факт и заменённым, и действующим сразу."""
+        self.memory({
+            "user.md": self.fact(
+                "user", "updated: %s\nsupersedes: user\n" % self.ago(1)),
+        })
+        code, out = self.run_linter()
+        lines = findings(out, "L7")
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("сам", lines[0])
+        self.assertEqual(code, 0, out)
+
+    def test_a_retired_fact_is_not_asked_to_be_fresh(self):
+        """У выключенного факта возраст не спрашивают: перечитывать нечего.
+
+        Совет «перечитай и обнови дату» на файле, который только что объявили
+        заменённым, ведёт к вредной правке - ровно то, что формат запрещает
+        делать инструменту.
+        """
+        self.memory({
+            "old.md": self.fact(
+                "old", "updated: %s\nstatus: superseded\n" % self.ago(900)),
+            "new.md": self.fact(
+                "new", "updated: %s\nsupersedes: old\n" % self.ago(1)),
+        })
+        code, out = self.run_linter()
+        self.assertEqual(findings(out, "L7"), [], out)
+        self.assertEqual(code, 0, out)
+
+    def test_lifecycle_findings_never_change_the_exit_code(self):
+        """Код 0 при всех нарушениях L7 сразу: формат v2 не блокирует коммит.
+
+        Это главный инвариант класса. Стоит ему сломаться - и хук начнёт
+        отказывать в коммите на памяти, которую никто не портил.
+        """
+        self.memory({
+            "user.md": self.fact(
+                "user", "updated: вчера\nstatus: old\nsupersedes: net_takogo\n"),
+            "feedback_rule.md": self.fact("feedback_rule"),
+        })
+        code, out = self.run_linter()
+        self.assertEqual(code, 0, out)
+        self.assertGreaterEqual(len(findings(out, "L7")), 3, out)
+
+    def test_the_index_is_not_asked_for_a_date(self):
+        """Индекс - оглавление, а не факт: у него нет ни возраста, ни замены."""
+        self.write({
+            "MEMORY.md": "---\nname: MEMORY\ndescription: оглавление\n---\n"
+                         "- [Профиль](user.md) - кто\n",
+            "user.md": self.fact("user", "updated: %s\n" % self.ago(1)),
+        })
+        code, out = self.run_linter()
+        self.assertEqual(findings(out, "L7"), [], out)
+        self.assertEqual(code, 0, out)
+
+    def test_an_allowed_orphan_is_not_audited(self):
+        """`--allow-orphan` значит «сюда проверка не смотрит» - и для L7 тоже."""
+        self.memory({"user.md": self.fact("user", "updated: %s\n" % self.ago(1))})
+        self.write({"draft/wip.md": self.fact("wip", "updated: %s\n" % self.ago(400))})
+        code, out = self.run_linter("--allow-orphan", "draft/*.md")
+        self.assertEqual(findings(out, "L7"), [], out)
+        self.assertEqual(code, 0, out)
+
+    def test_the_summary_names_l7_as_a_warning(self):
+        """Итог обязан объяснить букву, которая в выводе есть.
+
+        Прежде расшифровка печаталась только для L3 и L4, и новая буква в
+        выводе осталась бы без объяснения - а итог, объясняющий не то, что
+        напечатано, учит не читать итог.
+        """
+        self.memory({"user.md": self.fact("user", "updated: %s\n" % self.ago(400))})
+        code, out = self.run_linter()
+        self.assertIn("L7", out.splitlines()[-1])
+        self.assertEqual(code, 0, out)
+
+    def test_the_legend_of_a_blocking_run_calls_l7_a_warning(self):
+        """Вторая ветка итога - та, что печатается при нарушениях."""
+        self.write({
+            "MEMORY.md": "- [Профиль](user.md) - кто\n- [Пропал](missing.md) - нет\n",
+            "user.md": self.fact("user", "updated: %s\n" % self.ago(400)),
+        })
+        code, out = self.run_linter()
+        self.assertEqual(code, 1, out)
+        self.assertIn("L7", out.splitlines()[-1])
+        self.assertIn("предупреждения", out.splitlines()[-1])
+
 class HintsDoNotOverclaim(MemoryFixture):
     """Подсказка обязана быть верна, иначе она хуже своего отсутствия."""
 
@@ -4986,7 +5344,7 @@ class SummaryTellsWhatBlocks(MemoryFixture):
         """
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n- [Битая](net.md) - файла нет\n",
-            "user.md": "см. [[net_takogo_fakta]] рядом\n",
+            "user.md": dated("user", body="см. [[net_takogo_fakta]] рядом\n"),
         })
         code, output = self.run_linter()
         self.assertEqual(code, 1, output)
@@ -5036,7 +5394,7 @@ class ExitCodes(MemoryFixture):
         """
         self.write({
             "MEMORY.md": "- [Профиль](user.md) - кто\n",
-            "user.md": "факт\n",
+            "user.md": dated("user"),
         })
         code, output = self.run_linter("--quiet")
         self.assertEqual(code, 0)
@@ -6620,6 +6978,247 @@ class PreCommitHook(unittest.TestCase):
         self.git("add", "-A")
         result = self.run_hook()
         self.assertIn("--no-verify", result.stdout.decode("utf-8", "replace"))
+
+
+PROTOCOL_SOURCE = os.path.join("prompts", "memory-protocol.md")
+
+# Кусок канона → копии, где он обязан стоять дословно. Список, а не догадка
+# по тексту: копию, которую забыли внести сюда, проверка не увидит вовсе.
+PROTOCOL_PIECES = (
+    ("формат", ("README.md", os.path.join("prompts", "setup-memory.md"))),
+    ("правила", ("CLAUDE.example.md", os.path.join("prompts", "setup-memory.md"))),
+)
+
+PIECE_OPEN = "<!-- кусок: %s -->"
+PIECE_CLOSE = "<!-- конец куска: %s -->"
+FENCE_LINE = re.compile(r"^\s*(?:`{3,}|~{3,})\s*[\w+-]*\s*$")
+ANY_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
+
+
+def fenced_blocks(text):
+    """Содержимое всех fenced-блоков файла, без обрамляющих заборов."""
+    blocks = []
+    current, fence = None, None
+    for line in text.splitlines():
+        match = ANY_FENCE.match(line)
+        if current is None:
+            if match:
+                current, fence = [], match.group(1)[0]
+            continue
+        if match and match.group(1)[0] == fence:
+            blocks.append(current)
+            current = None
+        else:
+            current.append(line)
+    return blocks
+
+
+def looks_like_piece(block, piece):
+    """Блок похож на кусок: знакома хотя бы половина его строк.
+
+    Похожесть, а не равенство, - потому что ловить надо именно РАЗОШЕДШУЮСЯ
+    копию: она отличается одной-двумя строками и при сравнении на равенство
+    выглядит чужим блоком, а не испорченным своим. Половина строк - порог
+    грубый намеренно: у чужого блока (пример шапки, снимок конфига) с куском
+    не совпадает почти ничего.
+
+    Строки сравниваются как МНОЖЕСТВА, а не списки: в примере шапки строка
+    `---` стоит дважды, и по списку четырёхстрочный блок набирал два
+    совпадения - ровно половину, - хотя на деле совпала одна строка из трёх
+    разных. Блок короче трёх строк кандидатом не считается: одинокое
+    `---` совпадает с куском всегда.
+    """
+    lines = {line for line in block if line.strip()}
+    if len(lines) < 3:
+        return False
+    known = set(piece.splitlines())
+    return len(lines & known) * 2 >= len(lines)
+
+
+def protocol_pieces(root):
+    """Куски канона: имя → текст без обрамляющего забора и пустых краёв.
+
+    Пустой словарь означает «источник не прочитан или размечен не так», и это
+    отдельный случай от «копии совпали». Слить их в один - значит получить
+    проверку, которая молчит ровно тогда, когда проверять нечего: пропавший
+    источник выглядел бы согласием всех копий.
+    """
+    try:
+        with open(os.path.join(root, PROTOCOL_SOURCE), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return {}
+    pieces = {}
+    for name, _copies in PROTOCOL_PIECES:
+        opener, closer = PIECE_OPEN % name, PIECE_CLOSE % name
+        if opener not in lines or closer not in lines:
+            continue
+        body = lines[lines.index(opener) + 1:lines.index(closer)]
+        for _ in range(2):
+            while body and not body[0].strip():
+                body.pop(0)
+            while body and not body[-1].strip():
+                body.pop()
+            # Забор у источника свой, у копии - свой: `~~~` в CLAUDE.example.md
+            # против ``` в README. В сравнение он не входит, иначе совпадение
+            # зависело бы от оформления, а не от текста.
+            if body and FENCE_LINE.match(body[0]):
+                body.pop(0)
+            if body and FENCE_LINE.match(body[-1]):
+                body.pop()
+        if body:
+            pieces[name] = "\n".join(body)
+    return pieces
+
+
+def protocol_divergences(root):
+    """Копии, где куска нет дословно и ровно одним блоком: список (кусок, файл).
+
+    Сравниваются БЛОКИ, а не подстрока файла. Первая редакция искала кусок
+    подстрокой и находила ПЕРВОЕ вхождение - и пропустила настоящую поломку:
+    в `prompts/setup-memory.md` сошлись две копии правил, свежая в шаге 6 и
+    устаревшая в шаге 7, проверка смотрела на свежую и была зелёной, а
+    устаревшая уезжала в конфиг нового пользователя. Сравнение на равенство
+    тоже не спасло бы: разошедшаяся копия не равна куску, но и «чужого»
+    блока не образует - она просто перестаёт быть кандидатом, и проверка
+    молчит. Поэтому кандидат ищется по похожести (`looks_like_piece`), а
+    требуется ровно один: две похожие копии в одном файле - это всегда
+    остаток от неудачной правки.
+    """
+    pieces = protocol_pieces(root)
+    diverged = []
+    for name, copies in PROTOCOL_PIECES:
+        for rel in copies:
+            text = pieces.get(name)
+            if text is None:
+                diverged.append((name, rel))
+                continue
+            try:
+                with open(os.path.join(root, rel), encoding="utf-8") as f:
+                    copy_text = f.read()
+            except OSError:
+                diverged.append((name, rel))
+                continue
+            candidates = [block for block in fenced_blocks(copy_text)
+                          if looks_like_piece(block, text)]
+            if len(candidates) != 1 or candidates[0] != text.splitlines():
+                diverged.append((name, rel))
+    return diverged
+
+
+class ProtocolHasOneSource(MemoryFixture):
+    """Текст протокола живёт в одном файле, копии совпадают с ним дословно.
+
+    Прежде протокол лежал в трёх местах с пометкой «если правите один, правьте
+    и другой». Пометка работает ровно до первого раза, когда о ней забыли, - и
+    копии разошлись: одно и то же правило в README и в промпте стояло разными
+    словами. Человеку не надо помнить о копиях; об этом помнит проверка.
+    """
+
+    def test_the_source_holds_every_piece(self):
+        """Пропавший кусок в источнике - не «копии совпали», а поломка.
+
+        Без этой половины первая проверка проходила бы на пустом источнике:
+        сравнивать нечего - расхождений нет.
+        """
+        pieces = protocol_pieces(REPO_DIR)
+        for name, copies in PROTOCOL_PIECES:
+            self.assertIn(name, pieces,
+                          "в %s нет куска «%s» между метками %r и %r"
+                          % (PROTOCOL_SOURCE, name, PIECE_OPEN % name,
+                             PIECE_CLOSE % name))
+            self.assertIn("\n", pieces[name],
+                          "кусок «%s» в %s - одна строка" % (name, PROTOCOL_SOURCE))
+
+    def test_every_copy_matches_the_source(self):
+        """Копия разошлась - назвать файл и кусок, а не «что-то не так»."""
+        diverged = protocol_divergences(REPO_DIR)
+        self.assertEqual(
+            diverged, [],
+            "копии разошлись с %s: %s. Правится только источник, копию "
+            "переносят дословно"
+            % (PROTOCOL_SOURCE,
+               ", ".join("%s → %s" % (name, rel) for name, rel in diverged)))
+
+    def copies_from_source(self):
+        """Собирает копии из настоящего источника: по куску на файл.
+
+        Один файл может нести оба куска (так устроен setup-memory.md), поэтому
+        куски сначала складываются по файлам, а потом пишутся - запись по
+        одному затирала бы предыдущий.
+        """
+        os.makedirs(os.path.join(self.root, "prompts"), exist_ok=True)
+        shutil.copyfile(os.path.join(REPO_DIR, PROTOCOL_SOURCE),
+                        os.path.join(self.root, PROTOCOL_SOURCE))
+        pieces = protocol_pieces(REPO_DIR)
+        bodies = {}
+        for name, copies in PROTOCOL_PIECES:
+            for rel in copies:
+                bodies.setdefault(rel, []).append(pieces[name])
+        for rel, chunks in bodies.items():
+            target = os.path.join(self.root, rel)
+            folder = os.path.dirname(target)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(target, "w", encoding="utf-8", newline="\n") as f:
+                f.write("".join("```markdown\n%s\n```\n\n" % chunk
+                                for chunk in chunks))
+        return pieces
+
+    def test_a_broken_copy_is_reported(self):
+        """Проверка, которая не различает, не держит ничего.
+
+        Фикстура собирается из настоящего источника и настоящих кусков: вход
+        отличается от боевого ровно одним символом в одной копии, и проверка
+        обязана назвать именно эту копию.
+        """
+        self.copies_from_source()
+        self.assertEqual(protocol_divergences(self.root), [],
+                         "фикстура не собралась: копии уже расходятся")
+
+        broken = os.path.join(self.root, "CLAUDE.example.md")
+        with open(broken, encoding="utf-8") as f:
+            text = f.read()
+        with open(broken, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text.replace("Правила:", "Правила :", 1))
+
+        self.assertEqual(protocol_divergences(self.root),
+                         [("правила", "CLAUDE.example.md")],
+                         "порча копии не поймана - проверка смотрит не туда")
+
+    def test_a_copy_that_lost_the_piece_is_reported(self):
+        """Вторая половина пары: пропавший кусок, а не изменённый.
+
+        Правка на один символ и удаление целого куска - разные поломки, и
+        ловятся они по-разному: первая подстрокой, вторая отсутствием.
+        """
+        self.copies_from_source()
+        os.remove(os.path.join(self.root, "README.md"))
+
+        self.assertEqual(protocol_divergences(self.root), [("формат", "README.md")])
+
+    def test_a_stale_second_copy_is_reported(self):
+        """Две копии одного куска в одном файле - остаток от неудачной правки.
+
+        Так и случилось по-настоящему: при переносе правил кусок встал в шаг
+        6 вместо шага 7, старая редакция осталась в шаге 7, и проверка была
+        зелёной - она искала вхождение и находила свежую копию. Устаревшая
+        уезжала в конфиг нового пользователя, а расхождения не видел никто.
+        Поэтому считается число вхождений: два - это уже поломка.
+        """
+        self.copies_from_source()
+        target = os.path.join(self.root, "prompts", "setup-memory.md")
+        with open(target, encoding="utf-8", newline="") as f:
+            text = f.read()
+        rules = protocol_pieces(REPO_DIR)["правила"]
+        # Устаревшая редакция того же куска - без строки про дату и замену.
+        stale = rules.replace(
+            "- **Дата и выключение факта.**", "- **Новые факты пиши в тело.**")
+        with open(target, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text + "\n```markdown\n%s\n```\n" % stale)
+
+        self.assertEqual(protocol_divergences(self.root),
+                         [("правила", os.path.join("prompts", "setup-memory.md"))])
 
 
 if __name__ == "__main__":
